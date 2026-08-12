@@ -1,0 +1,11 @@
+{
+  "camera_mount_version": "fixture-camera-mount-v1",
+  "synthetic": true,
+  "version": "fixture-calibration-v1",
+  "workspace_roi": [
+    0,
+    0,
+    64,
+    64
+  ]
+}

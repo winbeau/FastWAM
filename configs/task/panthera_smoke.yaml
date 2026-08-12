@@ -1,0 +1,21 @@
+# @package _global_
+
+defaults:
+  - override /data: panthera_2cam_smoke
+  - override /model: fastwam
+  - _self_
+
+batch_size: 1
+num_workers: 0
+mixed_precision: bf16
+gradient_accumulation_steps: 1
+learning_rate: 1.0e-4
+weight_decay: 0.0
+num_epochs: 1
+max_steps: 1
+log_every: 1
+save_every: 1
+eval_every: 1000000
+
+model:
+  mot_checkpoint_mixed_attn: true

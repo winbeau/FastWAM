@@ -1,0 +1,67 @@
+{
+  "action_output_shape": [
+    1,
+    4,
+    7
+  ],
+  "checkpoint_bytes": 440375,
+  "checkpoint_path": "artifacts/autodl/tiny-structural.pt",
+  "checkpoint_reload_verified": true,
+  "checkpoint_sha256": "45750a403df72424b6a6f2b64b0d90f57de8e9324224b009e0c1d29444103d96",
+  "gpu": {
+    "capability": [
+      8,
+      9
+    ],
+    "count": 1,
+    "name": "NVIDIA GeForce RTX 4090",
+    "total_memory_bytes": 50864390144
+  },
+  "gradient_norm": 0.047796573489904404,
+  "hostname": "autodl-container-77prys3ppf-f86a3184",
+  "input_action_source": "tests/fixtures/panthera_lerobot_v3_minimal",
+  "loss": 0.005971625447273254,
+  "loss_final": 0.005971625447273254,
+  "loss_initial": 0.45972132682800293,
+  "loss_ratio": 0.012989663734933573,
+  "loss_trace": [
+    0.45972132682800293,
+    0.39807406067848206,
+    0.26262494921684265,
+    0.14220169186592102,
+    0.036477357149124146,
+    0.005971625447273254
+  ],
+  "optimizer": "AdamW",
+  "overfit_steps": 40,
+  "packages": {
+    "accelerate": "1.12.0",
+    "datasets": "3.6.0",
+    "fastwam": "0.1.0",
+    "torch": "2.7.1+cu128",
+    "torchcodec": "0.5",
+    "torchvision": "0.22.1+cu128",
+    "transformers": "4.49.0"
+  },
+  "peak_cuda_memory_bytes": 18633728,
+  "platform": "Linux-5.15.0-78-generic-x86_64-with-glibc2.35",
+  "python": "3.10.8",
+  "schema_version": 1,
+  "scope": "40-step tiny overfit with real WanVideoDiT + ActionDiT + MoT and checkpoint reload; no pretrained weights",
+  "stage": "structural",
+  "status": "passed",
+  "torch": {
+    "cuda_available": true,
+    "cuda_runtime": "12.8",
+    "cudnn": 90701,
+    "version": "2.7.1+cu128"
+  },
+  "video_output_shape": [
+    1,
+    4,
+    3,
+    4,
+    4
+  ],
+  "wall_seconds": 3.6418634336441755
+}

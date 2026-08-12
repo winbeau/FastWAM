@@ -1,0 +1,15 @@
+{
+  "action_semantics": "next_absolute_position_waypoint_q_t_plus_1_30hz",
+  "dataset_content_sha256": "16d6c9c99b2381efd286753477c17469159c58fd4d858fa888f56a0f4324774a",
+  "format": "LeRobotDataset v3.0",
+  "frame_count": 5,
+  "lerobot_codebase_version": "v3.0",
+  "lerobot_version": "0.4.4",
+  "repo_id": "local/panthera-fixture",
+  "schema_sha256": "6ae62a733073bb30aec588c2e246490fe46b0df43e58974af0e3e96e5915a00d",
+  "schema_version": "panthera-fastwam-v1",
+  "source_calibration_sha256": "62e40a4fbb4c922d448a5fe419ee75b7c9e4ee4f22c0fd3886e7a1a11207e384",
+  "source_episode_id": "fixture-color-block-000001",
+  "source_panthera_commit": "77cc8aad0b2e278bab6202d1fc61c79a1af18424",
+  "source_staging_sha256": "8bd0d45946998949c78001825e1f775d5d72bd4859b370699c4eb2f4da7de2db"
+}

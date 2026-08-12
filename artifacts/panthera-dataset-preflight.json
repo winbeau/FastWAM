@@ -1,0 +1,33 @@
+{
+  "datasets": [
+    {
+      "dataset_content_sha256": "16d6c9c99b2381efd286753477c17469159c58fd4d858fa888f56a0f4324774a",
+      "decoded_probe_indices": [
+        0,
+        2,
+        4
+      ],
+      "decoded_shapes": {
+        "overhead_rgb": [
+          5,
+          3,
+          64,
+          64
+        ],
+        "wrist_rgb": [
+          5,
+          3,
+          64,
+          64
+        ]
+      },
+      "episodes": 1,
+      "frames": 5,
+      "root": "/home/winbeau/Papers/ICLR2027-WAM-Reprojection/FastWAM/tests/fixtures/panthera_lerobot_v3_minimal",
+      "source_staging_sha256": "8bd0d45946998949c78001825e1f775d5d72bd4859b370699c4eb2f4da7de2db",
+      "status": "passed"
+    }
+  ],
+  "schema_version": 1,
+  "status": "passed"
+}

@@ -1,0 +1,61 @@
+{
+  "dataset_length": 5,
+  "fixture": "tests/fixtures/panthera_lerobot_v3_minimal",
+  "gpu": {
+    "capability": [
+      8,
+      9
+    ],
+    "count": 1,
+    "name": "NVIDIA GeForce RTX 4090",
+    "total_memory_bytes": 50864390144
+  },
+  "hostname": "autodl-container-77prys3ppf-f86a3184",
+  "packages": {
+    "accelerate": "1.12.0",
+    "datasets": "3.6.0",
+    "fastwam": "0.1.0",
+    "torch": "2.7.1+cu128",
+    "torchcodec": "0.5",
+    "torchvision": "0.22.1+cu128",
+    "transformers": "4.49.0"
+  },
+  "platform": "Linux-5.15.0-78-generic-x86_64-with-glibc2.35",
+  "python": "3.10.8",
+  "sample_shapes": {
+    "action": [
+      4,
+      7
+    ],
+    "action_is_pad": [
+      4
+    ],
+    "image_is_pad": [
+      5
+    ],
+    "proprio": [
+      4,
+      7
+    ],
+    "video": [
+      3,
+      5,
+      128,
+      256
+    ]
+  },
+  "schema_version": 1,
+  "stage": "data",
+  "status": "passed",
+  "torch": {
+    "cuda_available": true,
+    "cuda_runtime": "12.8",
+    "cudnn": 90701,
+    "version": "2.7.1+cu128"
+  },
+  "video_value_range": [
+    -1.0,
+    1.0
+  ],
+  "wall_seconds": 1.9216812010854483
+}

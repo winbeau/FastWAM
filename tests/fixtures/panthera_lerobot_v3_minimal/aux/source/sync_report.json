@@ -1,0 +1,51 @@
+{
+  "canonical_ticks": 6,
+  "disk": {
+    "bytes_written": 0,
+    "duration_s": 0.2,
+    "throughput_bytes_s": 0
+  },
+  "duplicate_frames": {
+    "overhead_rgb": 0,
+    "wrist_depth": 0,
+    "wrist_rgb": 0
+  },
+  "missing_frames": {
+    "overhead_rgb": 0,
+    "state": 0,
+    "wrist_depth": 0,
+    "wrist_rgb": 0
+  },
+  "offset_ns": {
+    "overhead_rgb": {
+      "max_abs": 2000000,
+      "p50": -2000000,
+      "p95": -2000000
+    },
+    "state": {
+      "max_abs": 1000000,
+      "p50": -1000000,
+      "p95": -1000000
+    },
+    "wrist_rgb": {
+      "max_abs": 2000000,
+      "p50": -2000000,
+      "p95": -2000000
+    }
+  },
+  "ring_overflows": {
+    "overhead_rgb": 0,
+    "state": 0,
+    "wrist_depth": 0,
+    "wrist_rgb": 0
+  },
+  "sequence_gaps": {
+    "overhead_rgb": 0,
+    "state": 0,
+    "wrist_depth": 0,
+    "wrist_rgb": 0
+  },
+  "state_interpolation_ratio": 0.5,
+  "timestamp_regressions": 0,
+  "valid_ticks": 6
+}

@@ -13,29 +13,40 @@ from fastwam.utils.pytorch_utils import dict_apply
 
 logger = get_logger(__name__)
 
-ConstConstStr = Annotated[str, "format: 'const_min/const_max', where const_min and const_max give the constant range"]
+ConstConstStr = Annotated[
+    str, "format: 'const_min/const_max', where const_min and const_max give the constant range"
+]
 NormMode = Union[Literal["min/max", "q01/q99", "z-score"], ConstConstStr]
+
 
 class LinearNormalizer:
     def __init__(
-            self, 
-            shape_meta, 
-            use_stepwise_action_norm,
-            default_mode: NormMode, 
-            exception_mode: Dict[str, Dict[str, NormMode]], 
-            stats: Dict[str, Dict[str, Dict[str, torch.Tensor]]]
-        ):
+        self,
+        shape_meta,
+        use_stepwise_action_norm,
+        default_mode: NormMode,
+        exception_mode: Dict[str, Dict[str, NormMode]],
+        stats: Dict[str, Dict[str, Dict[str, torch.Tensor]]],
+    ):
         super().__init__()
         self.normalizers = {"action": {}, "state": {}}
         self.stats = stats
 
         for meta in shape_meta["action"]:
             key = meta["key"]
-            
+
             if use_stepwise_action_norm:
-                cur_stats = {k.removeprefix("stepwise_"): v for k, v in stats["action"][key].items() if k.startswith("stepwise_")}
+                cur_stats = {
+                    k.removeprefix("stepwise_"): v
+                    for k, v in stats["action"][key].items()
+                    if k.startswith("stepwise_")
+                }
             else:
-                cur_stats = {k.removeprefix("global_"): v for k, v in stats["action"][key].items() if k.startswith("global_")}
+                cur_stats = {
+                    k.removeprefix("global_"): v
+                    for k, v in stats["action"][key].items()
+                    if k.startswith("global_")
+                }
 
             if exception_mode is not None and "action" in exception_mode and key in exception_mode["action"]:
                 cur_mode = exception_mode["action"][key]
@@ -43,13 +54,17 @@ class LinearNormalizer:
                 cur_mode = default_mode
 
             self.normalizers["action"][key] = SingleFieldLinearNormalizer(
-                stats=cur_stats, 
+                stats=cur_stats,
                 mode=cur_mode,
             )
 
         for meta in shape_meta["state"]:
             key = meta["key"]
-            cur_stats = {k.removeprefix("global_"): v for k, v in stats["state"][key].items() if k.startswith("global_")}
+            cur_stats = {
+                k.removeprefix("global_"): v
+                for k, v in stats["state"][key].items()
+                if k.startswith("global_")
+            }
 
             if exception_mode is not None and "state" in exception_mode and key in exception_mode["state"]:
                 cur_mode = exception_mode["state"][key]
@@ -57,17 +72,17 @@ class LinearNormalizer:
                 cur_mode = default_mode
 
             self.normalizers["state"][key] = SingleFieldLinearNormalizer(
-                stats=cur_stats, 
+                stats=cur_stats,
                 mode=cur_mode,
             )
 
     def get_stats(self):
         stats = {
             "action": {key: norm.get_stats() for key, norm in self.normalizers["action"].items()},
-            "state": {key: norm.get_stats() for key, norm in self.normalizers["state"].items()}
+            "state": {key: norm.get_stats() for key, norm in self.normalizers["state"].items()},
         }
         return stats
-                
+
     def forward(self, batch: Dict[str, Dict[str, torch.Tensor]]) -> torch.Tensor:
         if "action" in batch:
             for key, norm in self.normalizers["action"].items():
@@ -77,14 +92,14 @@ class LinearNormalizer:
             batch["state"][key] = norm.forward(batch["state"][key])
 
         return batch
-    
+
     def backward(self, batch: Dict[str, Dict[str, torch.Tensor]]) -> torch.Tensor:
         for key, norm in self.normalizers["action"].items():
             batch["action"][key] = norm.backward(batch["action"][key])
 
         for key, norm in self.normalizers["state"].items():
             batch["state"][key] = norm.backward(batch["state"][key])
-        
+
         return batch
 
 
@@ -93,20 +108,21 @@ class SingleFieldLinearNormalizer:
     range_tol = 1e-4
     output_max = 1.0
     output_min = -1.0
-    def __init__(self, stats, mode: NormMode="min/max"):
+
+    def __init__(self, stats, mode: NormMode = "min/max"):
         self.stats = stats
         self.mode = mode
 
         if mode == "z-score":
             input_mean, input_std = stats["mean"], stats["std"]
             scale = 1.0 / (input_std + self.std_reg)
-            offset = - input_mean / (input_std + self.std_reg)
+            offset = -input_mean / (input_std + self.std_reg)
         else:
             if mode == "min/max":
                 input_min, input_max = stats["min"], stats["max"]
             elif mode == "q01/q99":
                 input_min, input_max = stats["q01"], stats["q99"]
-            else: 
+            else:
                 # parse const_min/const_max
                 input_min, input_max = map(float, mode.split("/"))
                 input_min = torch.full_like(stats["min"], input_min)
@@ -121,6 +137,7 @@ class SingleFieldLinearNormalizer:
 
         self.scale = scale
         self.offset = offset
+
     def get_stats(self):
         return self.stats
 
@@ -128,9 +145,11 @@ class SingleFieldLinearNormalizer:
         x = x * self.scale + self.offset
         x = torch.clamp(x, -5.0, 5.0)
         return x
+
     def backward(self, x: torch.Tensor) -> torch.Tensor:
         x = (x - self.offset) / self.scale
         return x
+
 
 def save_dataset_stats_to_json(dataset_stats: dict, file_path: str):
 
@@ -145,19 +164,20 @@ def save_dataset_stats_to_json(dataset_stats: dict, file_path: str):
             return obj
         else:
             return str(obj)
-    
+
     serializable_stats = convert_tensor(dataset_stats)
-    
-    with open(file_path, 'w', encoding='utf-8') as f:
+    Path(file_path).parent.mkdir(parents=True, exist_ok=True)
+
+    with open(file_path, "w", encoding="utf-8") as f:
         json.dump(serializable_stats, f, ensure_ascii=False, indent=2)
 
-def load_dataset_stats_from_json(file_path: str, 
-                                 try_convert_tensor: bool = True) -> Dict[str, Any]:
+
+def load_dataset_stats_from_json(file_path: str, try_convert_tensor: bool = True) -> Dict[str, Any]:
 
     def is_numeric_list(obj):
         if isinstance(obj, list):
             if not obj:
-                return True  
+                return True
             first = obj[0]
             if isinstance(first, (int, float)):
                 return all(isinstance(x, (int, float)) for x in obj)
@@ -182,7 +202,7 @@ def load_dataset_stats_from_json(file_path: str,
         else:
             return obj
 
-    with open(file_path, 'r', encoding='utf-8') as f:
+    with open(file_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
     if try_convert_tensor:
@@ -196,7 +216,9 @@ def load_dataset_stats_from_json(file_path: str,
     return data
 
 
-def search_dataset_stats_cache_json(cache_dir: str | Path, data_config: DictConfig) -> Tuple[bool, str | None]:
+def search_dataset_stats_cache_json(
+    cache_dir: str | Path, data_config: DictConfig
+) -> Tuple[bool, str | None]:
     if isinstance(cache_dir, str):
         cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -264,7 +286,7 @@ def search_dataset_stats_cache_json(cache_dir: str | Path, data_config: DictConf
         return normalize_transforms(transforms)
 
     signature = {
-        "action_size": data_config.dataset.action_size, 
+        "action_size": data_config.dataset.action_size,
         "dataset_dirs": normalize_dataset_dirs(data_config),
         "action_state_transforms": normalize_action_state_transforms(data_config),
     }
@@ -275,17 +297,21 @@ def search_dataset_stats_cache_json(cache_dir: str | Path, data_config: DictConf
     precise_name = f"dataset_stats_{dataset_hash}_{git_hash}.json"
     precise = cache_dir / precise_name
     if precise.exists():
-        logger.info(f"Found dataset stats cache with precisely matching dataset and git hash: {precise_name}.")
+        logger.info(
+            f"Found dataset stats cache with precisely matching dataset and git hash: {precise_name}."
+        )
         return True, str(precise)
-    
+
     candidates = sorted(cache_dir.glob(f"dataset_stats_{dataset_hash}_*.json"))
     if not candidates:
         logger.info(f"No dataset stats cache found for dataset hash {dataset_hash}")
-        return False, str(precise) # return precise cache path for saving cache
+        return False, str(precise)  # return precise cache path for saving cache
 
     picked = candidates[0]
     prefix = f"dataset_stats_{dataset_hash}_"
-    picked_git_hash = picked.name[len(prefix):-5]
+    picked_git_hash = picked.name[len(prefix) : -5]
     assert picked_git_hash != git_hash
-    logger.warning(f"Found substitute dataset stats cache {picked.name} which mismatch current git hash {git_hash}.")
+    logger.warning(
+        f"Found substitute dataset stats cache {picked.name} which mismatch current git hash {git_hash}."
+    )
     return True, str(picked)

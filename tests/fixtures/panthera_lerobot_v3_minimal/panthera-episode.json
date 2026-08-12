@@ -1,0 +1,56 @@
+{
+  "action_semantics": "next_absolute_position_waypoint_q_t_plus_1_30hz",
+  "action_source": "next_state_pseudo_action",
+  "aliases_en": [
+    "Move the red block to the target."
+  ],
+  "aliases_zh": [
+    "把红色方块移到目标区"
+  ],
+  "calibration_sha256": "62e40a4fbb4c922d448a5fe419ee75b7c9e4ee4f22c0fd3886e7a1a11207e384",
+  "camera_state_offset_frames": 0,
+  "cameras": {
+    "overhead": {
+      "model": "C920e",
+      "serial": "fixture-c920e"
+    },
+    "wrist": {
+      "model": "D405",
+      "serial": "fixture-d405"
+    }
+  },
+  "canonical_task": "Move the red block from the start area to the target area.",
+  "depth": {
+    "complete": true,
+    "requested": true
+  },
+  "episode_id": "fixture-color-block-000001",
+  "failure_reason": null,
+  "finished_monotonic_ns": 1200000000,
+  "finished_wall_time": "2026-01-01T00:00:00.200000Z",
+  "fps": 30,
+  "identity": {
+    "action_units_version": "panthera-7axis-rad-nativegripper-v1",
+    "calibration_version": "fixture-calibration-v1",
+    "camera_mount_version": "fixture-camera-mount-v1",
+    "dataset_id": "panthera-color-block-fixture-v1",
+    "roi_version": "fixture-roi-v1",
+    "task_id": "color_block_red_to_target_v1"
+  },
+  "offset_estimation_method": "synthetic_exact",
+  "operator": "synthetic-fixture",
+  "panthera_wam_commit": "77cc8aad0b2e278bab6202d1fc61c79a1af18424",
+  "queue_policy": {
+    "camera_capacity": 64,
+    "overflow_policy": "explicit_episode_rejection",
+    "state_capacity": 4096
+  },
+  "robot": {
+    "model": "Panthera-HT",
+    "serial": "fixture-robot"
+  },
+  "schema_version": "panthera-fastwam-v1",
+  "started_monotonic_ns": 1000000000,
+  "started_wall_time": "2026-01-01T00:00:00Z",
+  "success": true
+}

@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "status": "structural_smoke_passed_full_model_blocked",
+  "environment": {
+    "host": "autodl-container-77prys3ppf-f86a3184",
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "torch": "2.7.1+cu128",
+    "uv_lock_sha256": "0dd898d259089b5195d325b2170310961d8ba772429fe0f96312f29c401f6798"
+  },
+  "data": {
+    "scope": "synthetic deterministic compatibility fixture, not real robot data",
+    "dataset_content_sha256": "16d6c9c99b2381efd286753477c17469159c58fd4d858fa888f56a0f4324774a",
+    "dataset_preflight_sha256": "78d64e2d499ccc94c20895de696706652901f03b236f46f38f09c7f847a483b5",
+    "normalization_stats_sha256": "9bf95059dd78498dbe2af5968226e9d7586bfb7b92af14bbc4e321698447342f",
+    "asset_manifest_sha256": "68aee38219d5053bfc7a4aaa9e6f0b2ca8ef44ffed0f078d1a83c2cb62bbb16f",
+    "compatibility_manifest_sha256": "50e51e6f2ec50e89e06431d0168a4211621e525262d8fa94d3fb38f04cd2d3c1"
+  },
+  "model": {
+    "scope": "tiny randomly initialized real WanVideoDiT + ActionDiT + MoT classes",
+    "pretrained_weights_loaded": false,
+    "overfit_steps": 40,
+    "loss_initial": 0.45972132682800293,
+    "loss_final": 0.005971625447273254,
+    "loss_ratio": 0.012989663734933573,
+    "checkpoint_sha256": "45750a403df72424b6a6f2b64b0d90f57de8e9324224b009e0c1d29444103d96",
+    "checkpoint_reload_verified": true,
+    "structural_report_sha256": "495cb588e88b57b1cf14f5f2063467b6a3aa35567b79582f02b22ddeb340a5c3"
+  },
+  "blocked": [
+    "AutoDL cannot reach huggingface.co",
+    "Hugging Face cache is empty",
+    "Wan2.2 video model, Wan2.1 tokenizer/text encoder, and ActionDiT backbone are absent",
+    "real Panthera collection is blocked by Pi SSD and deployed service configuration gates"
+  ]
+}

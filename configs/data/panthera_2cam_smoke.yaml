@@ -1,0 +1,59 @@
+train:
+  _target_: fastwam.datasets.lerobot.robot_video_dataset.RobotVideoDataset
+  dataset_dirs:
+    - ${oc.env:PANTHERA_DATASET_DIR,./data/panthera_lerobot_v3}
+  dataset_format: panthera_v3
+  video_backend: pyav
+  video_tolerance_s: 1.0e-4
+  random_fallback_on_error: false
+  shape_meta:
+    images:
+      - key: overhead_rgb
+        raw_shape: [3, 1080, 1920]
+        shape: [3, 128, 128]
+      - key: wrist_rgb
+        raw_shape: [3, 480, 640]
+        shape: [3, 128, 128]
+    action:
+      - key: default
+        raw_shape: 7
+        shape: 7
+    state:
+      - key: default
+        raw_shape: 7
+        shape: 7
+  num_frames: 5
+  global_sample_stride: 1
+  action_video_freq_ratio: 1
+  video_size: [128, 256]
+  camera_key: null
+  val_set_proportion: 0.0
+  is_training_set: true
+  skip_padding_as_possible: false
+  concat_multi_camera: horizontal
+  processor:
+    _target_: fastwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor
+    shape_meta: ${data.train.shape_meta}
+    num_obs_steps: ${data.train.num_frames}
+    num_output_cameras: 2
+    action_output_dim: 7
+    proprio_output_dim: 7
+    delta_action_dim_mask:
+      default: [false, false, false, false, false, false, false]
+    action_state_transforms: null
+    use_stepwise_action_norm: false
+    norm_default_mode: min/max
+    norm_exception_mode: null
+    action_state_merger:
+      _target_: fastwam.datasets.lerobot.transforms.action_state_merger.ConcatLeftAlign
+    train_transforms:
+      - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+      - _target_: torchvision.transforms.Resize
+        size: [128, 128]
+    val_transforms:
+      - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+      - _target_: torchvision.transforms.Resize
+        size: [128, 128]
+  text_embedding_cache_dir: ${oc.env:PANTHERA_TEXT_EMBED_CACHE,./data/text_embeds_cache/panthera}
+  context_len: 128
+  pretrained_norm_stats: null

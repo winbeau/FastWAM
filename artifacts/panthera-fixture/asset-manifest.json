@@ -1,0 +1,69 @@
+{
+  "compatibility_manifest": {
+    "path": "/home/winbeau/Papers/ICLR2027-WAM-Reprojection/FastWAM/lerobot-compatibility.json",
+    "sha256": "50e51e6f2ec50e89e06431d0168a4211621e525262d8fa94d3fb38f04cd2d3c1"
+  },
+  "dataset_preflight": [
+    {
+      "dataset_content_sha256": "16d6c9c99b2381efd286753477c17469159c58fd4d858fa888f56a0f4324774a",
+      "decoded_probe_indices": [
+        0,
+        2,
+        4
+      ],
+      "decoded_shapes": {
+        "overhead_rgb": [
+          5,
+          3,
+          64,
+          64
+        ],
+        "wrist_rgb": [
+          5,
+          3,
+          64,
+          64
+        ]
+      },
+      "episodes": 1,
+      "frames": 5,
+      "root": "/home/winbeau/Papers/ICLR2027-WAM-Reprojection/FastWAM/tests/fixtures/panthera_lerobot_v3_minimal",
+      "source_staging_sha256": "8bd0d45946998949c78001825e1f775d5d72bd4859b370699c4eb2f4da7de2db",
+      "status": "passed"
+    }
+  ],
+  "limitations": [
+    "real T5 text embeddings have not been generated for every task"
+  ],
+  "normalization": {
+    "absolute_action_round_trip_verified": true,
+    "delta_action_dim_mask": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ],
+    "mode": "global min/max",
+    "path": "/home/winbeau/Papers/ICLR2027-WAM-Reprojection/FastWAM/artifacts/panthera-fixture/dataset_stats.json",
+    "sha256": "9bf95059dd78498dbe2af5968226e9d7586bfb7b92af14bbc4e321698447342f"
+  },
+  "schema_version": 1,
+  "text_embeddings": {
+    "cache_dir": null,
+    "ready": false,
+    "records": [
+      {
+        "filename": "ccf55c2bd270916d416a6345b2f72e6410b2c46c78de5b6dd517e953ccf71431.t5_len128.wan22ti2v5b.pt",
+        "present": false,
+        "prompt_sha256": "ccf55c2bd270916d416a6345b2f72e6410b2c46c78de5b6dd517e953ccf71431",
+        "sha256": null,
+        "task": "Move the red block from the start area to the target area."
+      }
+    ],
+    "task_rows": 1
+  },
+  "training_ready": false
+}

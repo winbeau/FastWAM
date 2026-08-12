@@ -1,0 +1,79 @@
+{
+  "collector": {
+    "canonical_rate_hz": 30,
+    "loss_policy": "bounded rings with explicit DATA_LOSS and episode rejection",
+    "repo_commit": "77cc8aad0b2e278bab6202d1fc61c79a1af18424",
+    "source_sha256": "faed9257dceff19ed4c11085d74d18bd7cd3c15f6af57c4b9924dfa047e28bb7",
+    "state_rate_hz": 200
+  },
+  "consumer": {
+    "repo_commit": "45d8e1458921d83f8ad6cf9ce993d371208dabd0",
+    "source_sha256": "8b3177cf330a5103d05569fdebacdcd0524e08cc0ac5f3b7dd064977677bfba2"
+  },
+  "decision": {
+    "consumer_environment": "FastWAM uv project, CUDA 12.8, direct frozen-v3 reader",
+    "exact_lerobot_version": "0.4.4",
+    "producer_environment": "isolated uv project, CPU-only, Linux x86_64",
+    "reason": "LeRobot 0.4.x requires datasets>=4 and rerun-sdk/numpy>=2, while FastWAM and the Panthera hardware runtime retain incompatible dependency baselines. The producer is therefore isolated; the consumer reads the pinned v3 parquet/video contract without importing the official lerobot package."
+  },
+  "fixture": {
+    "consumer_dataset_content_sha256": "16d6c9c99b2381efd286753477c17469159c58fd4d858fa888f56a0f4324774a",
+    "consumer_dataset_sha256": "60b059b74e6700d98fa0360a1e7a7a4b006485530d96f53274762f3cc44f257b",
+    "consumer_path": "FastWAM/tests/fixtures/panthera_lerobot_v3_minimal",
+    "frame_count": 5,
+    "producer_path": "Panthera-WAM/tools/lerobot-v3/tests/fixtures/panthera_staging_minimal",
+    "producer_staging_sha256": "8bd0d45946998949c78001825e1f775d5d72bd4859b370699c4eb2f4da7de2db",
+    "source_calibration_sha256": "62e40a4fbb4c922d448a5fe419ee75b7c9e4ee4f22c0fd3886e7a1a11207e384",
+    "source_panthera_commit": "77cc8aad0b2e278bab6202d1fc61c79a1af18424"
+  },
+  "lerobot": {
+    "codebase_version": "v3.0",
+    "critical_requirements": [
+      "datasets<5.0.0,>=4.0.0",
+      "huggingface-hub[cli,hf-transfer]<0.36.0,>=0.34.2",
+      "accelerate<2.0.0,>=1.10.0",
+      "av<16.0.0,>=15.0.0",
+      "torch<2.11.0,>=2.2.1",
+      "torchcodec<0.11.0,>=0.2.1; sys_platform != \"win32\" and (sys_platform != \"linux\" or (platform_machine != \"aarch64\" and platform_machine != \"arm64\" and platform_machine != \"armv7l\")) and (sys_platform != \"darwin\" or platform_machine != \"x86_64\")",
+      "torchvision<0.26.0,>=0.21.0",
+      "rerun-sdk<0.27.0,>=0.24.0",
+      "transformers<5.0.0,>=4.57.1; extra == \"transformers-dep\"",
+      "transformers==4.49.0; extra == \"wallx\"",
+      "torchdiffeq==0.2.5; extra == \"wallx\"",
+      "accelerate<2.0.0,>=1.7.0; extra == \"smolvla\""
+    ],
+    "package_version": "0.4.4",
+    "pypi_json_sha256": "7d1d24e99f28300513288561476eb75d4070d1dd3ce7cabbf457395364408381"
+  },
+  "locks": {
+    "fastwam_uv_lock_sha256": "0dd898d259089b5195d325b2170310961d8ba772429fe0f96312f29c401f6798",
+    "panthera_runtime_uv_lock_sha256": "bc3bb9f733f5119e12f1421742f6ec22518fa3c10bda6cf7071fac1c6c01d05b",
+    "producer_uv_lock_sha256": "0d53069f1b2b5d6292e8d13a93cd5f72a93f92a73ae605ddfd38e78affb9dac8"
+  },
+  "manifest_version": 1,
+  "producer": {
+    "repo_commit": "77cc8aad0b2e278bab6202d1fc61c79a1af18424",
+    "source_sha256": "bf8d2926193626cedc5b868120c12774c60a2df9e248c0dc1e5e153a7ea4792b"
+  },
+  "schema": {
+    "action_semantics": "next_absolute_position_waypoint_q_t_plus_1_30hz",
+    "axes": [
+      "joint_1",
+      "joint_2",
+      "joint_3",
+      "joint_4",
+      "joint_5",
+      "joint_6",
+      "gripper"
+    ],
+    "camera_order": [
+      "overhead_rgb",
+      "wrist_rgb"
+    ],
+    "color_space": "RGB",
+    "depth_policy": "sidecar_only_not_fastwam_rgb_input",
+    "schema_sha256": "6ae62a733073bb30aec588c2e246490fe46b0df43e58974af0e3e96e5915a00d",
+    "schema_version": "panthera-fastwam-v1",
+    "staging_samples": "samples.parquet"
+  }
+}

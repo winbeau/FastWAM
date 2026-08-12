@@ -1,0 +1,55 @@
+{
+  "action_semantics": "next_absolute_position_waypoint_q_t_plus_1_30hz",
+  "action_units": [
+    "rad",
+    "rad",
+    "rad",
+    "rad",
+    "rad",
+    "rad",
+    "native_gripper_position"
+  ],
+  "aliases_en": [
+    "Move the red block to the target."
+  ],
+  "aliases_zh": [
+    "把红色方块移到目标区"
+  ],
+  "axes": [
+    "joint_1",
+    "joint_2",
+    "joint_3",
+    "joint_4",
+    "joint_5",
+    "joint_6",
+    "gripper"
+  ],
+  "camera_order": [
+    "overhead_rgb",
+    "wrist_rgb"
+  ],
+  "canonical_task": "Move the red block from the start area to the target area.",
+  "color_space": "RGB",
+  "depth_policy": "sidecar_only_not_fastwam_rgb_input",
+  "fps": 30,
+  "identity": {
+    "action_units_version": "panthera-7axis-rad-nativegripper-v1",
+    "calibration_version": "fixture-calibration-v1",
+    "camera_mount_version": "fixture-camera-mount-v1",
+    "dataset_id": "panthera-color-block-fixture-v1",
+    "roi_version": "fixture-roi-v1",
+    "task_id": "color_block_red_to_target_v1"
+  },
+  "lerobot_codebase_version": "v3.0",
+  "lerobot_version": "0.4.4",
+  "schema_version": "panthera-fastwam-v1",
+  "state_units": [
+    "rad",
+    "rad",
+    "rad",
+    "rad",
+    "rad",
+    "rad",
+    "native_gripper_position"
+  ]
+}

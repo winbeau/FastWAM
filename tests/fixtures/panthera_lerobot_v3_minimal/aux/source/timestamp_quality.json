@@ -1,0 +1,34 @@
+{
+  "coverage_fraction": 1.0,
+  "overhead_rgb": {
+    "coverage_fraction": 1.0,
+    "quality": "capture_estimated",
+    "source": "v4l2_buffer_timestamp_mapped_to_pi_monotonic"
+  },
+  "state": {
+    "coverage_fraction": 1.0,
+    "quality": "pi_monotonic_sampled",
+    "source": "hardware_loop_state_tap"
+  },
+  "timestamp_regressions": 0,
+  "wrist_depth": {
+    "affine_fit": {
+      "drift_ppm": 0.0,
+      "residual_p95_ns": 0,
+      "slope": 1.0
+    },
+    "coverage_fraction": 1.0,
+    "quality": "device_clock_mapped",
+    "source": "realsense_device_clock_affine_mapped_to_pi_monotonic"
+  },
+  "wrist_rgb": {
+    "affine_fit": {
+      "drift_ppm": 0.0,
+      "residual_p95_ns": 0,
+      "slope": 1.0
+    },
+    "coverage_fraction": 1.0,
+    "quality": "device_clock_mapped",
+    "source": "realsense_device_clock_affine_mapped_to_pi_monotonic"
+  }
+}

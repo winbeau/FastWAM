@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "fastwam"
 version = "0.1.0"
 description = "FastWAM: standalone Wan2.2-TI2V-5B training/inference package"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.11"
 dependencies = [
   "accelerate==1.12.0",
   "av==16.0.1",
@@ -38,6 +38,20 @@ dependencies = [
   "transformers==4.49.0",
   "typing-extensions==4.15.0",
   "wandb==0.23.1",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+
+[dependency-groups]
+dev = [
+  "pytest==8.4.2",
 ]
 
 [tool.setuptools.package-dir]

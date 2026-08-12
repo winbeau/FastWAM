@@ -1,0 +1,297 @@
+{
+    "codebase_version": "v3.0",
+    "robot_type": "panthera_ht_c920e_d405",
+    "total_episodes": 1,
+    "total_frames": 5,
+    "total_tasks": 1,
+    "chunks_size": 1000,
+    "data_files_size_in_mb": 100,
+    "video_files_size_in_mb": 200,
+    "fps": 30,
+    "splits": {
+        "train": "0:1"
+    },
+    "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
+    "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
+    "features": {
+        "observation.images.overhead_rgb": {
+            "dtype": "video",
+            "shape": [
+                64,
+                64,
+                3
+            ],
+            "names": [
+                "height",
+                "width",
+                "channels"
+            ],
+            "info": {
+                "video.height": 64,
+                "video.width": 64,
+                "video.codec": "h264",
+                "video.pix_fmt": "yuv420p",
+                "video.is_depth_map": false,
+                "video.fps": 30,
+                "video.channels": 3,
+                "has_audio": false
+            }
+        },
+        "observation.images.wrist_rgb": {
+            "dtype": "video",
+            "shape": [
+                64,
+                64,
+                3
+            ],
+            "names": [
+                "height",
+                "width",
+                "channels"
+            ],
+            "info": {
+                "video.height": 64,
+                "video.width": 64,
+                "video.codec": "h264",
+                "video.pix_fmt": "yuv420p",
+                "video.is_depth_map": false,
+                "video.fps": 30,
+                "video.channels": 3,
+                "has_audio": false
+            }
+        },
+        "observation.state": {
+            "dtype": "float32",
+            "shape": [
+                7
+            ],
+            "names": [
+                "joint_1",
+                "joint_2",
+                "joint_3",
+                "joint_4",
+                "joint_5",
+                "joint_6",
+                "gripper"
+            ]
+        },
+        "observation.velocity": {
+            "dtype": "float32",
+            "shape": [
+                7
+            ],
+            "names": [
+                "joint_1",
+                "joint_2",
+                "joint_3",
+                "joint_4",
+                "joint_5",
+                "joint_6",
+                "gripper"
+            ]
+        },
+        "action": {
+            "dtype": "float32",
+            "shape": [
+                7
+            ],
+            "names": [
+                "joint_1",
+                "joint_2",
+                "joint_3",
+                "joint_4",
+                "joint_5",
+                "joint_6",
+                "gripper"
+            ]
+        },
+        "panthera.tick_monotonic_ns": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": [
+                "tick_monotonic_ns"
+            ]
+        },
+        "panthera.state_sampled_monotonic_ns": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": [
+                "state_sampled_monotonic_ns"
+            ]
+        },
+        "panthera.state_sequence": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": [
+                "state_sequence"
+            ]
+        },
+        "panthera.state_interpolated": {
+            "dtype": "int8",
+            "shape": [
+                1
+            ],
+            "names": [
+                "state_interpolated"
+            ]
+        },
+        "panthera.overhead_sequence": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": [
+                "overhead_sequence"
+            ]
+        },
+        "panthera.overhead_host_receive_ns": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": [
+                "overhead_host_receive_ns"
+            ]
+        },
+        "panthera.overhead_host_publish_ns": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": [
+                "overhead_host_publish_ns"
+            ]
+        },
+        "panthera.overhead_estimated_capture_ns": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": [
+                "overhead_estimated_capture_ns"
+            ]
+        },
+        "panthera.overhead_device_timestamp_raw": {
+            "dtype": "float64",
+            "shape": [
+                1
+            ],
+            "names": [
+                "overhead_device_timestamp_raw"
+            ]
+        },
+        "panthera.overhead_delta_ns": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": [
+                "overhead_delta_ns"
+            ]
+        },
+        "panthera.wrist_sequence": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": [
+                "wrist_sequence"
+            ]
+        },
+        "panthera.wrist_host_receive_ns": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": [
+                "wrist_host_receive_ns"
+            ]
+        },
+        "panthera.wrist_host_publish_ns": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": [
+                "wrist_host_publish_ns"
+            ]
+        },
+        "panthera.wrist_estimated_capture_ns": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": [
+                "wrist_estimated_capture_ns"
+            ]
+        },
+        "panthera.wrist_device_timestamp_raw": {
+            "dtype": "float64",
+            "shape": [
+                1
+            ],
+            "names": [
+                "wrist_device_timestamp_raw"
+            ]
+        },
+        "panthera.wrist_delta_ns": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": [
+                "wrist_delta_ns"
+            ]
+        },
+        "panthera.sync_ok": {
+            "dtype": "int8",
+            "shape": [
+                1
+            ],
+            "names": [
+                "sync_ok"
+            ]
+        },
+        "timestamp": {
+            "dtype": "float32",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "frame_index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "episode_index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "task_index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        }
+    }
+}
