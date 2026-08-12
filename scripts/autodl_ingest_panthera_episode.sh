@@ -44,13 +44,18 @@ done
 export UV_CACHE_DIR="${UV_CACHE_DIR:-/root/autodl-tmp/uv-cache}"
 mkdir -p "$UV_CACHE_DIR" "$root/downloads" "$root/staging" "$root/lerobot-v3"
 
-uv run --frozen python scripts/hf_fetch_panthera_episode.py \
-    "$episode_id" \
-    --revision "$revision" \
-    --kind "$kind" \
-    --repo-id "$repo_id" \
-    --download-dir "$root/downloads" \
+fetch_args=(
+    "$episode_id"
+    --revision "$revision"
+    --kind "$kind"
+    --repo-id "$repo_id"
+    --download-dir "$root/downloads"
     --output-root "$root/staging"
+)
+if [[ "${PANTHERA_ALLOW_LEGACY_HF_MANIFEST:-0}" == "1" ]]; then
+    fetch_args+=(--allow-legacy-manifest)
+fi
+uv run --frozen python scripts/hf_fetch_panthera_episode.py "${fetch_args[@]}"
 
 (
     cd "$producer"

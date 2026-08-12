@@ -29,7 +29,13 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _load_manifest(path: Path, *, episode_id: str, kind: str) -> dict[str, Any]:
+def _load_manifest(
+    path: Path,
+    *,
+    episode_id: str,
+    kind: str,
+    allow_legacy_manifest: bool = False,
+) -> dict[str, Any]:
     try:
         manifest = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -38,7 +44,6 @@ def _load_manifest(path: Path, *, episode_id: str, kind: str) -> dict[str, Any]:
         raise HFEpisodeFetchError("episode manifest must be a JSON object")
     expected = {
         "schema_version": 1,
-        "layout": "panthera-hf-episode-v1",
         "episode_id": episode_id,
         "kind": kind,
         "archive": f"{episode_id}.tar",
@@ -49,18 +54,40 @@ def _load_manifest(path: Path, *, episode_id: str, kind: str) -> dict[str, Any]:
             raise HFEpisodeFetchError(
                 f"episode manifest {field} mismatch: {manifest.get(field)!r} != {value!r}"
             )
+    layout = manifest.get("layout")
+    legacy_manifest = layout is None
+    if legacy_manifest and not allow_legacy_manifest:
+        raise HFEpisodeFetchError(
+            "episode manifest layout is missing; pass --allow-legacy-manifest only for a verified v0 bundle"
+        )
+    if not legacy_manifest and layout != "panthera-hf-episode-v1":
+        raise HFEpisodeFetchError(
+            f"episode manifest layout mismatch: {layout!r} != 'panthera-hf-episode-v1'"
+        )
     digest = manifest.get("sha256")
     if not isinstance(digest, str) or len(digest) != 64 or any(
         character not in "0123456789abcdef" for character in digest
     ):
         raise HFEpisodeFetchError("episode manifest sha256 is invalid")
     archive_bytes = manifest.get("archive_bytes")
-    if isinstance(archive_bytes, bool) or not isinstance(archive_bytes, int) or archive_bytes <= 0:
+    if archive_bytes is not None and (
+        isinstance(archive_bytes, bool) or not isinstance(archive_bytes, int) or archive_bytes <= 0
+    ):
         raise HFEpisodeFetchError("episode manifest archive_bytes is invalid")
+    if archive_bytes is None and not legacy_manifest:
+        raise HFEpisodeFetchError("episode manifest archive_bytes is invalid")
+    manifest = dict(manifest)
+    manifest["legacy_manifest"] = legacy_manifest
     return manifest
 
 
-def verify_bundle(bundle_dir: str | Path, *, episode_id: str, kind: str) -> dict[str, Any]:
+def verify_bundle(
+    bundle_dir: str | Path,
+    *,
+    episode_id: str,
+    kind: str,
+    allow_legacy_manifest: bool = False,
+) -> dict[str, Any]:
     directory = Path(bundle_dir).expanduser().resolve()
     archive = directory / f"{episode_id}.tar"
     checksum = directory / f"{episode_id}.sha256"
@@ -68,7 +95,12 @@ def verify_bundle(bundle_dir: str | Path, *, episode_id: str, kind: str) -> dict
     for path in (archive, checksum, manifest_path):
         if not path.is_file() or path.is_symlink():
             raise HFEpisodeFetchError(f"bundle file is unavailable: {path}")
-    manifest = _load_manifest(manifest_path, episode_id=episode_id, kind=kind)
+    manifest = _load_manifest(
+        manifest_path,
+        episode_id=episode_id,
+        kind=kind,
+        allow_legacy_manifest=allow_legacy_manifest,
+    )
     try:
         fields = checksum.read_text(encoding="utf-8").strip().split()
     except OSError as exc:
@@ -81,8 +113,11 @@ def verify_bundle(bundle_dir: str | Path, *, episode_id: str, kind: str) -> dict
     actual = sha256_file(archive)
     if actual != expected:
         raise HFEpisodeFetchError(f"archive checksum mismatch: {actual} != {expected}")
-    if manifest.get("archive_bytes") != archive.stat().st_size:
+    archive_bytes = manifest.get("archive_bytes")
+    if archive_bytes is not None and archive_bytes != archive.stat().st_size:
         raise HFEpisodeFetchError("archive size does not match the manifest")
+    if archive_bytes is None:
+        manifest = {**manifest, "archive_bytes": archive.stat().st_size}
     return manifest
 
 
@@ -120,8 +155,14 @@ def extract_bundle(
     *,
     episode_id: str,
     kind: str,
+    allow_legacy_manifest: bool = False,
 ) -> tuple[Path, dict[str, Any]]:
-    manifest = verify_bundle(bundle_dir, episode_id=episode_id, kind=kind)
+    manifest = verify_bundle(
+        bundle_dir,
+        episode_id=episode_id,
+        kind=kind,
+        allow_legacy_manifest=allow_legacy_manifest,
+    )
     directory = Path(bundle_dir).expanduser().resolve()
     output = Path(output_root).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -162,6 +203,7 @@ def download_bundle(
     episode_id: str,
     kind: str,
     hf_binary: str = "hf",
+    allow_legacy_manifest: bool = False,
 ) -> Path:
     if len(revision) != 40 or any(character not in "0123456789abcdef" for character in revision):
         raise HFEpisodeFetchError("--revision must be a 40-character lowercase commit SHA")
@@ -198,7 +240,12 @@ def download_bundle(
             f"Hugging Face download failed: {combined[-4000:] or completed.returncode}"
         )
     bundle = destination / remote
-    verify_bundle(bundle, episode_id=episode_id, kind=kind)
+    verify_bundle(
+        bundle,
+        episode_id=episode_id,
+        kind=kind,
+        allow_legacy_manifest=allow_legacy_manifest,
+    )
     return bundle
 
 
@@ -221,6 +268,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("/root/autodl-tmp/fastwam-lerobot/staging"),
     )
     parser.add_argument("--hf-binary", default="hf")
+    parser.add_argument(
+        "--allow-legacy-manifest",
+        action="store_true",
+        help="Accept the verified pre-v1 manifest that lacks layout/archive_bytes",
+    )
     parser.add_argument("--bundle-dir", type=Path, help="Verify/extract an existing local bundle")
     return parser
 
@@ -241,12 +293,14 @@ def main() -> None:
                     episode_id=args.episode_id,
                     kind=args.kind,
                     hf_binary=args.hf_binary,
+                    allow_legacy_manifest=args.allow_legacy_manifest,
                 )
                 output, manifest = extract_bundle(
                     bundle,
                     args.output_root,
                     episode_id=args.episode_id,
                     kind=args.kind,
+                    allow_legacy_manifest=args.allow_legacy_manifest,
                 )
         else:
             output, manifest = extract_bundle(
@@ -254,6 +308,7 @@ def main() -> None:
                 args.output_root,
                 episode_id=args.episode_id,
                 kind=args.kind,
+                allow_legacy_manifest=args.allow_legacy_manifest,
             )
     except HFEpisodeFetchError as exc:
         raise SystemExit(str(exc)) from exc

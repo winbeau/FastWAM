@@ -67,6 +67,26 @@ def test_verify_and_extract_bundle(tmp_path: Path) -> None:
     assert (output / "samples.parquet").is_file()
 
 
+def test_legacy_manifest_requires_explicit_opt_in(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path / "bundle", kind="smoke")
+    manifest_path = bundle / "episode-000001.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest.pop("layout")
+    manifest.pop("archive_bytes")
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(HFEpisodeFetchError, match="allow-legacy-manifest"):
+        verify_bundle(bundle, episode_id="episode-000001", kind="smoke")
+    accepted = verify_bundle(
+        bundle,
+        episode_id="episode-000001",
+        kind="smoke",
+        allow_legacy_manifest=True,
+    )
+    assert accepted["legacy_manifest"] is True
+    assert accepted["archive_bytes"] == (bundle / "episode-000001.tar").stat().st_size
+
+
 def test_verify_rejects_checksum_manifest_and_size_mismatch(tmp_path: Path) -> None:
     bundle = _bundle(tmp_path / "bundle")
     archive = bundle / "episode-000001.tar"
