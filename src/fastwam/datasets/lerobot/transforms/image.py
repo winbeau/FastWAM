@@ -3,6 +3,11 @@ import torch.nn as nn
 import torchvision.transforms as TF
 
 
+def fastwam_validation_image_transforms(size: tuple[int, int] | list[int]) -> list[nn.Module]:
+    """Canonical deterministic FastWAM validation path used by training and serving."""
+    return [ToTensor(), TF.Resize(size=list(size))]
+
+
 class ToTensor(nn.Module):
     def __init__(self):
         super().__init__()

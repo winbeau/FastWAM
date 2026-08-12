@@ -91,11 +91,11 @@ class PolicyRequest:
         if not isinstance(payload, dict):
             raise PolicyRequestError("request body must be a JSON object")
         task_id = _string(payload, "task_id")
-        prompt = _string(payload, "canonical_prompt")
-        expected_prompt = task_registry.get(task_id)
-        if expected_prompt is None:
+        canonical_task = _string(payload, "canonical_prompt")
+        expected_task = task_registry.get(task_id)
+        if expected_task is None:
             raise PolicyRequestError(f"task_id {task_id!r} is not registered")
-        if prompt != expected_prompt:
+        if canonical_task != expected_task:
             raise PolicyRequestError("canonical_prompt does not match the registered task")
         try:
             state = np.asarray(payload.get("state_position"), dtype=np.float64)
@@ -107,7 +107,7 @@ class PolicyRequest:
             request_id=_string(payload, "request_id"),
             session_id=_string(payload, "session_id"),
             task_id=task_id,
-            canonical_prompt=prompt,
+            canonical_prompt=canonical_task,
             observation_sequence=_integer(payload, "observation_sequence"),
             observation_sampled_monotonic_ns=_integer(
                 payload,

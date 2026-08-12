@@ -52,7 +52,10 @@ class Model:
 def engine(model=None):
     return PolicyEngine(
         model=Model() if model is None else model,
-        task_registry={"pick-red": "pick up the red block"},
+        task_registry={
+            "pick-red": "pick up the red block",
+            "place-blue": "place the blue block in the target area",
+        },
         checkpoint_sha256=HASH,
         stats_sha256=HASH,
         schema_sha256=HASH,
@@ -83,6 +86,13 @@ def test_policy_engine_rejects_unknown_or_malformed_requests(field, value, messa
     request = payload()
     request[field] = value
     with pytest.raises(PolicyRequestError, match=message):
+        engine().infer_mapping(request)
+
+
+def test_policy_engine_rejects_cross_task_prompt_mismatch():
+    request = payload()
+    request["task_id"] = "place-blue"
+    with pytest.raises(PolicyRequestError, match="does not match"):
         engine().infer_mapping(request)
 
 
