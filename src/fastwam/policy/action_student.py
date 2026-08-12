@@ -149,6 +149,11 @@ class ActionStudentPolicyModel:
         self.device = torch.device(device)
         self._text_context: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
+    def preflight_text_cache(self) -> None:
+        """Load every registered task embedding before the server becomes ready."""
+        for task_id, canonical_task in self.task_registry.items():
+            self._load_text(task_id, canonical_task)
+
     def _load_text(
         self,
         task_id: str,

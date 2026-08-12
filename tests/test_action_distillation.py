@@ -450,6 +450,8 @@ def test_policy_exact_text_filename_camera_order_and_manifest_validation(tmp_pat
         schema_path=schema_path,
         task_registry_path=tasks_path,
     )
+    adapter.preflight_text_cache()
+    assert task in adapter._text_context
     request = PolicyRequest(
         "r",
         "s",

@@ -32,6 +32,33 @@ directory fsync. JSON is retained only for structural fixtures and small experim
 scalable for a production corpus, which should use a sharded binary representation preserving
 the same manifest and record validation contract.
 
+## HTTP serving
+
+`fastwam-policy-server` serves one detached action-student deployment. It defaults to
+`127.0.0.1:8080`, validates the checkpoint, detached manifest, stats, schema, task registry,
+model geometry, and vision encoder, then loads **every** registered text cache before binding
+the socket. Startup fails closed when any asset or task embedding is missing or mismatched.
+The built-in entry point currently accepts only `tiny-vision-fixture-v1`; production encoders
+must add an explicit, reviewed constructor rather than silently falling back to the fixture
+encoder.
+
+```bash
+uv run --frozen fastwam-policy-server \
+  --checkpoint /srv/fastwam/action-student.pt \
+  --deployment-manifest /srv/fastwam/action-student.deployment.json \
+  --stats /srv/fastwam/dataset_stats.json \
+  --schema /srv/fastwam/panthera-schema.json \
+  --task-registry /srv/fastwam/task-registry.json \
+  --text-cache-dir /srv/fastwam/text-cache \
+  --device cuda
+```
+
+Read-only probes are `GET /healthz` and `GET /readyz`; inference is `POST /v1/infer`.
+Requests are bounded, overlapping inference receives HTTP 429 rather than being queued, and
+there is no retry or motion RPC in this process. A systemd template and environment example
+are under `deploy/`; keep the loopback bind unless access is protected by an authenticated
+tunnel or trusted private network.
+
 Run the download-free CPU structural smoke with:
 
 ```bash

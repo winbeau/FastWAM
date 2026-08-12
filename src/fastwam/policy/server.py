@@ -217,9 +217,27 @@ class PolicyHTTPServer(ThreadingHTTPServer):
 class PolicyHTTPRequestHandler(BaseHTTPRequestHandler):
     server: PolicyHTTPServer
 
+    def do_GET(self) -> None:
+        if self.path not in {"/healthz", "/readyz"}:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+            return
+        engine = self.server.engine
+        self._json(
+            HTTPStatus.OK,
+            {
+                "ready": True,
+                "checkpoint_sha256": engine.checkpoint_sha256,
+                "stats_sha256": engine.stats_sha256,
+                "schema_sha256": engine.schema_sha256,
+            },
+        )
+
     def do_POST(self) -> None:
         if self.path != "/v1/infer":
             self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+            return
+        if self.headers.get_content_type() != "application/json":
+            self._json(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, {"error": "Content-Type must be application/json"})
             return
         try:
             length = int(self.headers.get("Content-Length", "0"))

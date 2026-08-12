@@ -1,0 +1,19 @@
+[Unit]
+Description=FastWAM action-student HTTP policy server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@REPO_ROOT@
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=@ENV_FILE@
+UnsetEnvironment=http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
+ExecStart=/usr/bin/env uv run --frozen fastwam-policy-server --bind ${FASTWAM_POLICY_BIND} --port ${FASTWAM_POLICY_PORT} --checkpoint ${FASTWAM_POLICY_CHECKPOINT} --deployment-manifest ${FASTWAM_POLICY_DEPLOYMENT_MANIFEST} --stats ${FASTWAM_POLICY_STATS} --schema ${FASTWAM_POLICY_SCHEMA} --task-registry ${FASTWAM_POLICY_TASK_REGISTRY} --text-cache-dir ${FASTWAM_POLICY_TEXT_CACHE_DIR} --device ${FASTWAM_POLICY_DEVICE}
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

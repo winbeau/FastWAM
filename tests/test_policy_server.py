@@ -1,17 +1,26 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import http.client
+import json
 import threading
 import time
+from argparse import Namespace
 from io import BytesIO
 
 import numpy as np
 import pytest
+import torch
 from PIL import Image
 
+from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
+from fastwam.distillation.smoke import run as run_action_student_smoke
+from fastwam.policy.serve import build_engine
 from fastwam.policy.server import (
     PolicyBusyError,
     PolicyEngine,
+    PolicyHTTPServer,
     PolicyPrediction,
     PolicyRequestError,
 )
@@ -133,3 +142,79 @@ def test_policy_engine_drops_concurrent_request_instead_of_queueing():
     thread.join(timeout=2)
     assert not error
     assert not thread.is_alive()
+
+
+def test_action_student_server_entrypoint_preflights_and_infers(tmp_path):
+    output = tmp_path / "serve-smoke.json"
+    run_action_student_smoke(output, steps=1)
+    prompt = DEFAULT_PROMPT.format(task="synthetic")
+    digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    cache = tmp_path / f"{digest}.t5_len5.synthetic-t5.pt"
+    torch.save(
+        {"context": torch.ones(5, 6), "mask": torch.ones(5, dtype=torch.bool)},
+        cache,
+    )
+    args = Namespace(
+        checkpoint=output.with_suffix(".student.pt"),
+        deployment_manifest=output.with_suffix(".deployment.json"),
+        stats=output.with_suffix(".stats.json"),
+        schema=output.with_suffix(".schema.json"),
+        task_registry=output.with_suffix(".tasks.json"),
+        text_cache_dir=tmp_path,
+        device="cpu",
+    )
+    service = build_engine(args)
+    response = service.infer_mapping(
+        {
+            **payload(),
+            "task_id": "synthetic",
+            "canonical_prompt": "synthetic",
+        }
+    )
+    assert np.asarray(response["waypoint_positions"]).shape == (32, 7)
+    cache.unlink()
+    with pytest.raises(ValueError, match="invalid cached text context"):
+        build_engine(args)
+
+
+def test_policy_http_server_health_ready_and_infer_round_trip():
+    server = PolicyHTTPServer(("127.0.0.1", 0), engine(), max_body_bytes=1 << 20)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        for path in ("/healthz", "/readyz"):
+            connection.request("GET", path)
+            response = connection.getresponse()
+            data = json.loads(response.read())
+            assert response.status == 200
+            assert data["ready"] is True
+            assert data["checkpoint_sha256"] == HASH
+
+        body = json.dumps(payload()).encode()
+        connection.request(
+            "POST",
+            "/v1/infer",
+            body=body,
+            headers={"Content-Type": "text/plain", "Content-Length": str(len(body))},
+        )
+        response = connection.getresponse()
+        response.read()
+        assert response.status == 415
+
+        connection.request(
+            "POST",
+            "/v1/infer",
+            body=body,
+            headers={"Content-Type": "application/json", "Content-Length": str(len(body))},
+        )
+        response = connection.getresponse()
+        data = json.loads(response.read())
+        assert response.status == 200
+        assert data["observation_sequence"] == 42
+        assert data["waypoint_positions"] == [[0.01] * 7, [0.02] * 7]
+        connection.close()
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
