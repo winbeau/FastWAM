@@ -20,6 +20,28 @@ The bootstrap command:
 
 No bare `pip` or conda command is used.
 
+## Pull one Pi 5 episode from Hugging Face
+
+Pi 5 publishes complete collectord episodes to the Hugging Face dataset repo
+`winbeau/fastwam-lerobot`. Always pin the 40-character Hub revision printed by the Pi upload;
+do not ingest mutable `main` implicitly. Restore the matching Panthera-WAM source archive,
+then run:
+
+```bash
+export PANTHERA_WAM_ROOT=/root/autodl-tmp/fastwam-work/Panthera-WAM
+bash scripts/autodl_ingest_panthera_episode.sh \
+  color-block-000001 \
+  <40-character-hf-revision> \
+  episodes
+```
+
+For a non-training diagnostic use `smoke` as the third argument. The script downloads exactly
+three files for that episode, verifies the portable SHA-256 and manifest, rejects unsafe tar
+members, extracts atomically, runs the pinned LeRobot 0.4.4/v3 producer from
+`Panthera-WAM/tools/lerobot-v3`, then executes `scripts/validate_panthera_dataset.py` including
+video decode probes. AutoDL may load `~/.bashrc` before this command when its configured
+Hugging Face mirror is required; credentials and proxy values must not be logged.
+
 ## Expected artifacts
 
 The command writes:
