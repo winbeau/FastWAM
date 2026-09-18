@@ -1,3 +1,7 @@
+> **Fork 入口 · winbeau/FastWAM** — [Joint / LIBERO 文档与后续计划](docs/action-eval/README.md) · [来源证据](docs/action-eval/PROVENANCE.md) · [阻塞项](docs/action-eval/BLOCKERS.md) · [工作约束](AGENTS.md)。常用评测分支目标为 `main`（default），分支整合由父任务处理。本轮仅文档落盘与静态审计，**未实施**部署/adapter/评测。官方 LIBERO Joint 权重未找到，RoboTwin Joint 不可替代；仅允许获授权服务器 GPU5 安装/运行，禁止 CI、训练与伪造结果，`pyproject.toml` / `uv.lock` 不可改。下方上游 README 原文保留，其安装、训练及多卡示例不构成本 fork 的执行许可。
+
+---
+
 # FastWAM
 
 Official codebase for **Fast-WAM: Do World Action Models Need Test-time Future Imagination?**
