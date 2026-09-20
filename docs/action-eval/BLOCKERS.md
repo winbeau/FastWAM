@@ -1,5 +1,9 @@
 # 阻塞项与后续计划（未实施）
 
+**2026-09-20 更新：** 用户已授权核验 BadWAM 第三方 LIBERO Joint 后做独立接入测试，取代下面历史记录中的“只计划／不实施”。当前具体阻塞是服务器 Hugging Face 凭据访问该仓库返回 **403 GatedRepo**；用户已申请访问，仍 pending，并要求先搁置 FastWAM。权重、stats、原生加载与 adapter 均未实测。固定 revision、预期哈希、环境审计和后续顺序见 [当前准入记录](BADWAM-JOINT-ADMISSION-20260920.md)。原官方 Joint 基线继续保持独立身份。
+
+以下保留 2026-09-18 的历史阻塞记录。
+
 **当前只完成文档计划与静态审计。用户稍后自行逐步实施；不启动部署、安装、测试或adapter实现。**
 
 证据统一见 [PROVENANCE](PROVENANCE.md)：UTC 2026-09-18、本地基线 `6adf8c267e9195e17febf1b7ce72f6d2c89bf729`。以下静态结论对应E03–E07，用户提供的服务器/权重现状对应E08；未运行的项目对应E09，退出码N/A，无运行artifact。

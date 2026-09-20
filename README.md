@@ -1,4 +1,4 @@
-> **Fork 入口 · winbeau/FastWAM** — [Joint / LIBERO 文档与后续计划](docs/action-eval/README.md) · [来源证据](docs/action-eval/PROVENANCE.md) · [阻塞项](docs/action-eval/BLOCKERS.md) · [工作约束](AGENTS.md)。常用评测分支目标为 `main`（default），分支整合由父任务处理。本轮仅文档落盘与静态审计，**未实施**部署/adapter/评测。官方 LIBERO Joint 权重未找到，RoboTwin Joint 不可替代；仅允许获授权服务器 GPU5 安装/运行，禁止 CI、训练与伪造结果，`pyproject.toml` / `uv.lock` 不可改。下方上游 README 原文保留，其安装、训练及多卡示例不构成本 fork 的执行许可。
+> **Fork 入口 · winbeau/FastWAM (`main`)** — [Joint / LIBERO 原生接口](docs/action-eval/README.md) · [第三方 Joint 准入记录](docs/action-eval/BADWAM-JOINT-ADMISSION-20260920.md) · [工作约束](AGENTS.md)。用户已授权核验 BadWAM LIBERO Joint 后做独立接入测试；下载实测为 **403 GatedRepo**，访问申请仍 pending，现按用户要求暂时搁置。尚未加载权重或完成 adapter/闭环评测。第三方结果将与原官方 Joint 基线分开。仅在服务器执行，不训练、不启用 CI；依赖文件和现有环境保持原样。下方上游 README 保留，其示例不构成本 fork 的执行许可。
 
 ---
 

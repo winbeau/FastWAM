@@ -1,6 +1,6 @@
 # FastWAM Joint / LIBERO：fork 入口与只读接口审计
 
-**状态：仅文档计划落盘，实施未开始；STATIC_AUDIT_ONLY，运行 BLOCKED。** 本目录属于 [winbeau/FastWAM](https://github.com/winbeau/FastWAM)，常用评测分支目标为 `main`（default），不使用长期 action-eval 分支；分支整合由父任务处理，本轮未切换分支。用户稍后自行逐步实施，这不是上游已发布实验结果。官方 LIBERO Joint 权重尚未找到，服务器现有 RoboTwin Joint 不匹配。不得替代、训练或伪造结果；此处没有 adapter 实现、部署或运行通过声明。
+**状态：第三方 Joint 独立接入已获授权，当前按用户要求暂时搁置。** 本目录属于 [winbeau/FastWAM](https://github.com/winbeau/FastWAM)，维护分支为 `main`。用户于 2026-09-20 接受核验后的 BadWAM LIBERO Joint，作为独立接入测试；下载返回 403 `GatedRepo`，用户的访问申请仍 pending，尚未加载或验证 adapter。见 [当前准入记录](BADWAM-JOINT-ADMISSION-20260920.md)。下方是先前完成的原生接口静态审计，不是新的运行通过声明；RoboTwin、uncond、IDM、student 仍不可冒充 Joint。
 
 - [工作约束](../../AGENTS.md)
 - [证据与来源](PROVENANCE.md)
@@ -76,11 +76,11 @@
 
 `run_single_episode` 以环境 `done` 作为success，返回 `(bool(done), replay_images, predicted_future_video_clips, episode_mean_psnr)`。`run_single_task` 统计成功/失败trial索引并保存rollout。`eval_single_process` 写 `<output_dir>/<suite>/gpu<gpu_id>_task<task_id>_results.json`。这些只是未来原生产物路径，本次未产生结果/视频。
 
-## 5. 后续 adapter 的接口边界（非实现、非执行指令）
+## 5. 后续 adapter 的接口边界
 
-1. 先满足 [BLOCKERS](BLOCKERS.md) 的权重、stats、环境和GPU门槛，再由获授权服务器执行原生单worker基准，记录完整证据。
+1. 先满足 [当前准入记录](BADWAM-JOINT-ADMISSION-20260920.md) 的访问、权重、stats、环境和 GPU 门槛，再由获授权服务器执行原生单 worker 基准，记录完整证据。
 2. 保留以上原生 `obs → image/proprio → Joint → denormalize/gripper → chunk`，不能通过换模型、截断输出、虚构stats达到“接口兼容”。
 3. 比对相同观测、prompt、seed、steps、stats的原生/adapter动作；同时检查后处理后的7维动作，不只比模型tensor。未经服务器实测不创建或发布adapter。
-4. GPU只允许物理5。manager shell会读取 `CUDA_VISIBLE_DEVICES` 并为worker重新设置它；`MULTIRUN.num_gpus=1` 本身不能锁定物理5。进程内使用逻辑cuda:0，`gpu_id`主要用于结果标记。
+4. GPU 按 [当前工作约束](../../AGENTS.md) 选择并显式绑定。manager shell 会为 worker 重设 `CUDA_VISIBLE_DEVICES`，`MULTIRUN.num_gpus=1` 本身不能锁定物理卡。进程内使用逻辑 cuda:0，`gpu_id` 主要用于结果标记。
 5. manager默认8卡、每卡2task，且tmux执行 `source ~/.bashrc` 后调用裸 `python`；有解释器漂移风险，还会删除同名 `libero_test_v3` session。现有结果文件可能被scheduler先于退出状态当作完成。未来需独立新输出目录、核验真实解释器/进程退出码/结果一致性，不把存在文件等同通过。本轮不更改或执行这些脚本。
-6. 安装、测试、模型/模拟器运行只能在服务器GPU5，禁止CI。最大限度复用原始 `pyproject.toml` / `uv.lock`，二者不可改；新依赖必须精确pin。上游README中的训练、浮动pip升级、多卡命令为保留历史内容，不是fork执行许可。
+6. 安装、测试、模型/模拟器运行只能在授权服务器，禁止 CI。最大限度复用原始 `pyproject.toml` / `uv.lock`，二者保持原样；新依赖必须精确 pin。上游 README 的训练、浮动 pip 升级、多卡命令不是本次执行许可。
