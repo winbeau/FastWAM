@@ -42,9 +42,13 @@ def _f16_b64(x: torch.Tensor) -> str:
 
 
 class JointCaseStudyRunner:
-    def __init__(self, model, config: CaseStudyConfig):
+    def __init__(self, model, config: CaseStudyConfig, prompt_store: Optional[dict] = None):
         self.model = model
         self.cfg = config
+        #: Precomputed ``encode_prompt`` outputs keyed by full prompt
+        #: (``scripts/casestudy/precompute_prompts.py``); lets the model run without its
+        #: text encoder. A prompt missing from the store is an error, never a fallback.
+        self.prompt_store = prompt_store
         self.mot = model.mot
         self.video = model.video_expert
         self.action = model.action_expert
@@ -65,6 +69,17 @@ class JointCaseStudyRunner:
     def _encode_prompt(self, prompt: str) -> tuple[torch.Tensor, torch.Tensor, int]:
         if self.cfg.prompt_cache and prompt in self._prompt_cache:
             return self._prompt_cache[prompt]
+        if self.prompt_store is not None:
+            if prompt not in self.prompt_store:
+                raise KeyError(f"prompt not in precomputed store: {prompt!r}")
+            item = self.prompt_store[prompt]
+            entry = (
+                item["context"].to(device=self.model.device),
+                item["mask"].to(device=self.model.device, dtype=torch.bool),
+                int(item["num_text"]),
+            )
+            self._prompt_cache[prompt] = entry
+            return entry
         context, context_mask = self.model.encode_prompt(prompt)
         _ids, raw_mask = self.model.tokenizer(prompt, return_mask=True, add_special_tokens=True)
         num_text = int(raw_mask.gt(0).sum().item())
@@ -149,8 +164,12 @@ class JointCaseStudyRunner:
         model = self.model
         steps = int(cfg.num_inference_steps)
         if not cfg.frame0_cache:
+            text = {"prompt": prompt}
+            if self.prompt_store is not None:
+                context, context_mask, _ = self._encode_prompt(prompt)
+                text = {"prompt": None, "context": context, "context_mask": context_mask}
             out = model.infer_action(
-                prompt=prompt,
+                **text,
                 input_image=input_image,
                 action_horizon=action_horizon,
                 num_video_frames=num_video_frames,

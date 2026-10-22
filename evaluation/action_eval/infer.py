@@ -34,6 +34,8 @@ Options (``policy.options``):
 ``shadow_casestudy``     optional second arm (normally dense) evaluated on the same observation
                          and seed at every call; its actions are logged, never executed.
 ``shadow_executed``      actions per chunk counted as executed in shadow metrics (default 10).
+``prompt_embeddings``    optional ``.pt`` from scripts/casestudy/precompute_prompts.py; when set the
+                         text encoder is not loaded and unknown instructions are an error.
 ``hash_checkpoint``      default true.
 ``checkpoint_sha256``    optional expected digest; a mismatch is fatal.
 
@@ -163,6 +165,13 @@ class FastWAMJointPolicy:
         register_default_resolvers()
         task = str(options.get("task") or "libero_joint_2cam224_1e-4")
         overrides = [f"task={task}", f"ckpt={self.checkpoint}"] + [str(o) for o in options.get("hydra_overrides") or []]
+        self.prompt_store = None
+        self.prompt_store_sha256 = None
+        if options.get("prompt_embeddings"):
+            store_path = _require_file(options["prompt_embeddings"], "prompt_embeddings")
+            self.prompt_store = torch.load(str(store_path), map_location="cpu")["prompts"]
+            self.prompt_store_sha256 = _sha256(store_path)
+            overrides.append("model.load_text_encoder=false")
         with initialize_config_dir(config_dir=str(model_config.parent.resolve()), version_base="1.3"):
             cfg = compose(config_name=model_config.stem, overrides=overrides)
         self.cfg = cfg
@@ -211,10 +220,12 @@ class FastWAMJointPolicy:
         self.sigma_shift = None if sigma is None else float(sigma)
         self.rand_device = str(evaluation.get("rand_device", "cpu"))
         self.native_seed = int(cfg.seed)
-        self.runner = JointCaseStudyRunner(self.model, self.casestudy)
+        self.runner = JointCaseStudyRunner(self.model, self.casestudy, prompt_store=self.prompt_store)
         self.shadow = None
         if options.get("shadow_casestudy") is not None:
-            self.shadow = JointCaseStudyRunner(self.model, parse_config(options["shadow_casestudy"]))
+            self.shadow = JointCaseStudyRunner(
+                self.model, parse_config(options["shadow_casestudy"]), prompt_store=self.prompt_store
+            )
         self.shadow_executed = int(options.get("shadow_executed", 10))
 
         self.rng_mode = (
@@ -245,6 +256,7 @@ class FastWAMJointPolicy:
             "casestudy": self.casestudy.describe(),
             "casestudy_hash": self.casestudy.config_hash(),
             "shadow": None if self.shadow is None else self.shadow.cfg.describe(),
+            "prompt_embeddings_sha256": self.prompt_store_sha256,
         }
         notes = (
             "FastWAM-Joint through its native Hydra build and shared policy_io transforms; the benchmark "
