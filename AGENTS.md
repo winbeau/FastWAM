@@ -2,7 +2,7 @@
 
 适用本仓库全部目录。Fork: `winbeau/FastWAM`；常用评测分支为 `main`（default），不使用长期 action-eval 分支。用户于 2026-09-20 授权：核验 BadWAM 第三方 LIBERO Joint 权重后，做独立的 FastWAM 评测接入测试；三个模型 fork 的真实评测链路打通即可完成接入目标。先读 [当前准入记录](docs/action-eval/BADWAM-JOINT-ADMISSION-20260920.md)、[原生接口](docs/action-eval/README.md) 与 [来源](docs/action-eval/PROVENANCE.md)。历史“仅计划／暂停”文字不再限制本次已授权的工作。
 
-**最新状态：用户要求暂时搁置 FastWAM。** 用户已申请 Hugging Face 访问，但仍 pending，并说“这个先放着吧”。因此暂停下载、部署、模型加载及适配器实施，不反复探测访问或寻找替代权重。保留已有核验记录与测试授权，待用户恢复这部分工作。其他模型的现有评测不受本段暂停影响。
+**最新状态（2026-10-22）：FastWAM 恢复，用于 CVPR'27 Sparse-rethinking 稀疏加速 case study。** BadWAM 仓库访问已获批（带用户 HF 凭据的 HEAD 返回 200），用户确认使用该 HF 权重作为 FastWAM-Joint。服务器工作根为 `/data/chenjiayu/wenbiao_zhao/sparse-casestudy/`（GPU 由用户分配 4 张，GPU 7 仍不启动 CUDA）。新增代码：`src/fastwam/casestudy/`（各实验臂推理）、`evaluation/action_eval/infer.py`（adapter）、`experiments/libero/policy_io.py`（原生 LIBERO 前后处理抽出，供原生评测与 adapter 共用，行为不变）、`scripts/casestudy/`（开环标定）。计划见论文仓库 `case-study-plan.md`。
 
 ## 不可绕过的边界
 

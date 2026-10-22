@@ -10,6 +10,7 @@ import numpy as np
 from libero.libero import get_libero_path
 from libero.libero.envs import OffScreenRenderEnv, SubprocVectorEnv
 from fastwam.utils.video_io import save_mp4
+from experiments.libero.policy_io import invert_gripper_action  # noqa: F401  (re-export)
 
 DATE = time.strftime("%Y_%m_%d")
 DATE_TIME = time.strftime("%Y_%m_%d-%H_%M_%S")
@@ -178,12 +179,3 @@ def quat2axisangle(quat):
         return np.zeros(3)
 
     return (quat[:3] * 2.0 * math.acos(quat[3])) / den
-
-def invert_gripper_action(action):
-    """
-    Flips the sign of the gripper action (last dimension of action vector).
-    This is necessary for some environments where -1 = open, +1 = close, since
-    the RLDS dataloader aligns gripper actions such that 0 = close, 1 = open.
-    """
-    action[..., -1] = action[..., -1] * -1.0
-    return action

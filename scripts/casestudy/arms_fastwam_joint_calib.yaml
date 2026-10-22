@@ -1,0 +1,31 @@
+# Calibration sweep for FastWAM-Joint arms (open loop, recorded observations).
+# record_attention is off unless the arm needs scores, so latency is the arm's real cost.
+- name: dense
+  casestudy: {method: dense, record_attention: false}
+- name: dense_reseed
+  casestudy: {method: dense, seed_offset: 1000000, record_attention: false}
+- {name: fs8, casestudy: {method: dense, num_inference_steps: 8, record_attention: false}}
+- {name: fs6, casestudy: {method: dense, num_inference_steps: 6, record_attention: false}}
+- {name: fs5, casestudy: {method: dense, num_inference_steps: 5, record_attention: false}}
+- {name: fs4, casestudy: {method: dense, num_inference_steps: 4, record_attention: false}}
+- {name: av_k60, casestudy: {method: prune, record_attention: false, prune: {selection: av, keep_ratio: 0.60}}}
+- {name: av_k45, casestudy: {method: prune, record_attention: false, prune: {selection: av, keep_ratio: 0.45}}}
+- {name: av_k30, casestudy: {method: prune, record_attention: false, prune: {selection: av, keep_ratio: 0.30}}}
+- {name: av_k20, casestudy: {method: prune, record_attention: false, prune: {selection: av, keep_ratio: 0.20}}}
+- {name: av_k10, casestudy: {method: prune, record_attention: false, prune: {selection: av, keep_ratio: 0.10}}}
+- {name: cf_k45, casestudy: {method: prune, record_attention: false, prune: {selection: cf, keep_ratio: 0.45}}}
+- {name: cf_k30, casestudy: {method: prune, record_attention: false, prune: {selection: cf, keep_ratio: 0.30}}}
+- {name: cf_k20, casestudy: {method: prune, record_attention: false, prune: {selection: cf, keep_ratio: 0.20}}}
+- {name: rd_k45, casestudy: {method: prune, record_attention: false, prune: {selection: random, keep_ratio: 0.45}}}
+- {name: rd_k30, casestudy: {method: prune, record_attention: false, prune: {selection: random, keep_ratio: 0.30}}}
+- {name: rd_k20, casestudy: {method: prune, record_attention: false, prune: {selection: random, keep_ratio: 0.20}}}
+- {name: tc_005, casestudy: {method: teacache, record_attention: false, teacache: {thresh: 0.05}}}
+- {name: tc_010, casestudy: {method: teacache, record_attention: false, teacache: {thresh: 0.10}}}
+- {name: tc_020, casestudy: {method: teacache, record_attention: false, teacache: {thresh: 0.20}}}
+- {name: tc_040, casestudy: {method: teacache, record_attention: false, teacache: {thresh: 0.40}}}
+- {name: tc_080, casestudy: {method: teacache, record_attention: false, teacache: {thresh: 0.80}}}
+- {name: nz_002, casestudy: {method: noise, record_attention: false, noise: {sigma: 0.02}}}
+- {name: nz_005, casestudy: {method: noise, record_attention: false, noise: {sigma: 0.05}}}
+- {name: nz_010, casestudy: {method: noise, record_attention: false, noise: {sigma: 0.10}}}
+- {name: nz_020, casestudy: {method: noise, record_attention: false, noise: {sigma: 0.20}}}
+- {name: nz_040, casestudy: {method: noise, record_attention: false, noise: {sigma: 0.40}}}
