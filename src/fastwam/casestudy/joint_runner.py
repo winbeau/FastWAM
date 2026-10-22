@@ -281,7 +281,7 @@ class JointCaseStudyRunner:
 
             # ---- mode for this step
             mode = "full"
-            if prune is not None and s >= prune.warmup_steps and not gated_dense:
+            if prune is not None and s >= prune.warmup_steps and not gated_dense and s not in prune.full_steps:
                 mode = "pruned"
             if tea is not None:
                 block0 = self.video.blocks[0]
@@ -402,6 +402,20 @@ class JointCaseStudyRunner:
                         c = sel.gate_score(p_act, grid)["c"]
                         gated_dense = bool(c > prune.gate.tau)
                         diag["gated_dense"] = gated_dense
+                if prune.extra_keep_ratio > 0:
+                    dropped_mask = torch.ones(num_future, dtype=torch.bool, device=kept.device)
+                    dropped_mask[kept] = False
+                    dropped = torch.nonzero(dropped_mask).flatten()
+                    m = int(round(prune.extra_keep_ratio * dropped.numel()))
+                    if m > 0:
+                        if prune.extra_selection == "random":
+                            g = torch.Generator(device="cpu").manual_seed((int(seed) + 2) & 0x7FFFFFFF)
+                            extra = dropped[torch.randperm(dropped.numel(), generator=g)[:m].to(dropped.device)]
+                        else:
+                            av_all = sel.av_scores(act_probs_step0[self._layers["act"]], grid)
+                            extra = dropped[torch.topk(av_all[dropped], m).indices]
+                        kept = torch.cat([kept, extra])
+                        diag["extra_kept"] = int(m)
                 kept = torch.sort(kept).values
                 if s == prune.warmup_steps - 1:
                     av = sel.av_scores(act_probs_step0[self._layers["act"]], grid) if act_probs_step0 else None

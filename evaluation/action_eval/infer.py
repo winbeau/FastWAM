@@ -34,6 +34,10 @@ Options (``policy.options``):
 ``shadow_casestudy``     optional second arm (normally dense) evaluated on the same observation
                          and seed at every call; its actions are logged, never executed.
 ``shadow_executed``      actions per chunk counted as executed in shadow metrics (default 10).
+``episode_plans``        optional JSON {episode_id: {"calls": {"<k>": casestudy}, "from_call":
+                         {"call": k, "casestudy": {...}}}}: per-call arm overrides used by the
+                         attribution (patch at one call) and switch-point (arm from call k on)
+                         experiments; every other call runs the base arm.
 ``prompt_embeddings``    optional ``.pt`` from scripts/casestudy/precompute_prompts.py; when set the
                          text encoder is not loaded and unknown instructions are an error.
 ``hash_checkpoint``      default true.
@@ -227,6 +231,16 @@ class FastWAMJointPolicy:
                 self.model, parse_config(options["shadow_casestudy"]), prompt_store=self.prompt_store
             )
         self.shadow_executed = int(options.get("shadow_executed", 10))
+        self.episode_plans = {}
+        self.episode_plans_sha256 = None
+        if options.get("episode_plans"):
+            import json as _json
+
+            plans_path = _require_file(options["episode_plans"], "episode_plans")
+            self.episode_plans = _json.loads(plans_path.read_text())
+            self.episode_plans_sha256 = _sha256(plans_path)
+        self._override_runners: dict[str, object] = {}
+        self._plan: dict = {}
 
         self.rng_mode = (
             RNG_MODE_EPISODE_CALL_HASH if self.casestudy.seed_mode == "episode_call_hash" else RNG_MODE_FIXED_PER_PREDICT
@@ -257,6 +271,8 @@ class FastWAMJointPolicy:
             "casestudy_hash": self.casestudy.config_hash(),
             "shadow": None if self.shadow is None else self.shadow.cfg.describe(),
             "prompt_embeddings_sha256": self.prompt_store_sha256,
+            "episode_plans_sha256": self.episode_plans_sha256,
+            "episode_plans_count": len(self.episode_plans),
         }
         notes = (
             "FastWAM-Joint through its native Hydra build and shared policy_io transforms; the benchmark "
@@ -278,6 +294,8 @@ class FastWAMJointPolicy:
         self.runner.reset_episode()
         if self.shadow is not None:
             self.shadow.reset_episode()
+        for runner in self._override_runners.values():
+            runner.reset_episode()
         self.predict_calls = 0
         # Seed key = (instruction, task, init, protocol seed); the repeat index is left out so
         # that replays of one episode (patch / switch-point experiments use repeats to index
@@ -287,6 +305,7 @@ class FastWAMJointPolicy:
         episode_id = str(episode.get("episode_id", ""))
         self._episode_id = episode_id
         self._episode_key = f"{episode.get('instruction', '')}|{_re.sub(r'-r[0-9]+', '', episode_id)}"
+        self._plan = self.episode_plans.get(episode_id, {})
 
     def predict(self, observation: dict) -> Prediction:
         torch = self._torch
@@ -317,7 +336,8 @@ class FastWAMJointPolicy:
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         model_started = time.perf_counter()
-        action, diag = self.runner.infer_action(
+        runner, override = self._runner_for_call(call_index)
+        action, diag = runner.infer_action(
             prompt=prompt, input_image=image, proprio=proprio,
             action_horizon=self.action_horizon, num_video_frames=self.num_video_frames,
             seed=seed, sigma_shift=self.sigma_shift, rand_device=self.rand_device,
@@ -331,6 +351,8 @@ class FastWAMJointPolicy:
             raise ValueError("FastWAM produced non-finite actions")
         self.predict_calls += 1
         diag.update({"call_index": call_index, "model_seconds": round(model_seconds, 6)})
+        if override is not None:
+            diag["plan_override"] = override
         if self.shadow is not None:
             diag["shadow"] = self._shadow_metrics(prompt, image, proprio, seed, action, actions)
         return Prediction(
@@ -338,6 +360,30 @@ class FastWAMJointPolicy:
             timing={"predict_seconds": round(time.perf_counter() - started, 6), "model_seconds": round(model_seconds, 6)},
             diagnostics=diag,
         )
+
+    def _runner_for_call(self, call_index: int):
+        """Base runner, or the episode plan's override for this call."""
+        plan = self._plan
+        raw = None
+        label = None
+        calls = plan.get("calls") or {}
+        if str(call_index) in calls:
+            raw, label = calls[str(call_index)], f"call:{call_index}"
+        elif plan.get("from_call") and call_index >= int(plan["from_call"]["call"]):
+            raw, label = plan["from_call"]["casestudy"], f"from:{plan['from_call']['call']}"
+        if raw is None:
+            return self.runner, None
+        from fastwam.casestudy import JointCaseStudyRunner, parse_config
+
+        cfg = parse_config(raw)
+        key = cfg.config_hash()
+        if key not in self._override_runners:
+            self._override_runners[key] = JointCaseStudyRunner(self.model, cfg, prompt_store=self.prompt_store)
+        runner = self._override_runners[key]
+        # Share the episode's frozen CF layer choice so a patched call scores like the base arm.
+        if getattr(self.runner, "_layers", None) is not None:
+            runner._layers = dict(self.runner._layers)
+        return runner, {"label": label, "casestudy_hash": key}
 
     def _shadow_metrics(self, prompt, image, proprio, seed, action, actions) -> dict:
         """Shadow arm on the same input and seed; returns deviation metrics and its chunk."""

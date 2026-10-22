@@ -54,6 +54,12 @@ class PruneConfig:
     #: Patch P2 of the case study: recompute scores and the kept set at every pruned step
     #: from that step's own action->video attention instead of fixing it after warm-up.
     reselect_every_step: bool = False
+    #: Patch P1 / P1-ctl: after selecting the kept set, also keep this fraction of the
+    #: dropped tokens, chosen by A->V score (``av``) or uniformly at random (``random``).
+    extra_keep_ratio: float = 0.0
+    extra_selection: str = "av"
+    #: Patch P3: denoising steps forced to run with all tokens (e.g. late steps only).
+    full_steps: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -135,6 +141,9 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             layer=None if block.get("layer") is None else int(block["layer"]),
             gate=gate,
             reselect_every_step=bool(block.get("reselect_every_step", False)),
+            extra_keep_ratio=float(block.get("extra_keep_ratio", 0.0)),
+            extra_selection=str(block.get("extra_selection", "av")),
+            full_steps=tuple(int(x) for x in block.get("full_steps", ())),
         )
         _require(prune.selection in SELECTIONS, f"prune.selection must be one of {SELECTIONS}")
         _require(0.0 < prune.keep_ratio <= 1.0, "prune.keep_ratio must be in (0, 1]")
@@ -142,6 +151,9 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
         _require(prune.layer_rule in LAYER_RULES, f"prune.layer_rule must be one of {LAYER_RULES}")
         _require(prune.layer_rule != "fixed" or prune.layer is not None, "layer_rule=fixed needs prune.layer")
         _require(prune.gate is None or prune.selection == "cf", "phase gating is defined for selection=cf only")
+        _require(0.0 <= prune.extra_keep_ratio < 1.0, "prune.extra_keep_ratio must be in [0, 1)")
+        _require(prune.extra_selection in ("av", "random"), "prune.extra_selection must be av or random")
+        _require(all(0 <= x < steps for x in prune.full_steps), "prune.full_steps out of range")
     else:
         _require(raw.get("prune") is None, "prune block given but method != prune")
 
