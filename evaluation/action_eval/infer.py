@@ -31,6 +31,9 @@ Options (``policy.options``):
 ``hydra_overrides``      extra Hydra overrides (list of strings).
 ``casestudy``            the arm, see ``fastwam/casestudy/config.py``.
 ``casestudy_file``       alternatively, a YAML file ``{name, casestudy}`` holding the arm.
+``shadow_casestudy``     optional second arm (normally dense) evaluated on the same observation
+                         and seed at every call; its actions are logged, never executed.
+``shadow_executed``      actions per chunk counted as executed in shadow metrics (default 10).
 ``hash_checkpoint``      default true.
 ``checkpoint_sha256``    optional expected digest; a mismatch is fatal.
 
@@ -209,6 +212,10 @@ class FastWAMJointPolicy:
         self.rand_device = str(evaluation.get("rand_device", "cpu"))
         self.native_seed = int(cfg.seed)
         self.runner = JointCaseStudyRunner(self.model, self.casestudy)
+        self.shadow = None
+        if options.get("shadow_casestudy") is not None:
+            self.shadow = JointCaseStudyRunner(self.model, parse_config(options["shadow_casestudy"]))
+        self.shadow_executed = int(options.get("shadow_executed", 10))
 
         self.rng_mode = (
             RNG_MODE_EPISODE_CALL_HASH if self.casestudy.seed_mode == "episode_call_hash" else RNG_MODE_FIXED_PER_PREDICT
@@ -237,6 +244,7 @@ class FastWAMJointPolicy:
             "arm_file_sha256": self.arm_file_sha256,
             "casestudy": self.casestudy.describe(),
             "casestudy_hash": self.casestudy.config_hash(),
+            "shadow": None if self.shadow is None else self.shadow.cfg.describe(),
         }
         notes = (
             "FastWAM-Joint through its native Hydra build and shared policy_io transforms; the benchmark "
@@ -256,6 +264,8 @@ class FastWAMJointPolicy:
     def reset(self, episode: dict) -> None:
         """Clears the per-episode prompt cache, CF layer choice and call counter."""
         self.runner.reset_episode()
+        if self.shadow is not None:
+            self.shadow.reset_episode()
         self.predict_calls = 0
         self._episode_key = f"{episode.get('instruction', '')}|{episode.get('episode_id', '')}"
 
@@ -296,20 +306,53 @@ class FastWAMJointPolicy:
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         model_seconds = time.perf_counter() - model_started
-        actions = self._io.postprocess_action(action, self.processor, binarize_gripper=self.binarize_gripper)
+        actions = self._io.postprocess_action(action.clone(), self.processor, binarize_gripper=self.binarize_gripper)
         actions = np.asarray(actions, dtype=np.float32)
         if not np.isfinite(actions).all():
             raise ValueError("FastWAM produced non-finite actions")
         self.predict_calls += 1
         diag.update({"call_index": call_index, "model_seconds": round(model_seconds, 6)})
+        if self.shadow is not None:
+            diag["shadow"] = self._shadow_metrics(prompt, image, proprio, seed, action, actions)
         return Prediction(
             actions=actions,
             timing={"predict_seconds": round(time.perf_counter() - started, 6), "model_seconds": round(model_seconds, 6)},
             diagnostics=diag,
         )
 
+    def _shadow_metrics(self, prompt, image, proprio, seed, action, actions) -> dict:
+        """Shadow arm on the same input and seed; returns deviation metrics and its chunk."""
+        import base64
+
+        shadow_action, shadow_diag = self.shadow.infer_action(
+            prompt=prompt, input_image=image, proprio=proprio,
+            action_horizon=self.action_horizon, num_video_frames=self.num_video_frames,
+            seed=seed, sigma_shift=self.sigma_shift, rand_device=self.rand_device,
+        )
+        shadow_sim = np.asarray(
+            self._io.postprocess_action(shadow_action.clone(), self.processor, binarize_gripper=self.binarize_gripper),
+            dtype=np.float32,
+        )
+        a = action.numpy()
+        b = shadow_action.numpy()
+        k = self.shadow_executed
+        d = a - b
+        return {
+            # normalized action space ([-1, 1] per dim under min/max normalisation)
+            "rms_executed": float(np.sqrt(np.mean(d[:k] ** 2))),
+            "rms_full": float(np.sqrt(np.mean(d ** 2))),
+            "max_abs_executed": float(np.abs(d[:k]).max()),
+            # simulator units
+            "gripper_disagree_executed": int(np.sum(np.sign(actions[:k, -1]) != np.sign(shadow_sim[:k, -1]))),
+            "translation_diff_executed": float(np.linalg.norm(actions[:k, :3].sum(0) - shadow_sim[:k, :3].sum(0))),
+            "rotation_diff_executed": float(np.linalg.norm(actions[:k, 3:6].sum(0) - shadow_sim[:k, 3:6].sum(0))),
+            "shadow_sim_actions_f16": base64.b64encode(shadow_sim.astype(np.float16).tobytes()).decode(),
+            "shadow_gate_score": shadow_diag.get("gate_score"),
+        }
+
     def close(self) -> None:
         self.runner = None
+        self.shadow = None
         self.model = None
         torch = getattr(self, "_torch", None)
         if torch is not None and torch.cuda.is_available():
