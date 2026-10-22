@@ -279,7 +279,14 @@ class FastWAMJointPolicy:
         if self.shadow is not None:
             self.shadow.reset_episode()
         self.predict_calls = 0
-        self._episode_key = f"{episode.get('instruction', '')}|{episode.get('episode_id', '')}"
+        # Seed key = (instruction, task, init, protocol seed); the repeat index is left out so
+        # that replays of one episode (patch / switch-point experiments use repeats to index
+        # variants) draw exactly the noise of the original rollout at every call index.
+        import re as _re
+
+        episode_id = str(episode.get("episode_id", ""))
+        self._episode_id = episode_id
+        self._episode_key = f"{episode.get('instruction', '')}|{_re.sub(r'-r[0-9]+', '', episode_id)}"
 
     def predict(self, observation: dict) -> Prediction:
         torch = self._torch
