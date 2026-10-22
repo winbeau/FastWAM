@@ -56,6 +56,8 @@ def main() -> None:
     ap.add_argument("--diffsynth-base", required=True)
     ap.add_argument("--arms", required=True, help="YAML: list of {name, casestudy}")
     ap.add_argument("--prompt-embeddings", default=None)
+    ap.add_argument("--task", default="libero_joint_2cam224_1e-4")
+    ap.add_argument("--hydra-override", action="append", default=[])
     ap.add_argument("--observations", required=True, help="glob of observation .npz files")
     ap.add_argument("--max-observations", type=int, default=40)
     ap.add_argument("--warmup", type=int, default=3)
@@ -65,7 +67,7 @@ def main() -> None:
 
     import torch
     from infer import FastWAMJointPolicy  # the adapter
-    from fastwam.casestudy import JointCaseStudyRunner, call_seed, parse_config, timed
+    from fastwam.casestudy import call_seed, make_runner, parse_config, timed
 
     arms = yaml.safe_load(Path(args.arms).read_text())
     names = [a["name"] for a in arms]
@@ -84,6 +86,8 @@ def main() -> None:
             "dataset_stats_path": args.dataset_stats,
             "diffsynth_model_base_path": args.diffsynth_base,
             "hash_checkpoint": False,
+            "task": args.task,
+            "hydra_overrides": args.hydra_override,
             **({"prompt_embeddings": args.prompt_embeddings} if args.prompt_embeddings else {}),
         },
         "cuda:0",
@@ -113,7 +117,7 @@ def main() -> None:
     order = ["dense"] + [n for n in names if n != "dense"]
     for name in order:
         arm = next(a for a in arms if a["name"] == name)
-        runner = JointCaseStudyRunner(policy.model, parse_config(arm.get("casestudy")), prompt_store=policy.prompt_store)
+        runner = make_runner(policy.model, parse_config(arm.get("casestudy")), prompt_store=policy.prompt_store)
         latencies, dev_exec, dev_full, token_frac, computed = [], [], [], [], []
         for _ in range(args.warmup):
             runner.reset_episode()
@@ -146,8 +150,8 @@ def main() -> None:
         results[name]["speedup_vs_dense"] = dense_latency / results[name]["latency_median_s"]
 
     # Equivalence and determinism of the dense path.
-    dense = JointCaseStudyRunner(policy.model, parse_config({"method": "dense"}), prompt_store=policy.prompt_store)
-    native = JointCaseStudyRunner(
+    dense = make_runner(policy.model, parse_config({"method": "dense"}), prompt_store=policy.prompt_store)
+    native = make_runner(
         policy.model, parse_config({"method": "dense", "frame0_cache": False, "prompt_cache": False}),
         prompt_store=policy.prompt_store,
     )

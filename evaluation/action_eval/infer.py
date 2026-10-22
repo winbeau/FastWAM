@@ -153,7 +153,7 @@ class FastWAMJointPolicy:
         from hydra.utils import instantiate
 
         from experiments.libero import policy_io
-        from fastwam.casestudy import JointCaseStudyRunner, call_seed, parse_config
+        from fastwam.casestudy import call_seed, make_runner, parse_config
         from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
         from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
         from fastwam.utils.config_resolvers import register_default_resolvers
@@ -179,8 +179,13 @@ class FastWAMJointPolicy:
         with initialize_config_dir(config_dir=str(model_config.parent.resolve()), version_base="1.3"):
             cfg = compose(config_name=model_config.stem, overrides=overrides)
         self.cfg = cfg
-        if cfg.model.get("_target_") != "fastwam.runtime.create_fastwam_joint":
-            raise ValueError(f"task {task!r} does not build FastWAMJoint (got {cfg.model.get('_target_')})")
+        allowed_targets = {
+            "fastwam.runtime.create_fastwam_joint",
+            "fastwam.runtime.create_fastwam_optional_idm",
+            "fastwam.runtime.create_fastwam_idm",
+        }
+        if cfg.model.get("_target_") not in allowed_targets:
+            raise ValueError(f"task {task!r} builds {cfg.model.get('_target_')}, not a FastWAM Joint/IDM model")
 
         raw_arm = options.get("casestudy")
         self.arm_name = None
@@ -224,12 +229,10 @@ class FastWAMJointPolicy:
         self.sigma_shift = None if sigma is None else float(sigma)
         self.rand_device = str(evaluation.get("rand_device", "cpu"))
         self.native_seed = int(cfg.seed)
-        self.runner = JointCaseStudyRunner(self.model, self.casestudy, prompt_store=self.prompt_store)
+        self.runner = make_runner(self.model, self.casestudy, prompt_store=self.prompt_store)
         self.shadow = None
         if options.get("shadow_casestudy") is not None:
-            self.shadow = JointCaseStudyRunner(
-                self.model, parse_config(options["shadow_casestudy"]), prompt_store=self.prompt_store
-            )
+            self.shadow = make_runner(self.model, parse_config(options["shadow_casestudy"]), prompt_store=self.prompt_store)
         self.shadow_executed = int(options.get("shadow_executed", 10))
         self.episode_plans = {}
         self.episode_plans_sha256 = None
@@ -251,10 +254,11 @@ class FastWAMJointPolicy:
     # ------------------------------------------------------------------ contract
     def describe(self) -> PolicyDescription:
         fingerprint = {
-            "adapter": "fastwam-joint-casestudy",
+            "adapter": "fastwam-casestudy",
+            "model_class": type(self.model).__name__,
             "checkpoint": str(self.checkpoint),
             "checkpoint_sha256": self.checkpoint_sha256,
-            "checkpoint_identity": "third-party BadWAM LIBERO Joint (LIQIIIII/badwam-libero-joint-wam@086a861)",
+            "checkpoint_identity": self.options.get("checkpoint_identity"),
             "checkpoint_load": self.load_summary,
             "dataset_stats": str(self.stats_path),
             "dataset_stats_sha256": _sha256(self.stats_path),
@@ -373,12 +377,12 @@ class FastWAMJointPolicy:
             raw, label = plan["from_call"]["casestudy"], f"from:{plan['from_call']['call']}"
         if raw is None:
             return self.runner, None
-        from fastwam.casestudy import JointCaseStudyRunner, parse_config
+        from fastwam.casestudy import make_runner, parse_config
 
         cfg = parse_config(raw)
         key = cfg.config_hash()
         if key not in self._override_runners:
-            self._override_runners[key] = JointCaseStudyRunner(self.model, cfg, prompt_store=self.prompt_store)
+            self._override_runners[key] = make_runner(self.model, cfg, prompt_store=self.prompt_store)
         runner = self._override_runners[key]
         # Share the episode's frozen CF layer choice so a patched call scores like the base arm.
         if getattr(self.runner, "_layers", None) is not None:
