@@ -112,65 +112,80 @@ def main() -> None:
         )
         return action.numpy(), diag, seconds
 
-    results: dict[str, dict] = {}
-    reference: dict[int, np.ndarray] = {}
+    # Interleaved measurement: every observation runs every arm back to back, so the
+    # per-observation latency ratio to dense cancels drift in shared-GPU load.
     order = ["dense"] + [n for n in names if n != "dense"]
+    runners = {}
     for name in order:
         arm = next(a for a in arms if a["name"] == name)
-        runner = make_runner(policy.model, parse_config(arm.get("casestudy")), prompt_store=policy.prompt_store)
-        latencies, dev_exec, dev_full, token_frac, computed = [], [], [], [], []
-        for _ in range(args.warmup):
+        runners[name] = make_runner(policy.model, parse_config(arm.get("casestudy")), prompt_store=policy.prompt_store)
+    for _ in range(args.warmup):
+        for runner in runners.values():
             runner.reset_episode()
             run(runner, observations[0], 0)
-        for i, obs in enumerate(observations):
+    rec = {n: {"lat": [], "ratio": [], "dev_exec": [], "dev_full": [], "tok": [], "steps": []} for n in order}
+    for i, obs in enumerate(observations):
+        ref, ref_lat = None, None
+        for name in order:
+            runner = runners[name]
             runner.reset_episode()
             action, diag, seconds = run(runner, obs, i)
-            latencies.append(seconds)
+            r = rec[name]
+            r["lat"].append(seconds)
             if name == "dense":
-                reference[i] = action
+                ref, ref_lat = action, seconds
             else:
-                d = action - reference[i]
-                dev_exec.append(float(np.linalg.norm(d[: args.executed]) / np.sqrt(d[: args.executed].size)))
-                dev_full.append(float(np.linalg.norm(d) / np.sqrt(d.size)))
+                d = action - ref
+                r["dev_exec"].append(float(np.sqrt(np.mean(d[: args.executed] ** 2))))
+                r["dev_full"].append(float(np.sqrt(np.mean(d ** 2))))
+            r["ratio"].append(ref_lat / seconds)
             if "future_token_steps" in diag:
-                token_frac.append(diag["future_token_steps"] / diag["future_token_steps_dense"])
-            computed.append(diag.get("computed_steps", diag.get("steps")))
-        results[name] = {
-            "casestudy": runner.cfg.describe(),
-            "latency_median_s": statistics.median(latencies),
-            "latency_mean_s": statistics.fmean(latencies),
-            "rms_dev_executed_median": statistics.median(dev_exec) if dev_exec else 0.0,
-            "rms_dev_full_median": statistics.median(dev_full) if dev_full else 0.0,
-            "future_token_fraction_mean": statistics.fmean(token_frac) if token_frac else 1.0,
-            "computed_steps_mean": statistics.fmean(computed),
-        }
-        print(f"[calib] {name}: {results[name]}", flush=True)
-    dense_latency = results["dense"]["latency_median_s"]
-    for name in results:
-        results[name]["speedup_vs_dense"] = dense_latency / results[name]["latency_median_s"]
+                r["tok"].append(diag["future_token_steps"] / diag["future_token_steps_dense"])
+            r["steps"].append(diag.get("computed_steps", diag.get("steps")))
+        print(f"[calib] observation {i + 1}/{len(observations)}", flush=True)
 
-    # Equivalence and determinism of the dense path.
-    dense = make_runner(policy.model, parse_config({"method": "dense"}), prompt_store=policy.prompt_store)
+    def pct(xs, q):
+        return float(np.percentile(xs, q)) if xs else 0.0
+
+    results = {}
+    for name in order:
+        r = rec[name]
+        results[name] = {
+            "casestudy": runners[name].cfg.describe(),
+            "latency_median_s": statistics.median(r["lat"]),
+            "speedup_vs_dense": statistics.median(r["ratio"]),
+            "rms_dev_executed_median": pct(r["dev_exec"], 50),
+            "rms_dev_executed_p90": pct(r["dev_exec"], 90),
+            "rms_dev_executed_p95": pct(r["dev_exec"], 95),
+            "rms_dev_full_median": pct(r["dev_full"], 50),
+            "future_token_fraction_mean": statistics.fmean(r["tok"]) if r["tok"] else 1.0,
+            "computed_steps_mean": statistics.fmean(r["steps"]),
+        }
+        print(f"[calib] {name}: speedup={results[name]['speedup_vs_dense']:.2f} dev_exec={results[name]['rms_dev_executed_median']:.4f}", flush=True)
+
+    # Equivalence (optimized dense vs native infer_action) and determinism of the dense path.
+    dense = runners["dense"]
     native = make_runner(
         policy.model, parse_config({"method": "dense", "frame0_cache": False, "prompt_cache": False}),
         prompt_store=policy.prompt_store,
     )
-    eq, det = [], []
+    eq_max, eq_rms, det, nat_ratio = [], [], [], []
     for i, obs in enumerate(observations[:10]):
-        dense.reset_episode(); a1, _, _ = run(dense, obs, i)
+        dense.reset_episode(); a1, _, s1 = run(dense, obs, i)
         dense.reset_episode(); a2, _, _ = run(dense, obs, i)
-        native.reset_episode(); a3, _, _ = run(native, obs, i)
+        native.reset_episode(); a3, _, s3 = run(native, obs, i)
         det.append(float(np.abs(a1 - a2).max()))
-        eq.append(float(np.abs(a1 - a3).max()))
-    native_latency = []
-    for i, obs in enumerate(observations[:10]):
-        native.reset_episode(); native_latency.append(run(native, obs, i)[2])
+        eq_max.append(float(np.abs(a1 - a3).max()))
+        eq_rms.append(float(np.sqrt(np.mean((a1[: args.executed] - a3[: args.executed]) ** 2))))
+        nat_ratio.append(s3 / s1)
     summary = {
         "observations": len(observations),
+        "timing": "interleaved per observation; speedup = median of per-observation dense/arm latency ratios",
         "arms": results,
         "dense_repeat_max_abs_diff": max(det),
-        "dense_vs_native_max_abs_diff": max(eq),
-        "native_latency_median_s": statistics.median(native_latency),
+        "dense_vs_native_max_abs_diff": max(eq_max),
+        "dense_vs_native_rms_executed_median": statistics.median(eq_rms),
+        "dense_speedup_vs_native": statistics.median(nat_ratio),
         "gpu": torch.cuda.get_device_name(0),
     }
     Path(args.out).write_text(json.dumps(summary, indent=2) + "\n")

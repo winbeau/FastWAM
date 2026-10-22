@@ -1,0 +1,11 @@
+# Second calibration (interleaved timing): final compute-matched arms and the noise control.
+- {name: dense, casestudy: {method: dense, record_attention: false}}
+- {name: dense_reseed, casestudy: {method: dense, seed_offset: 1000000, record_attention: false}}
+- {name: av, casestudy: {method: prune, record_attention: false, prune: {selection: av, keep_ratio: 0.5}}}
+- {name: cf, casestudy: {method: prune, record_attention: false, prune: {selection: cf, keep_ratio: 0.5}}}
+- {name: rd, casestudy: {method: prune, record_attention: false, prune: {selection: random, keep_ratio: 0.5}}}
+- {name: fs6, casestudy: {method: dense, num_inference_steps: 6, record_attention: false}}
+- {name: tc_014, casestudy: {method: teacache, record_attention: false, teacache: {thresh: 0.14}}}
+- {name: nz_080, casestudy: {method: noise, record_attention: false, noise: {sigma: 0.8}}}
+- {name: nz_160, casestudy: {method: noise, record_attention: false, noise: {sigma: 1.6}}}
+- {name: nz_320, casestudy: {method: noise, record_attention: false, noise: {sigma: 3.2}}}
