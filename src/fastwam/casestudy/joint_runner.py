@@ -19,6 +19,18 @@ tokens leave the sequence and their latents keep moving with their last velocity
 TeaCache step skipping of the whole joint stack, and attention-output noise on the
 action stream. ``frame0_cache=false`` (dense only) calls the model's native
 ``infer_action`` unchanged, as the reference for equivalence checks.
+
+Execution options (``execution=`` of ``make_runner``; all off by default, each must reproduce
+the default path bit for bit and is verified on paired episodes before use):
+
+* ``cross_kv_cache``: the cross-attention K/V of the (constant) instruction context are
+  computed once per call per layer instead of at every denoising step.
+* ``defer_diagnostics``: diagnostic tensors stay on the GPU during the call and are converted
+  after the final action copy (which synchronises anyway), instead of forcing mid-call syncs.
+* ``cuda_graphs`` (needs ``cross_kv_cache``): the layer stack of a denoising step without
+  attention capture, noise or TeaCache is replayed from a CUDA graph per (mode, token count,
+  context length); graphs are built from a runner's second call on, so one-call override
+  runners stay eager.
 """
 
 from __future__ import annotations
@@ -42,9 +54,18 @@ def _f16_b64(x: torch.Tensor) -> str:
 
 
 class JointCaseStudyRunner:
-    def __init__(self, model, config: CaseStudyConfig, prompt_store: Optional[dict] = None):
+    def __init__(self, model, config: CaseStudyConfig, prompt_store: Optional[dict] = None,
+                 execution: Optional[dict] = None):
         self.model = model
         self.cfg = config
+        self.exec = {"cross_kv_cache": False, "defer_diagnostics": False, "cuda_graphs": False, **(execution or {})}
+        unknown = set(self.exec) - {"cross_kv_cache", "defer_diagnostics", "cuda_graphs"}
+        if unknown:
+            raise ValueError(f"unknown execution options: {sorted(unknown)}")
+        if self.exec["cuda_graphs"] and not self.exec["cross_kv_cache"]:
+            raise ValueError("execution.cuda_graphs needs execution.cross_kv_cache")
+        self._graphs: dict[tuple, "_StepGraph"] = {}
+        self._calls_done = 0
         #: Precomputed ``encode_prompt`` outputs keyed by full prompt
         #: (``scripts/casestudy/precompute_prompts.py``); lets the model run without its
         #: text encoder. A prompt missing from the store is an error, never a fallback.
@@ -113,7 +134,73 @@ class JointCaseStudyRunner:
             context_payload=context_payload,
         )
 
-    def _prefill_frame0(self, pre0: dict, num_text: int, inst_layers: set[int]) -> tuple[list, dict[int, torch.Tensor]]:
+    def _cross_kv(self, expert, context: torch.Tensor) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Per-layer cross-attention K/V of a projected context (what every block computes
+        from the same context at every step)."""
+        out = []
+        for layer in range(self.num_layers):
+            ca = expert.blocks[layer].cross_attn
+            out.append((ca.norm_k(ca.k(context)), ca.v(context)))
+        return out
+
+    def _post_cached(self, block, io: tuple, mixed: torch.Tensor, mask: Optional[torch.Tensor],
+                     ckv: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        """``_post`` with the cross-attention K/V taken from ``ckv``; otherwise the same ops in
+        the same order as ``MoT._apply_expert_post_block``."""
+        _q, _k, _v, residual_x, gate_msa, shift_mlp, scale_mlp, gate_mlp, _ckpt = io
+        x = block.gate(residual_x, gate_msa, block.self_attn.o(mixed))
+        if mask is not None and mask.dim() == 3:
+            mask = mask.unsqueeze(1)
+        ca = block.cross_attn
+        q = ca.norm_q(ca.q(block.norm3(x)))
+        x = x + ca.o(flash_attention(q=q, k=ckv[0], v=ckv[1], num_heads=ca.num_heads, ctx_mask=mask))
+        mlp_input = modulate(block.norm2(x), shift_mlp, scale_mlp)
+        return block.gate(x, gate_mlp, block.ffn(mlp_input))
+
+    def _stack(self, xv, xa, freqs_v, tmod_v, mask_v, freqs_a, tmod_a, mask_a, kv0, ckv_v, ckv_a):
+        """One denoising step's layer stack without capture, noise or TeaCache (the loop of
+        ``infer_action`` with cached cross K/V); the body of a step CUDA graph."""
+        for layer in range(self.num_layers):
+            bv = self.video.blocks[layer]
+            ba = self.action.blocks[layer]
+            io_v = self.mot._build_expert_attention_io(expert=self.video, block=bv, x=xv, freqs=freqs_v, t_mod=tmod_v)
+            io_a = self.mot._build_expert_attention_io(expert=self.action, block=ba, x=xa, freqs=freqs_a, t_mod=tmod_a)
+            k_vid = torch.cat([kv0[layer]["k"], io_v[1]], dim=1)
+            v_vid = torch.cat([kv0[layer]["v"], io_v[2]], dim=1)
+            out_v = flash_attention(q=io_v[0], k=k_vid, v=v_vid, num_heads=self.num_heads)
+            k_all = torch.cat([k_vid, io_a[1]], dim=1)
+            v_all = torch.cat([v_vid, io_a[2]], dim=1)
+            out_a = flash_attention(q=io_a[0], k=k_all, v=v_all, num_heads=self.num_heads)
+            xv = self._post_cached(bv, io_v, out_v, mask_v, ckv_v[layer])
+            xa = self._post_cached(ba, io_a, out_a, mask_a, ckv_a[layer])
+        return xv, xa
+
+    @staticmethod
+    def _entropy_t(dist: torch.Tensor) -> torch.Tensor:
+        """``selection.entropy`` without the host sync (same values)."""
+        x = dist.float().clamp_min(0)
+        total = x.sum()
+        p = torch.where(total > 0, x / total, torch.full_like(x, 1.0 / x.numel()))
+        return -(p * torch.log(p.clamp_min(1e-12))).sum()
+
+    def _gate_entropies(self, p_act: torch.Tensor, grid) -> torch.Tensor:
+        """[h_third, h_wrist, h_early, h_late] of ``selection.gate_score`` as one GPU tensor."""
+        third, wrist = grid.future_view_masks(p_act.device)
+        start = grid.per_frame
+        fut = p_act[:, start : start + grid.num_future].float()
+        mass = fut.sum(dim=0)
+        half = p_act.shape[0] // 2
+        return torch.stack([self._entropy_t(mass[third]), self._entropy_t(mass[wrist]),
+                            self._entropy_t(fut[:half].sum(dim=0)), self._entropy_t(fut[half:].sum(dim=0))])
+
+    @staticmethod
+    def _gate_dict(h: list[float]) -> dict[str, float]:
+        h_third, h_wrist, h_early, h_late = h
+        return {"h_third": h_third, "h_wrist": h_wrist, "h_early": h_early, "h_late": h_late,
+                "c_view": h_third - h_wrist, "c_temp": h_early - h_late, "c": (h_third - h_wrist) + (h_early - h_late)}
+
+    def _prefill_frame0(self, pre0: dict, num_text: int, inst_layers: set[int],
+                        ckv_v: Optional[list] = None) -> tuple[list, dict[int, torch.Tensor]]:
         """Run frame-0 tokens alone through the video expert; return per-layer K/V and,
         for ``inst_layers``, the cross-attention mass on real instruction tokens."""
         x = pre0["tokens"]
@@ -133,7 +220,10 @@ class JointCaseStudyRunner:
                 ck = block.cross_attn.norm_k(block.cross_attn.k(pre0["context"]))
                 probs = self._attention_probs(cq, ck)  # [Kv0, L]
                 inst_mass[layer] = probs[:, :num_text].sum(dim=-1)
-            x = self._post(block, io, mixed, payload)
+            if ckv_v is not None:
+                x = self._post_cached(block, io, mixed, pre0["context_mask"], ckv_v[layer])
+            else:
+                x = self._post(block, io, mixed, payload)
             kv.append({"k": k, "v": v})
         return kv, inst_mass
 
@@ -246,7 +336,12 @@ class JointCaseStudyRunner:
             action=None,
             fuse_vae_embedding_in_latents=fuse,
         )
-        kv0, inst_mass = self._prefill_frame0(pre0, num_text, inst_layers)
+        ckv_v = self._cross_kv(self.video, pre0["context"]) if self.exec["cross_kv_cache"] else None
+        ckv_a = None
+        kv0, inst_mass = self._prefill_frame0(pre0, num_text, inst_layers, ckv_v)
+        defer = self.exec["defer_diagnostics"]
+        pending: dict[str, Any] = {}
+        call_token = object()
 
         # ---- denoising
         all_future = torch.arange(num_future, device=model.device)
@@ -316,7 +411,19 @@ class JointCaseStudyRunner:
                 payload_v = {"context": pre_v["context"], "mask": pre_v["context_mask"][:, idx_abs]}
                 payload_a = {"context": pre_a["context"], "mask": pre_a["context_mask"]}
                 step_probs: dict[int, torch.Tensor] = {}
-                for layer in range(self.num_layers):
+                if ckv_v is not None and ckv_a is None:
+                    ckv_a = self._cross_kv(self.action, pre_a["context"])
+                use_graph = (self.exec["cuda_graphs"] and self._calls_done >= 1 and not capture_layers
+                             and noise_gen is None and tea is None)
+                if use_graph:
+                    key = (mode, int(xv.shape[1]), int(ckv_v[0][0].shape[1]), int(ckv_a[0][0].shape[1]))
+                    args = (xv, xa, freqs_v, tmod_v, payload_v["mask"], pre_a["freqs"], pre_a["t_mod"], payload_a["mask"])
+                    graph = self._graphs.get(key)
+                    if graph is None:
+                        graph = self._graphs[key] = _StepGraph(self, args, kv0, ckv_v, ckv_a)
+                    graph.set_call_constants(call_token, kv0, ckv_v, ckv_a)
+                    xv, xa = graph(args)
+                for layer in (range(0) if use_graph else range(self.num_layers)):
                     bv = self.video.blocks[layer]
                     ba = self.action.blocks[layer]
                     io_v = self.mot._build_expert_attention_io(expert=self.video, block=bv, x=xv, freqs=freqs_v, t_mod=tmod_v)
@@ -348,8 +455,12 @@ class JointCaseStudyRunner:
                         out_a = out_a + (cfg.noise.sigma * rms * torch.randn(
                             out_a.shape, generator=noise_gen, device=out_a.device, dtype=torch.float32
                         )).to(out_a.dtype)
-                    xv = self._post(bv, io_v, out_v, payload_v)
-                    xa = self._post(ba, io_a, out_a, payload_a)
+                    if ckv_v is not None:
+                        xv = self._post_cached(bv, io_v, out_v, payload_v["mask"], ckv_v[layer])
+                        xa = self._post_cached(ba, io_a, out_a, payload_a["mask"], ckv_a[layer])
+                    else:
+                        xv = self._post(bv, io_v, out_v, payload_v)
+                        xa = self._post(ba, io_a, out_a, payload_a)
                 if tea is not None:
                     tea_res_v = xv - xv_in
                     tea_res_a = xa - xa_in
@@ -376,11 +487,16 @@ class JointCaseStudyRunner:
                     self._layers = self._choose_layers(act_probs_step0, inst_mass, grid)
                 p_act = act_probs_step0[self._layers["act"]]
                 diag["layer_act"] = self._layers["act"]
-                diag["gate_score"] = sel.gate_score(p_act, grid)
                 av = sel.av_scores(p_act, grid)
-                diag["av_mass_future"] = float(av.sum().item())
-                diag["av_mass_obs"] = float(p_act[:, :f0].float().sum().item())
-                diag["av_scores_f16"] = _f16_b64(av)
+                if defer:
+                    pending["gate"] = self._gate_entropies(p_act, grid)
+                    pending["av"] = av
+                    pending["av_mass_obs"] = p_act[:, :f0].float().sum()
+                else:
+                    diag["gate_score"] = sel.gate_score(p_act, grid)
+                    diag["av_mass_future"] = float(av.sum().item())
+                    diag["av_mass_obs"] = float(p_act[:, :f0].float().sum().item())
+                    diag["av_scores_f16"] = _f16_b64(av)
             elif s == 0 and first_call:
                 self._layers = {"act": -1, "inst": -1}
             if prune is not None and (s == prune.warmup_steps - 1 or (mode == "pruned" and prune.reselect_every_step)):
@@ -420,9 +536,13 @@ class JointCaseStudyRunner:
                 if s == prune.warmup_steps - 1:
                     av = sel.av_scores(act_probs_step0[self._layers["act"]], grid) if act_probs_step0 else None
                     diag["kept_count"] = int(kept.numel())
-                    diag["kept_index"] = kept.tolist()
-                    if av is not None and float(av.sum()) > 0:
-                        diag["kept_av_mass_fraction"] = float((av[kept].sum() / av.sum()).item())
+                    if defer:
+                        pending["kept"] = kept
+                        pending["kept_av"] = av
+                    else:
+                        diag["kept_index"] = kept.tolist()
+                        if av is not None and float(av.sum()) > 0:
+                            diag["kept_av_mass_fraction"] = float((av[kept].sum() / av.sum()).item())
 
         diag["modes"] = modes
         diag["computed_steps"] = sum(1 for m in modes if m != "skip")
@@ -435,7 +555,24 @@ class JointCaseStudyRunner:
             diag["teacache_rel_l1"] = [round(r, 6) for r in tea_rel]
         if noise_gen is not None:
             diag["noise_sigma"] = cfg.noise.sigma
-        return latents_action[0].detach().to(device="cpu", dtype=torch.float32), diag
+        action_out = latents_action[0].detach().to(device="cpu", dtype=torch.float32)
+        if defer:  # the copy above synchronised; convert in the order the default path writes
+            ordered = {}
+            for k_, v_ in diag.items():
+                ordered[k_] = v_
+                if k_ == "layer_act" and "gate" in pending:
+                    ordered["gate_score"] = self._gate_dict(pending["gate"].tolist())
+                    ordered["av_mass_future"] = float(pending["av"].sum().item())
+                    ordered["av_mass_obs"] = float(pending["av_mass_obs"].item())
+                    ordered["av_scores_f16"] = _f16_b64(pending["av"])
+                if k_ == "kept_count" and "kept" in pending:
+                    ordered["kept_index"] = pending["kept"].tolist()
+                    av_ = pending["kept_av"]
+                    if av_ is not None and float(av_.sum()) > 0:
+                        ordered["kept_av_mass_fraction"] = float((av_[pending["kept"]].sum() / av_.sum()).item())
+            diag = ordered
+        self._calls_done += 1
+        return action_out, diag
 
 
 def timed(fn, *args, **kwargs):
@@ -450,3 +587,60 @@ def timed(fn, *args, **kwargs):
 
 
 __all__ = ["JointCaseStudyRunner", "timed"]
+
+
+def _static_copy(src: torch.Tensor) -> tuple[torch.Tensor, Any]:
+    """Static buffer for ``src`` plus a function giving a view with ``src``'s exact strides
+    (broadcast dims are stored once and expanded, as in the eager tensors)."""
+    idx = tuple(slice(0, 1) if (st == 0 and sz > 1) else slice(None) for st, sz in zip(src.stride(), src.shape))
+    base = src[idx].clone()
+    shape = tuple(src.shape)
+    expanded = base.shape != src.shape
+    return base, (lambda: base.expand(shape)) if expanded else (lambda: base)
+
+
+class _StepGraph:
+    """CUDA graph of ``JointCaseStudyRunner._stack`` for fixed shapes.
+
+    Per-step inputs are copied into static buffers before each replay; per-call constants
+    (frame-0 K/V, cross-attention K/V) live in static buffers refreshed once per call.
+    """
+
+    def __init__(self, runner: JointCaseStudyRunner, args: tuple, kv0: list, ckv_v: list, ckv_a: list):
+        self.inp = [_static_copy(t) for t in args]
+        self.kv0 = [{"k": d["k"].clone(), "v": d["v"].clone()} for d in kv0]
+        self.ckv_v = [(k.clone(), v.clone()) for k, v in ckv_v]
+        self.ckv_a = [(k.clone(), v.clone()) for k, v in ckv_a]
+        self.token = None
+
+        def run():
+            views = [fn() for _base, fn in self.inp]
+            return runner._stack(*views, self.kv0, self.ckv_v, self.ckv_a)
+
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(2):
+                run()
+        torch.cuda.current_stream().wait_stream(side)
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph):
+            self.out = run()
+
+    def set_call_constants(self, token, kv0: list, ckv_v: list, ckv_a: list) -> None:
+        if token is self.token:
+            return
+        for dst, src in zip(self.kv0, kv0):
+            dst["k"].copy_(src["k"])
+            dst["v"].copy_(src["v"])
+        for (dk, dv), (sk, sv) in zip(self.ckv_v + self.ckv_a, ckv_v + ckv_a):
+            dk.copy_(sk)
+            dv.copy_(sv)
+        self.token = token
+
+    def __call__(self, args: tuple) -> tuple[torch.Tensor, torch.Tensor]:
+        for (base, fn), src in zip(self.inp, args):
+            idx = tuple(slice(0, 1) if (st == 0 and sz > 1) else slice(None) for st, sz in zip(src.stride(), src.shape))
+            base.copy_(src[idx])
+        self.graph.replay()
+        return self.out[0].clone(), self.out[1].clone()
