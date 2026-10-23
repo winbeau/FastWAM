@@ -78,14 +78,38 @@ _DIGESTS: dict[tuple[str, int, int], str] = {}
 
 
 def _sha256(path: Path, chunk: int = 1 << 22) -> str:
+    """SHA-256 of a file. For files over 256 MB the digest is also kept in a sidecar
+    ``<file>.sha256.json`` keyed by (size, mtime_ns), so the 12 GB checkpoints are hashed
+    once rather than by every worker at every start; a stale or unreadable sidecar is ignored."""
     stat = path.stat()
     key = (str(path), stat.st_size, stat.st_mtime_ns)
     if key not in _DIGESTS:
-        digest = hashlib.sha256()
-        with path.open("rb") as handle:
-            for block in iter(lambda: handle.read(chunk), b""):
-                digest.update(block)
-        _DIGESTS[key] = digest.hexdigest()
+        sidecar = path.with_name(path.name + ".sha256.json")
+        big = stat.st_size > (256 << 20)
+        if big and sidecar.exists():
+            try:
+                import json as _json
+
+                rec = _json.loads(sidecar.read_text())
+                if rec.get("size") == stat.st_size and rec.get("mtime_ns") == stat.st_mtime_ns and len(rec.get("sha256", "")) == 64:
+                    _DIGESTS[key] = rec["sha256"]
+            except (OSError, ValueError):
+                pass
+        if key not in _DIGESTS:
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for block in iter(lambda: handle.read(chunk), b""):
+                    digest.update(block)
+            _DIGESTS[key] = digest.hexdigest()
+            if big:
+                try:
+                    import json as _json
+
+                    tmp = sidecar.with_name(sidecar.name + f".{os.getpid()}.tmp")
+                    tmp.write_text(_json.dumps({"size": stat.st_size, "mtime_ns": stat.st_mtime_ns, "sha256": _DIGESTS[key]}))
+                    tmp.replace(sidecar)
+                except OSError:
+                    pass
     return _DIGESTS[key]
 
 
@@ -102,7 +126,12 @@ def _verified_load(model, checkpoint: Path) -> dict:
     """Load a Joint checkpoint with strict key/shape checks; return a summary."""
     import torch
 
-    payload = torch.load(str(checkpoint), map_location="cpu")
+    # Memory-mapped: concurrent workers share one page-cache copy instead of each reading
+    # 12 GB into RAM; the tensors (and so the loaded weights) are the same bytes.
+    try:
+        payload = torch.load(str(checkpoint), map_location="cpu", mmap=True)
+    except (RuntimeError, TypeError):
+        payload = torch.load(str(checkpoint), map_location="cpu")
     if not isinstance(payload, dict) or "mot" not in payload:
         raise ValueError(f"checkpoint has no `mot` state dict: {checkpoint}")
     expected = model.mot.state_dict()
@@ -135,6 +164,8 @@ class FastWAMJointPolicy:
     def __init__(self, config: dict, device: str):
         options = dict(config)
         self.options = options
+        _t = [("start", time.perf_counter())]
+        self.startup_seconds: dict[str, float] = {}
         self.model_root = Path(options.get("model_root") or os.getcwd()).expanduser()
         for path in (self.model_root, self.model_root / "src"):
             if str(path) not in sys.path:
@@ -161,6 +192,7 @@ class FastWAMJointPolicy:
         from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
         from fastwam.utils.config_resolvers import register_default_resolvers
 
+        _t.append(("imports", time.perf_counter()))
         if device.startswith("cuda") and not torch.cuda.is_available():
             raise RuntimeError("CUDA device requested but torch sees no GPU; refusing to fall back to CPU")
         self._torch = torch
@@ -179,6 +211,7 @@ class FastWAMJointPolicy:
             self.prompt_store = torch.load(str(store_path), map_location="cpu")["prompts"]
             self.prompt_store_sha256 = _sha256(store_path)
             overrides.append("model.load_text_encoder=false")
+        _t.append(("prompt_store", time.perf_counter()))
         with initialize_config_dir(config_dir=str(model_config.parent.resolve()), version_base="1.3"):
             cfg = compose(config_name=model_config.stem, overrides=overrides)
         self.cfg = cfg
@@ -207,9 +240,13 @@ class FastWAMJointPolicy:
             self.arm_file_sha256 = _sha256(arm_file)
             raw_arm = arm.get("casestudy")
         self.casestudy = parse_config(raw_arm)
+        _t.append(("config", time.perf_counter()))
         model = instantiate(cfg.model, model_dtype=torch.bfloat16, device=device)
+        _t.append(("instantiate", time.perf_counter()))
         self.load_summary = _verified_load(model, self.checkpoint)
+        _t.append(("load_weights", time.perf_counter()))
         self.model = model.to(device).eval()
+        _t.append(("to_device", time.perf_counter()))
 
         processor = instantiate(cfg.data.train.processor).eval()
         processor.set_normalizer_from_stats(load_dataset_stats_from_json(str(self.stats_path)))
@@ -220,6 +257,7 @@ class FastWAMJointPolicy:
         self.checkpoint_sha256 = _sha256(self.checkpoint) if self._hash_checkpoint else None
         if expected_sha and self.checkpoint_sha256 != str(expected_sha):
             raise ValueError(f"checkpoint sha256 {self.checkpoint_sha256} != expected {expected_sha}")
+        _t.append(("checkpoint_sha256", time.perf_counter()))
 
         evaluation = cfg.EVALUATION
         self.action_horizon = int(evaluation.get("action_horizon") or (int(cfg.data.train.num_frames) - 1))
@@ -232,10 +270,13 @@ class FastWAMJointPolicy:
         self.sigma_shift = None if sigma is None else float(sigma)
         self.rand_device = str(evaluation.get("rand_device", "cpu"))
         self.native_seed = int(cfg.seed)
-        self.runner = make_runner(self.model, self.casestudy, prompt_store=self.prompt_store)
+        #: Exact execution options of the case-study runners (see fastwam.casestudy.joint_runner).
+        self.execution = dict(options.get("execution") or {})
+        self.runner = make_runner(self.model, self.casestudy, prompt_store=self.prompt_store, execution=self.execution)
         self.shadow = None
         if options.get("shadow_casestudy") is not None:
-            self.shadow = make_runner(self.model, parse_config(options["shadow_casestudy"]), prompt_store=self.prompt_store)
+            self.shadow = make_runner(self.model, parse_config(options["shadow_casestudy"]), prompt_store=self.prompt_store,
+                                      execution=self.execution)
         self.shadow_executed = int(options.get("shadow_executed", 10))
         self.episode_plans = {}
         self.episode_plans_sha256 = None
@@ -253,6 +294,15 @@ class FastWAMJointPolicy:
         )
         self._episode_key = ""
         self.predict_calls = 0
+        _t.append(("runners", time.perf_counter()))
+        self.startup_seconds = {name: round(t1 - t0, 3) for (_n0, t0), (name, t1) in zip(_t, _t[1:])}
+        print(f"[fastwam-adapter] startup seconds: {self.startup_seconds} total {round(_t[-1][1] - _t[0][1], 1)}",
+              file=sys.stderr, flush=True)
+        # Optional torch profiler (CS_TORCH_PROFILE_DIR): calls 3..5 of the first episode.
+        self._profile_dir = os.environ.get("CS_TORCH_PROFILE_DIR") or None
+        self._profiler = None
+        self._profile_done = False
+        self._episodes_seen = 0
 
     # ------------------------------------------------------------------ contract
     def describe(self) -> PolicyDescription:
@@ -280,6 +330,7 @@ class FastWAMJointPolicy:
             "prompt_embeddings_sha256": self.prompt_store_sha256,
             "episode_plans_sha256": self.episode_plans_sha256,
             "episode_plans_count": len(self.episode_plans),
+            "execution": self.execution,
         }
         notes = (
             "FastWAM-Joint through its native Hydra build and shared policy_io transforms; the benchmark "
@@ -304,6 +355,7 @@ class FastWAMJointPolicy:
         for runner in self._override_runners.values():
             runner.reset_episode()
         self.predict_calls = 0
+        self._episodes_seen += 1
         # Seed key = (instruction, task, init, protocol seed); the repeat index is left out so
         # that replays of one episode (patch / switch-point experiments use repeats to index
         # variants) draw exactly the noise of the original rollout at every call index.
@@ -315,6 +367,33 @@ class FastWAMJointPolicy:
         self._plan = self.episode_plans.get(episode_id, {})
 
     def predict(self, observation: dict) -> Prediction:
+        if self._profile_dir and not self._profile_done:
+            self._profile_step()
+        return self._predict(observation)
+
+    def _profile_step(self) -> None:
+        """Start the profiler before call 3 of the first episode, stop after call 5, export."""
+        torch = self._torch
+        if self._episodes_seen != 1:
+            return
+        if self.predict_calls == 3 and self._profiler is None:
+            self._profiler = torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA], record_shapes=False)
+            self._profiler.__enter__()
+        elif self.predict_calls == 6 and self._profiler is not None:
+            torch.cuda.synchronize()
+            self._profiler.__exit__(None, None, None)
+            out = Path(self._profile_dir)
+            out.mkdir(parents=True, exist_ok=True)
+            tag = f"{os.getpid()}"
+            ka = self._profiler.key_averages()
+            (out / f"profile-{tag}-by-cuda.txt").write_text(ka.table(sort_by="self_cuda_time_total", row_limit=40))
+            (out / f"profile-{tag}-by-cpu.txt").write_text(ka.table(sort_by="self_cpu_time_total", row_limit=40))
+            self._profiler.export_chrome_trace(str(out / f"profile-{tag}.json"))
+            self._profiler = None
+            self._profile_done = True
+
+    def _predict(self, observation: dict) -> Prediction:
         torch = self._torch
         images = observation.get("images") or {}
         state = np.asarray(observation.get("state"), dtype=np.float32)
@@ -392,7 +471,7 @@ class FastWAMJointPolicy:
         cfg = parse_config(raw)
         key = cfg.config_hash()
         if key not in self._override_runners:
-            self._override_runners[key] = make_runner(self.model, cfg, prompt_store=self.prompt_store)
+            self._override_runners[key] = make_runner(self.model, cfg, prompt_store=self.prompt_store, execution=self.execution)
         runner = self._override_runners[key]
         # Share the episode's frozen CF layer choice so a patched call scores like the base arm.
         if getattr(self.runner, "_layers", None) is not None:
