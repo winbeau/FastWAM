@@ -31,8 +31,9 @@ Options (``policy.options``):
 ``hydra_overrides``      extra Hydra overrides (list of strings).
 ``casestudy``            the arm, see ``fastwam/casestudy/config.py``.
 ``casestudy_file``       alternatively, a YAML file ``{name, casestudy}`` holding the arm.
-``shadow_casestudy``     optional second arm (normally dense) evaluated on the same observation
-                         and seed at every call; its actions are logged, never executed.
+``shadow_casestudy``     optional second arm (normally dense) evaluated on the same observation at
+                         every call, with the per-call seed of its own ``seed_offset``; its actions
+                         are logged, never executed.
 ``shadow_executed``      actions per chunk counted as executed in shadow metrics (default 10).
 ``episode_plans``        optional JSON {episode_id: {"calls": {"<k>": casestudy}, "from_call":
                          {"call": k, "casestudy": {...}}}}: per-call arm overrides used by the
@@ -361,7 +362,13 @@ class FastWAMJointPolicy:
             diag["plan_override"] = override
         shadow_calls = self._plan.get("shadow_calls")
         if self.shadow is not None and (shadow_calls is None or call_index in shadow_calls):
-            diag["shadow"] = self._shadow_metrics(prompt, image, proprio, seed, action, actions)
+            # The shadow draws its own noise: same per-call seed function, its own seed_offset
+            # (a dense-reseed shadow measures the policy's sampling spread; a plain dense shadow
+            # on a dense arm reproduces the executed action exactly).
+            shadow_offset = getattr(self.shadow.cfg, "seed_offset", self.casestudy.seed_offset)
+            shadow_seed = (self._call_seed(self._episode_key, call_index, shadow_offset)
+                           if self.casestudy.seed_mode == "episode_call_hash" else seed)
+            diag["shadow"] = self._shadow_metrics(prompt, image, proprio, shadow_seed, action, actions)
         return Prediction(
             actions=actions,
             timing={"predict_seconds": round(time.perf_counter() - started, 6), "model_seconds": round(model_seconds, 6)},
