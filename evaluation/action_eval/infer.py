@@ -38,6 +38,8 @@ Options (``policy.options``):
                          {"call": k, "casestudy": {...}}}}: per-call arm overrides used by the
                          attribution (patch at one call) and switch-point (arm from call k on)
                          experiments; every other call runs the base arm.
+                         An episode plan may list ``shadow_calls`` (call indices): the shadow arm then
+                         runs only on those calls (patch experiments that need one deviation).
 ``prompt_embeddings``    optional ``.pt`` from scripts/casestudy/precompute_prompts.py; when set the
                          text encoder is not loaded and unknown instructions are an error.
 ``hash_checkpoint``      default true.
@@ -357,7 +359,8 @@ class FastWAMJointPolicy:
         diag.update({"call_index": call_index, "model_seconds": round(model_seconds, 6)})
         if override is not None:
             diag["plan_override"] = override
-        if self.shadow is not None:
+        shadow_calls = self._plan.get("shadow_calls")
+        if self.shadow is not None and (shadow_calls is None or call_index in shadow_calls):
             diag["shadow"] = self._shadow_metrics(prompt, image, proprio, seed, action, actions)
         return Prediction(
             actions=actions,
