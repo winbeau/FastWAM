@@ -11,6 +11,7 @@ Methods
 ``prune``     token pruning of *future* video tokens after ``warmup_steps`` full
               steps. ``selection`` picks the kept set:
                 ``av``      top-k by action->video attention mass.
+                ``vv``      top-k by video->video attention mass (V→V).
                 ``cf``      CF-Prune (arXiv 2610.19957): complementary union of
                             action relevance and instruction relevance.
                 ``random``  uniform random subset (seeded per call).
@@ -30,7 +31,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
 METHODS = ("dense", "prune", "teacache", "noise")
-SELECTIONS = ("av", "cf", "random")
+SELECTIONS = ("av", "vv", "cf", "random")
 LAYER_RULES = ("min_entropy", "fixed")
 SEED_MODES = ("episode_call_hash", "native_fixed")
 
@@ -60,6 +61,10 @@ class PruneConfig:
     extra_selection: str = "av"
     #: Patch P3: denoising steps forced to run with all tokens (e.g. late steps only).
     full_steps: tuple[int, ...] = ()
+    #: Explicit kept set of future-token indices (e.g. a keep-set dumped from a dense
+    #: rollout). When given, ``selection`` is not consulted and no score is computed, so a
+    #: dense-derived keep-set can be replayed inside a sparse rollout at that call.
+    kept_index: Optional[tuple[int, ...]] = None
 
 
 @dataclass(frozen=True)
@@ -92,6 +97,12 @@ class CaseStudyConfig:
     #: Capture A->V attention, entropies and gate score at the first step of every call,
     #: also for arms that do not use them, so all arms log the same diagnostics.
     record_attention: bool = True
+    #: Layer whose attention is logged when ``method != prune`` (dense score dumps).
+    #: ``None`` picks the min-entropy layer, the same rule the pruning arms use.
+    score_layer: Optional[int] = None
+    #: Also log the V→V mass on future tokens at the captured layer (dense score dumps
+    #: and the ``vv`` selection). Requires the selection step to be step 0.
+    record_vv: bool = False
 
     def describe(self) -> dict[str, Any]:
         return asdict(self)
@@ -144,6 +155,7 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             extra_keep_ratio=float(block.get("extra_keep_ratio", 0.0)),
             extra_selection=str(block.get("extra_selection", "av")),
             full_steps=tuple(int(x) for x in block.get("full_steps", ())),
+            kept_index=None if block.get("kept_index") is None else tuple(int(x) for x in block["kept_index"]),
         )
         _require(prune.selection in SELECTIONS, f"prune.selection must be one of {SELECTIONS}")
         _require(0.0 < prune.keep_ratio <= 1.0, "prune.keep_ratio must be in (0, 1]")
@@ -154,6 +166,10 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
         _require(0.0 <= prune.extra_keep_ratio < 1.0, "prune.extra_keep_ratio must be in [0, 1)")
         _require(prune.extra_selection in ("av", "random"), "prune.extra_selection must be av or random")
         _require(all(0 <= x < steps for x in prune.full_steps), "prune.full_steps out of range")
+        if prune.kept_index is not None:
+            _require(len(set(prune.kept_index)) == len(prune.kept_index), "prune.kept_index has duplicates")
+            _require(all(x >= 0 for x in prune.kept_index), "prune.kept_index must be non-negative")
+            _require(0 < len(prune.kept_index), "prune.kept_index must not be empty")
     else:
         _require(raw.get("prune") is None, "prune block given but method != prune")
 
@@ -180,7 +196,7 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
     else:
         _require(raw.get("noise") is None, "noise block given but method != noise")
 
-    return CaseStudyConfig(
+    cfg = CaseStudyConfig(
         method=method,
         num_inference_steps=steps,
         frame0_cache=bool(raw.get("frame0_cache", True)),
@@ -191,7 +207,13 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
         teacache=teacache,
         noise=noise,
         record_attention=bool(raw.get("record_attention", True)),
+        score_layer=None if raw.get("score_layer") is None else int(raw["score_layer"]),
+        record_vv=bool(raw.get("record_vv", False)),
     )
+    _require(cfg.score_layer is None or cfg.score_layer >= 0, "casestudy.score_layer must be >= 0")
+    _require(cfg.prune is None or not cfg.record_vv or cfg.prune.warmup_steps == 1,
+             "record_vv needs prune.warmup_steps == 1 (V→V is captured at step 0)")
+    return cfg
 
 
 def call_seed(episode_key: str, call_index: int, offset: int = 0) -> int:

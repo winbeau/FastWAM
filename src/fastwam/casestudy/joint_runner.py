@@ -226,7 +226,9 @@ class JointCaseStudyRunner:
         prune = cfg.prune
         is_cf = prune is not None and prune.selection == "cf"
         first_call = self._layers is None
-        want_scores = prune is not None and prune.selection in ("av", "cf")
+        want_scores = prune is not None and prune.selection in ("av", "vv", "cf")
+        # V→V mass: dumped on dense score runs (record_vv) and needed by selection=vv.
+        want_vv = cfg.record_vv or (prune is not None and prune.selection == "vv")
         capture_first_step = cfg.record_attention or want_scores
         # Layer choice needs every layer on the episode's first call; afterwards one layer.
         all_layers = set(range(self.num_layers))
@@ -266,8 +268,12 @@ class JointCaseStudyRunner:
 
         modes: list[str] = []
         tea_rel: list[float] = []
-        diag: dict[str, Any] = {"path": "casestudy", "seed": int(seed), "steps": steps, "method": cfg.method}
+        diag: dict[str, Any] = {
+            "path": "casestudy", "seed": int(seed), "steps": steps, "method": cfg.method,
+            "grid": [int(grid.frames), int(grid.height), int(grid.width)],
+        }
         act_probs_step0: dict[int, torch.Tensor] = {}
+        vid_step_probs: dict[int, torch.Tensor] = {}
         k_future_store: dict[int, torch.Tensor] = {}
 
         for s in range(steps):
@@ -343,6 +349,9 @@ class JointCaseStudyRunner:
                             if s == 0 and prune is not None and prune.reselect_every_step:
                                 k_future_store[layer] = io_v[1].clone()
                         step_probs[layer] = probs
+                        if want_vv and mode == "full":
+                            # Video branch attends with k = [frame-0 | future kept], no action keys.
+                            vid_step_probs[layer] = self._attention_probs(io_v[0], k_vid)
                     if noise_gen is not None:
                         rms = out_a.float().pow(2).mean().sqrt()
                         out_a = out_a + (cfg.noise.sigma * rms * torch.randn(
@@ -381,17 +390,47 @@ class JointCaseStudyRunner:
                 diag["av_mass_future"] = float(av.sum().item())
                 diag["av_mass_obs"] = float(p_act[:, :f0].float().sum().item())
                 diag["av_scores_f16"] = _f16_b64(av)
+                if want_vv and vid_step_probs:
+                    vv_layer = self._layers.get("act", 0)
+                    if vv_layer not in vid_step_probs:
+                        vv_layer = int(min(vid_step_probs))
+                    vv = sel.vv_scores(vid_step_probs[vv_layer], grid)
+                    diag["vv_layer"] = int(vv_layer)
+                    diag["vv_scores_f16"] = _f16_b64(vv)
+                    diag["vv_mass_future"] = float(vv.sum().item())
             elif s == 0 and first_call:
-                self._layers = {"act": -1, "inst": -1}
+                # Dense arms with record_attention log A→V/V→V scores on every call. The layer
+                # is either fixed by score_layer or chosen by the pruning rule (min entropy).
+                if cfg.score_layer is not None:
+                    self._layers = {"act": int(cfg.score_layer), "inst": -1}
+                elif cfg.record_attention and act_probs_step0:
+                    self._layers = {
+                        "act": int(min(act_probs_step0, key=lambda l: sel.entropy(sel.future_mass(act_probs_step0[l], grid)))),
+                        "inst": -1,
+                    }
+                else:
+                    self._layers = {"act": -1, "inst": -1}
             if prune is not None and (s == prune.warmup_steps - 1 or (mode == "pruned" and prune.reselect_every_step)):
                 k = max(1, int(round(prune.keep_ratio * num_future)))
-                if prune.selection == "random":
+                if prune.kept_index is not None:
+                    # Keep-set taken from a dense rollout: no score is computed here.
+                    kept = torch.tensor(
+                        sorted({int(i) for i in prune.kept_index if 0 <= int(i) < num_future}),
+                        device=model.device, dtype=torch.long,
+                    )
+                    if kept.numel() == 0:
+                        kept = all_future[:k]
+                elif prune.selection == "random":
                     sel_gen = torch.Generator(device="cpu").manual_seed((int(seed) + 1) & 0x7FFFFFFF)
                     kept = sel.random_indices(num_future, k, sel_gen, model.device)
                 else:
                     p_src = step_probs if (mode == "pruned" and prune.reselect_every_step) else act_probs_step0
                     p_act = p_src[self._layers["act"]]
-                    if prune.selection == "av":
+                    if prune.selection == "vv":
+                        p_vid = vid_step_probs.get(self._layers["act"])
+                        kept = (sel.topk_indices(sel.vv_scores(p_vid, grid), k)
+                                if p_vid is not None else all_future[:k])
+                    elif prune.selection == "av":
                         kept = sel.topk_indices(sel.av_scores(p_act, grid), k)
                     else:
                         s_act = sel.cf_action_scores(p_act, grid)

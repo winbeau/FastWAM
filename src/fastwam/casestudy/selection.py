@@ -74,6 +74,20 @@ def av_scores(p_act: torch.Tensor, grid: Grid) -> torch.Tensor:
     return future_mass(p_act, grid)
 
 
+def vv_scores(p_vid: torch.Tensor, grid: Grid) -> torch.Tensor:
+    """[Kf] video->video mass received by each future video token.
+
+    ``p_vid`` is [Sq, Kv0 + Kf]: the video queries' probabilities over the *video* keys
+    only (the video branch attends with ``k = [frame-0 | future]``, no action keys).
+    The score is the column sum over all queries, divided by the number of queries so it
+    does not depend on how many future tokens were kept on this step. Frame-0 tokens are
+    never pruned, so only the future block is scored.
+    """
+    start = grid.per_frame
+    fut = p_vid[:, start : start + grid.num_future].float()
+    return fut.sum(dim=0) / max(1, p_vid.shape[0])
+
+
 def cf_action_scores(p_act: torch.Tensor, grid: Grid) -> torch.Tensor:
     """CF-Prune action relevance over future tokens.
 
@@ -165,6 +179,7 @@ def gate_score(p_act: torch.Tensor, grid: Grid) -> dict[str, float]:
 __all__ = [
     "Grid",
     "av_scores",
+    "vv_scores",
     "cf_action_scores",
     "cf_instruction_scores",
     "complementary_topk",
