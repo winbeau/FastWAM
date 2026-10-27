@@ -21,6 +21,11 @@ Methods
 ``noise``     dense compute plus Gaussian noise on the action stream's attention
               output (perturbation control, no speedup).
 Fewer denoising steps is ``dense`` with a smaller ``num_inference_steps``.
+
+``dump`` (any method) writes one call's internals to an ``.npz``: the action query's
+attention over the video tokens and the action hidden states after every layer and step,
+and the decoded predicted video. Capture does not change the numerics; it is meant for a
+single patched call of an episode plan.
 """
 
 from __future__ import annotations
@@ -61,6 +66,17 @@ class PruneConfig:
     extra_selection: str = "av"
     #: Patch P3: denoising steps forced to run with all tokens (e.g. late steps only).
     full_steps: tuple[int, ...] = ()
+    #: Patch P4: the denoising step whose A->V attention scores the kept set. ``None``
+    #: scores at step 0, as before. Late selection sets ``warmup_steps - 1``, so the set
+    #: is picked from the attention of the last warm-up step instead of the first.
+    score_step: Optional[int] = None
+    #: Patch P5: on pruned steps the action rows still see every future token. Kept tokens
+    #: give fresh K/V; dropped ones the K/V of the last full step. Video rows and latents
+    #: are pruned as usual.
+    action_full_kv: bool = False
+    #: Patch P6: only future tokens of these latent frames (1 = the first future frame)
+    #: can be kept; the count is unchanged.
+    score_frames: Optional[tuple[int, ...]] = None
     #: Explicit kept set of future-token indices (e.g. a keep-set dumped from a dense
     #: rollout). When given, ``selection`` is not consulted and no score is computed, so a
     #: dense-derived keep-set can be replayed inside a sparse rollout at that call.
@@ -80,6 +96,15 @@ class TeaCacheConfig:
 class NoiseConfig:
     #: Noise std relative to the RMS of the action stream's attention output, per layer.
     sigma: float = 0.0
+
+
+@dataclass(frozen=True)
+class DumpConfig:
+    #: Output ``.npz``; parent directories are created, an existing file is replaced.
+    path: str
+    attention: bool = True
+    hidden: bool = True
+    video: bool = True
 
 
 @dataclass(frozen=True)
@@ -103,6 +128,8 @@ class CaseStudyConfig:
     #: Also log the V→V mass on future tokens at the captured layer (dense score dumps
     #: and the ``vv`` selection). Requires the selection step to be step 0.
     record_vv: bool = False
+    #: Write this call's internals to an ``.npz`` (see the module docstring).
+    dump: Optional[DumpConfig] = None
 
     def describe(self) -> dict[str, Any]:
         return asdict(self)
@@ -155,6 +182,9 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             extra_keep_ratio=float(block.get("extra_keep_ratio", 0.0)),
             extra_selection=str(block.get("extra_selection", "av")),
             full_steps=tuple(int(x) for x in block.get("full_steps", ())),
+            score_step=None if block.get("score_step") is None else int(block["score_step"]),
+            action_full_kv=bool(block.get("action_full_kv", False)),
+            score_frames=None if block.get("score_frames") is None else tuple(int(x) for x in block["score_frames"]),
             kept_index=None if block.get("kept_index") is None else tuple(int(x) for x in block["kept_index"]),
         )
         _require(prune.selection in SELECTIONS, f"prune.selection must be one of {SELECTIONS}")
@@ -166,6 +196,16 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
         _require(0.0 <= prune.extra_keep_ratio < 1.0, "prune.extra_keep_ratio must be in [0, 1)")
         _require(prune.extra_selection in ("av", "random"), "prune.extra_selection must be av or random")
         _require(all(0 <= x < steps for x in prune.full_steps), "prune.full_steps out of range")
+        if prune.score_step is not None:
+            _require(0 <= prune.score_step < prune.warmup_steps,
+                     "prune.score_step must be in [0, warmup_steps): the kept set is scored on a full step")
+            _require(prune.selection in ("av", "vv", "cf"), "prune.score_step needs an attention-scored selection")
+            _require(prune.kept_index is None, "prune.score_step and prune.kept_index are exclusive")
+        if prune.score_frames is not None:
+            _require(len(prune.score_frames) > 0 and all(x >= 1 for x in prune.score_frames),
+                     "prune.score_frames lists future latent frames, 1-based")
+            _require(prune.selection == "av", "prune.score_frames is defined for selection=av")
+            _require(prune.kept_index is None, "prune.score_frames and prune.kept_index are exclusive")
         if prune.kept_index is not None:
             _require(len(set(prune.kept_index)) == len(prune.kept_index), "prune.kept_index has duplicates")
             _require(all(x >= 0 for x in prune.kept_index), "prune.kept_index must be non-negative")
@@ -196,6 +236,15 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
     else:
         _require(raw.get("noise") is None, "noise block given but method != noise")
 
+    dump = None
+    if raw.get("dump") is not None:
+        block = dict(raw["dump"])
+        _known_keys(block, {f for f in DumpConfig.__dataclass_fields__}, "casestudy.dump")
+        _require(bool(block.get("path")), "casestudy.dump needs a path")
+        dump = DumpConfig(path=str(block["path"]), attention=bool(block.get("attention", True)),
+                          hidden=bool(block.get("hidden", True)), video=bool(block.get("video", True)))
+        _require(dump.path.endswith(".npz"), "casestudy.dump.path must end in .npz")
+
     cfg = CaseStudyConfig(
         method=method,
         num_inference_steps=steps,
@@ -209,6 +258,7 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
         record_attention=bool(raw.get("record_attention", True)),
         score_layer=None if raw.get("score_layer") is None else int(raw["score_layer"]),
         record_vv=bool(raw.get("record_vv", False)),
+        dump=dump,
     )
     _require(cfg.score_layer is None or cfg.score_layer >= 0, "casestudy.score_layer must be >= 0")
     _require(cfg.prune is None or not cfg.record_vv or cfg.prune.warmup_steps == 1,
@@ -228,6 +278,7 @@ def call_seed(episode_key: str, call_index: int, offset: int = 0) -> int:
 
 __all__ = [
     "CaseStudyConfig",
+    "DumpConfig",
     "GateConfig",
     "NoiseConfig",
     "PruneConfig",

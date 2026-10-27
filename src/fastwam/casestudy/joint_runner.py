@@ -18,13 +18,15 @@ Methods (see ``config.py``): token pruning of future video tokens after warm-up 
 tokens leave the sequence and their latents keep moving with their last velocity),
 TeaCache step skipping of the whole joint stack, and attention-output noise on the
 action stream. ``frame0_cache=false`` (dense only) calls the model's native
-``infer_action`` unchanged, as the reference for equivalence checks.
+``infer_action`` unchanged, as the reference for equivalence checks. ``cfg.dump`` writes
+one call's attention, action hidden states and decoded video to an ``.npz``.
 """
 
 from __future__ import annotations
 
 import base64
 import time
+from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
@@ -273,8 +275,25 @@ class JointCaseStudyRunner:
             "grid": [int(grid.frames), int(grid.height), int(grid.width)],
         }
         act_probs_step0: dict[int, torch.Tensor] = {}
+        # A->V attention that scores the kept set: step 0 unless P4 moves it (score_step).
+        score_step = prune.score_step if prune is not None and prune.score_step is not None else 0
+        act_probs_sel: dict[int, torch.Tensor] = {}
         vid_step_probs: dict[int, torch.Tensor] = {}
         k_future_store: dict[int, torch.Tensor] = {}
+        # P5: future K/V of the last full step, per layer, for the action rows of pruned steps.
+        full_kv = prune is not None and prune.action_full_kv
+        kv_future_full: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        # P6: future tokens outside the listed latent frames cannot be kept.
+        frame_exclude = None
+        if prune is not None and prune.score_frames is not None:
+            bad = [f for f in prune.score_frames if not 1 <= f < grid.frames]
+            if bad:
+                raise ValueError(f"prune.score_frames {bad} outside the future frames 1..{grid.frames - 1}")
+            allowed = torch.tensor(sorted(set(prune.score_frames)), device=model.device)
+            frame_exclude = torch.nonzero(~torch.isin(grid.future_frame_index(model.device), allowed)).flatten()
+        dump = cfg.dump
+        d_future = d_obs = d_act = d_hidden = None
+        d_latents: list[torch.Tensor] = []
 
         for s in range(steps):
             ts_v = t_video[s].unsqueeze(0).to(dtype=latents_video.dtype, device=model.device)
@@ -317,6 +336,9 @@ class JointCaseStudyRunner:
                 capture_layers = act_layers if (s == 0 and capture_first_step) else set()
                 if mode == "pruned" and prune.reselect_every_step:
                     capture_layers = {self._layers["act"]}
+                if want_scores and score_step > 0 and s == score_step:
+                    # P4: score on a later full step; the layer was fixed at step 0.
+                    capture_layers = {self._layers["act"]}
                 freqs_v = pre_v["freqs"][idx_abs]
                 tmod_v = pre_v["t_mod"][:, idx_abs]
                 payload_v = {"context": pre_v["context"], "mask": pre_v["context_mask"][:, idx_abs]}
@@ -332,9 +354,30 @@ class JointCaseStudyRunner:
                     k_vid = torch.cat([kv0[layer]["k"], io_v[1]], dim=1)
                     v_vid = torch.cat([kv0[layer]["v"], io_v[2]], dim=1)
                     out_v = flash_attention(q=io_v[0], k=k_vid, v=v_vid, num_heads=self.num_heads)
-                    k_all = torch.cat([k_vid, io_a[1]], dim=1)
-                    v_all = torch.cat([v_vid, io_a[2]], dim=1)
+                    if full_kv and mode == "full":
+                        kv_future_full[layer] = (io_v[1], io_v[2])
+                    if full_kv and mode == "pruned" and layer in kv_future_full:
+                        # P5: dropped tokens keep the K/V of the last full step, kept ones are fresh.
+                        k_fut, v_fut = (x.clone() for x in kv_future_full[layer])
+                        k_fut[:, idx_rel] = io_v[1]
+                        v_fut[:, idx_rel] = io_v[2]
+                        k_all = torch.cat([kv0[layer]["k"], k_fut, io_a[1]], dim=1)
+                        v_all = torch.cat([kv0[layer]["v"], v_fut, io_a[2]], dim=1)
+                    else:
+                        k_all = torch.cat([k_vid, io_a[1]], dim=1)
+                        v_all = torch.cat([v_vid, io_a[2]], dim=1)
                     out_a = flash_attention(q=io_a[0], k=k_all, v=v_all, num_heads=self.num_heads)
+                    if dump is not None and dump.attention:
+                        pa = self._attention_probs(io_a[0], k_all)  # [A, f0 + future keys + A]
+                        nf = k_all.shape[1] - f0 - io_a[1].shape[1]
+                        if d_future is None:
+                            d_future = torch.zeros((steps, self.num_layers, pa.shape[0], num_future), dtype=torch.float16)
+                            d_obs = torch.zeros((steps, self.num_layers, pa.shape[0]), dtype=torch.float16)
+                            d_act = torch.zeros_like(d_obs)
+                        fut_idx = (all_future if nf == num_future else idx_rel).cpu()
+                        d_future[s, layer][:, fut_idx] = pa[:, f0:f0 + nf].half().cpu()
+                        d_obs[s, layer] = pa[:, :f0].sum(dim=-1).half().cpu()
+                        d_act[s, layer] = pa[:, f0 + nf:].sum(dim=-1).half().cpu()
                     if layer in capture_layers:
                         if idx_rel.numel() != num_future:
                             # P2 reselection on a pruned step: score every future token, with
@@ -359,6 +402,10 @@ class JointCaseStudyRunner:
                         )).to(out_a.dtype)
                     xv = self._post(bv, io_v, out_v, payload_v)
                     xa = self._post(ba, io_a, out_a, payload_a)
+                    if dump is not None and dump.hidden:
+                        if d_hidden is None:
+                            d_hidden = torch.zeros((steps, self.num_layers) + tuple(xa.shape[1:]), dtype=torch.float16)
+                        d_hidden[s, layer] = xa[0].half().cpu()
                 if tea is not None:
                     tea_res_v = xv - xv_in
                     tea_res_a = xa - xa_in
@@ -366,6 +413,8 @@ class JointCaseStudyRunner:
                     tea_consecutive = 0
                 if s == 0:
                     act_probs_step0 = step_probs
+                if s == score_step:
+                    act_probs_sel = step_probs
 
             # ---- heads and scheduler step
             vel_part = self.video.head(xv, pre_v["t"][:, idx_abs])
@@ -378,6 +427,8 @@ class JointCaseStudyRunner:
             latents_action = model.infer_action_scheduler.step(pred_action, d_action[s], latents_action)
             latents_video[:, :, 0:1] = first.clone()
             modes.append(mode)
+            if dump is not None:
+                d_latents.append(latents_action[0].float().cpu())
 
             # ---- after warm-up: layer choice, gate, kept set
             if s == 0 and act_probs_step0:
@@ -424,14 +475,14 @@ class JointCaseStudyRunner:
                     sel_gen = torch.Generator(device="cpu").manual_seed((int(seed) + 1) & 0x7FFFFFFF)
                     kept = sel.random_indices(num_future, k, sel_gen, model.device)
                 else:
-                    p_src = step_probs if (mode == "pruned" and prune.reselect_every_step) else act_probs_step0
+                    p_src = step_probs if (mode == "pruned" and prune.reselect_every_step) else act_probs_sel
                     p_act = p_src[self._layers["act"]]
                     if prune.selection == "vv":
                         p_vid = vid_step_probs.get(self._layers["act"])
                         kept = (sel.topk_indices(sel.vv_scores(p_vid, grid), k)
                                 if p_vid is not None else all_future[:k])
                     elif prune.selection == "av":
-                        kept = sel.topk_indices(sel.av_scores(p_act, grid), k)
+                        kept = sel.topk_indices(sel.av_scores(p_act, grid), k, exclude=frame_exclude)
                     else:
                         s_act = sel.cf_action_scores(p_act, grid)
                         s_inst = sel.cf_instruction_scores(inst_mass[self._layers["inst"]], grid)
@@ -451,13 +502,16 @@ class JointCaseStudyRunner:
                             g = torch.Generator(device="cpu").manual_seed((int(seed) + 2) & 0x7FFFFFFF)
                             extra = dropped[torch.randperm(dropped.numel(), generator=g)[:m].to(dropped.device)]
                         else:
-                            av_all = sel.av_scores(act_probs_step0[self._layers["act"]], grid)
+                            av_all = sel.av_scores(act_probs_sel[self._layers["act"]], grid)
                             extra = dropped[torch.topk(av_all[dropped], m).indices]
                         kept = torch.cat([kept, extra])
                         diag["extra_kept"] = int(m)
                 kept = torch.sort(kept).values
                 if s == prune.warmup_steps - 1:
-                    av = sel.av_scores(act_probs_step0[self._layers["act"]], grid) if act_probs_step0 else None
+                    av = sel.av_scores(act_probs_sel[self._layers["act"]], grid) if act_probs_sel else None
+                    diag["score_step"] = int(score_step)
+                    if score_step > 0 and av is not None:
+                        diag["av_scores_sel_f16"] = _f16_b64(av)
                     diag["kept_count"] = int(kept.numel())
                     diag["kept_index"] = kept.tolist()
                     if av is not None and float(av.sum()) > 0:
@@ -474,7 +528,33 @@ class JointCaseStudyRunner:
             diag["teacache_rel_l1"] = [round(r, 6) for r in tea_rel]
         if noise_gen is not None:
             diag["noise_sigma"] = cfg.noise.sigma
+        if full_kv:
+            diag["action_full_kv"] = True
+        if frame_exclude is not None:
+            diag["score_frames"] = list(prune.score_frames)
+        if dump is not None:
+            arrays = {"seed": np.int64(seed), "modes": np.asarray(modes), "grid": np.asarray(diag["grid"]),
+                      "kept_index": kept.cpu().numpy(), "action_latents": torch.stack(d_latents).numpy()}
+            if self._layers is not None:
+                arrays["layer_act"] = np.int64(self._layers["act"])
+            if d_future is not None:
+                arrays.update(attn_future=d_future.numpy(), attn_obs=d_obs.numpy(), attn_act=d_act.numpy())
+            if d_hidden is not None:
+                arrays["hidden"] = d_hidden.numpy()
+            if dump.video:
+                frames = model._decode_latents(latents_video)
+                arrays["video"] = np.stack([np.asarray(f) for f in frames])
+            _write_npz(Path(dump.path), arrays)
+            diag["dump_path"] = dump.path
         return latents_action[0].detach().to(device="cpu", dtype=torch.float32), diag
+
+
+def _write_npz(path: Path, arrays: dict) -> None:
+    """Atomic ``.npz`` write: a reader never sees a partial file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.stem + ".partial.npz")
+    np.savez_compressed(tmp, **arrays)
+    tmp.replace(path)
 
 
 def timed(fn, *args, **kwargs):

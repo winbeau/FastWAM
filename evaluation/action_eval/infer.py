@@ -38,7 +38,8 @@ Options (``policy.options``):
 ``episode_plans``        optional JSON {episode_id: {"calls": {"<k>": casestudy}, "from_call":
                          {"call": k, "casestudy": {...}}}}: per-call arm overrides used by the
                          attribution (patch at one call) and switch-point (arm from call k on)
-                         experiments; every other call runs the base arm.
+                         experiments; every other call runs the base arm. An override draws its
+                         noise with its own ``seed_offset`` (0 = the base rollout's noise).
                          An episode plan may list ``shadow_calls`` (call indices): the shadow arm then
                          runs only on those calls (patch experiments that need one deviation).
 ``prompt_embeddings``    optional ``.pt`` from scripts/casestudy/precompute_prompts.py; when set the
@@ -335,15 +336,16 @@ class FastWAMJointPolicy:
         proprio = self._io.normalize_proprio(state, self.processor)
         prompt = self._prompt_template.format(task=instruction)
         call_index = self.predict_calls
+        runner, override = self._runner_for_call(call_index)
         if self.casestudy.seed_mode == "episode_call_hash":
-            seed = self._call_seed(self._episode_key, call_index, self.casestudy.seed_offset)
+            offset = runner.cfg.seed_offset if override is not None else self.casestudy.seed_offset
+            seed = self._call_seed(self._episode_key, call_index, offset)
         else:
             seed = self.native_seed
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         model_started = time.perf_counter()
-        runner, override = self._runner_for_call(call_index)
         action, diag = runner.infer_action(
             prompt=prompt, input_image=image, proprio=proprio,
             action_horizon=self.action_horizon, num_video_frames=self.num_video_frames,
