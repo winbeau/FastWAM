@@ -360,6 +360,10 @@ class FastWAMJointPolicy:
             raise ValueError("FastWAM produced non-finite actions")
         self.predict_calls += 1
         diag.update({"call_index": call_index, "model_seconds": round(model_seconds, 6)})
+        diag.update(self._chunk_logs(action))
+        if diag.get("kept_index") is not None and diag.get("grid") is not None:
+            per_frame = int(diag["grid"][1]) * int(diag["grid"][2])
+            diag["kept_frame"] = [int(i) // per_frame + 1 for i in diag["kept_index"]]
         if override is not None:
             diag["plan_override"] = override
         shadow_calls = self._plan.get("shadow_calls")
@@ -429,6 +433,19 @@ class FastWAMJointPolicy:
             "rotation_diff_executed": float(np.linalg.norm(actions[:k, 3:6].sum(0) - shadow_sim[:k, 3:6].sum(0))),
             "shadow_sim_actions_f16": base64.b64encode(shadow_sim.astype(np.float16).tobytes()).decode(),
             "shadow_gate_score": shadow_diag.get("gate_score"),
+            "shadow_kept_index": shadow_diag.get("kept_index"),
+            **{f"shadow_{key}": value for key, value in self._chunk_logs(shadow_action).items()},
+        }
+
+    def _chunk_logs(self, action) -> dict:
+        """Full chunk as float32 base64 [T, 7]: normalized model output, and de-normalized
+        before gripper binarisation (the executed chunk differs only in the gripper sign)."""
+        import base64
+
+        continuous = self._io.postprocess_action(action.clone(), self.processor, binarize_gripper=False)
+        return {
+            "raw_actions_f32": base64.b64encode(np.asarray(action.numpy(), dtype=np.float32).tobytes()).decode(),
+            "cont_actions_f32": base64.b64encode(np.asarray(continuous, dtype=np.float32).tobytes()).decode(),
         }
 
     def close(self) -> None:
