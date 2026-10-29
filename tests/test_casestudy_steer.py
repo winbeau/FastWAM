@@ -142,12 +142,21 @@ def test_context_probe_config():
     assert v2.prune.video_full_kv and v2.prune.action_full_kv
     assert parse_config({"method": "prune", "prune": {**base, "video_eager": True, "oracle_kv": True}}).prune.oracle_kv
     assert parse_config({"method": "prune", "prune": {**base, "steer": {"lam": -1.0}, "dense_bias": True}}).prune.dense_bias
+    # V2 on the bf16 SDPA path and its two halves need no steer block; Rk adds a full step
+    plain = {"selection": "av", "keep_ratio": 0.2, "warmup_steps": 1}
+    for extra in ({"action_full_kv": True, "video_full_kv": True}, {"action_full_kv": True}, {"video_full_kv": True},
+                  {"action_full_kv": True, "video_full_kv": True, "full_steps": [6]}):
+        cfg = parse_config({"method": "prune", "prune": {**plain, **extra}})
+        assert cfg.prune.steer is None and cfg.prune.video_full_kv == extra.get("video_full_kv", False)
     for bad in ({"steer_video": {"lam": 1.0}},                                      # needs video_eager
-                {"video_eager": True, "video_full_kv": True},                       # needs action_full_kv
                 {"video_eager": True, "oracle_kv": True, "action_full_kv": True},   # exclusive
+                {"video_eager": True, "oracle_kv": True, "video_full_kv": True},    # exclusive
                 {"dense_bias": True, "video_eager": True},                          # dense_bias is plain dense
+                {"steer": {"lam": -1.0}, "dense_bias": True, "video_full_kv": True},
                 {"warmup_steps": 2, "video_eager": True, "steer_video": {"lam": 1.0}}):
         with pytest.raises(ValueError):
             parse_config({"method": "prune", "num_inference_steps": 10, "prune": {**base, **bad}})
+    with pytest.raises(ValueError):  # the cached K/V needs a kept set fixed after warm-up
+        parse_config({"method": "prune", "prune": {**plain, "video_full_kv": True, "reselect_every_step": True}})
     with pytest.raises(ValueError):  # every context probe needs the shared action-row path
         parse_config({"method": "prune", "prune": {"selection": "av", "keep_ratio": 0.2, "video_eager": True}})

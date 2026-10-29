@@ -28,12 +28,13 @@ warm-up step (mF: the row's probability on all future tokens, mFk: on the kept o
 ``lam = 1`` gives back the dense future share. With ``steer`` set the action rows of pruned
 steps run in plain fp32 attention, also at ``lam = 0``.
 
-Context probes of the same round (all need ``steer``, so every sparse arm shares that path):
+Context probes (all but the cached K/V need ``steer``, so those arms share one path):
 ``video_eager`` runs the video rows of pruned steps in plain fp32 attention as well;
 ``steer_video`` adds ``lam * b_v`` on the kept future columns of the kept future queries,
 ``b_v = log(mF / mFk)`` of each query at the last warm-up step (``lam = 1`` gives the video
-rows back their dense future share); ``video_full_kv`` (with ``action_full_kv``) lets the video
-rows of pruned steps also see the dropped tokens' K/V of the last full step; ``oracle_kv``
+rows back their dense future share); ``video_full_kv`` lets the video rows of pruned steps
+also see the dropped tokens' K/V of the last full step (with ``action_full_kv``: V2, which runs
+on the bf16 SDPA path unless ``video_eager``); ``oracle_kv``
 gives the action rows of pruned steps the kept tokens' K/V of a dense pass of the same call,
 seed and step; ``dense_bias`` never prunes and adds ``steer.lam * b`` to every future column
 of the action rows after warm-up (``lam = -1`` gives the sparse arm's future share with every
@@ -114,7 +115,9 @@ class PruneConfig:
     video_eager: bool = False
     #: Re-budget of the kept future queries on their kept future columns (module docstring).
     steer_video: Optional[SteerConfig] = None
-    #: With ``action_full_kv``: the video rows of pruned steps also see the dropped tokens.
+    #: V2 (video side): the video rows of pruned steps also see the dropped tokens' K/V of the
+    #: last full step. With ``action_full_kv`` too, this is V2; alone, V2-vid. A full step
+    #: listed in ``full_steps`` refreshes the cached K/V (V2 + Rk).
     video_full_kv: bool = False
     #: Action rows of pruned steps read the kept tokens' K/V from a dense pass (diagnostic).
     oracle_kv: bool = False
@@ -279,17 +282,17 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
                 _require(st.clamp > 0, f"prune.{name}.clamp must be > 0")
                 _require(not prune.reselect_every_step, f"prune.{name} needs a kept set fixed after warm-up")
                 _require(prune.warmup_steps == 1, f"prune.{name} needs warmup_steps == 1")
-        new_path = prune.video_eager or prune.steer_video is not None or prune.video_full_kv or prune.oracle_kv or prune.dense_bias
+        new_path = prune.video_eager or prune.steer_video is not None or prune.oracle_kv or prune.dense_bias
         if new_path:
             _require(prune.steer is not None, "the context probes need prune.steer (the shared action-row path)")
             _require(prune.selection != "vv" and prune.kept_index is None and prune.extra_keep_ratio == 0.0,
                      "the context probes are defined for an attention-scored kept set without extras")
         _require(prune.steer_video is None or prune.video_eager, "prune.steer_video needs prune.video_eager")
-        _require(not prune.video_full_kv or (prune.action_full_kv and prune.video_eager),
-                 "prune.video_full_kv needs prune.action_full_kv and prune.video_eager")
-        _require(not prune.oracle_kv or not prune.action_full_kv, "prune.oracle_kv and prune.action_full_kv are exclusive")
+        cache = prune.action_full_kv or prune.video_full_kv
+        _require(not (cache and prune.reselect_every_step), "cached dropped K/V needs a kept set fixed after warm-up")
+        _require(not (prune.oracle_kv and cache), "prune.oracle_kv and the cached dropped K/V are exclusive")
         if prune.dense_bias:
-            _require(not (prune.video_eager or prune.steer_video is not None or prune.action_full_kv or prune.oracle_kv
+            _require(not (prune.video_eager or prune.steer_video is not None or cache or prune.oracle_kv
                           or prune.full_steps or prune.gate is not None),
                      "prune.dense_bias is plain dense compute plus the action-row bias")
     else:
