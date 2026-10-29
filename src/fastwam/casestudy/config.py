@@ -28,6 +28,17 @@ warm-up step (mF: the row's probability on all future tokens, mFk: on the kept o
 ``lam = 1`` gives back the dense future share. With ``steer`` set the action rows of pruned
 steps run in plain fp32 attention, also at ``lam = 0``.
 
+Context probes of the same round (all need ``steer``, so every sparse arm shares that path):
+``video_eager`` runs the video rows of pruned steps in plain fp32 attention as well;
+``steer_video`` adds ``lam * b_v`` on the kept future columns of the kept future queries,
+``b_v = log(mF / mFk)`` of each query at the last warm-up step (``lam = 1`` gives the video
+rows back their dense future share); ``video_full_kv`` (with ``action_full_kv``) lets the video
+rows of pruned steps also see the dropped tokens' K/V of the last full step; ``oracle_kv``
+gives the action rows of pruned steps the kept tokens' K/V of a dense pass of the same call,
+seed and step; ``dense_bias`` never prunes and adds ``steer.lam * b`` to every future column
+of the action rows after warm-up (``lam = -1`` gives the sparse arm's future share with every
+token present).
+
 ``dump`` (any method) writes one call's internals to an ``.npz``: the action query's
 attention over the video tokens and the action hidden states after every layer and step,
 and the decoded predicted video. Capture does not change the numerics; it is meant for a
@@ -99,6 +110,16 @@ class PruneConfig:
     kept_index: Optional[tuple[int, ...]] = None
     #: Attention re-budget of the action rows on pruned steps (see the module docstring).
     steer: Optional[SteerConfig] = None
+    #: Video rows of pruned steps in plain fp32 attention (needed by the two options below).
+    video_eager: bool = False
+    #: Re-budget of the kept future queries on their kept future columns (module docstring).
+    steer_video: Optional[SteerConfig] = None
+    #: With ``action_full_kv``: the video rows of pruned steps also see the dropped tokens.
+    video_full_kv: bool = False
+    #: Action rows of pruned steps read the kept tokens' K/V from a dense pass (diagnostic).
+    oracle_kv: bool = False
+    #: Never prune; the action rows add ``steer.lam * b`` to every future column after warm-up.
+    dense_bias: bool = False
 
 
 @dataclass(frozen=True)
@@ -152,6 +173,12 @@ class CaseStudyConfig:
     #: Log, per future token, the distance of the final (clean) latent to the frame-0
     #: latent at the same position: how much the predicted future moves.
     record_motion: bool = False
+    #: Log, per denoising step and future query, the video rows' attention share on frame-0
+    #: keys (head- and layer-mean; NaN for queries not in the step's sequence).
+    record_video_frame0: bool = False
+    #: Log, per denoising step and frame-1 token, the distance of that step's clean estimate
+    #: x - sigma * v to the frame-0 latent at the same position.
+    record_motion_steps: bool = False
     #: Write this call's internals to an ``.npz`` (see the module docstring).
     dump: Optional[DumpConfig] = None
 
@@ -192,9 +219,10 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
         gate = None
         steer = None
         if block.get("steer") is not None:
-            sblock = dict(block["steer"])
-            _known_keys(sblock, {f for f in SteerConfig.__dataclass_fields__}, "casestudy.prune.steer")
-            steer = SteerConfig(lam=float(sblock.get("lam", 0.0)), clamp=float(sblock.get("clamp", 3.0)))
+            steer = _steer(block["steer"], "casestudy.prune.steer")
+        steer_video = None
+        if block.get("steer_video") is not None:
+            steer_video = _steer(block["steer_video"], "casestudy.prune.steer_video")
         if block.get("gate") is not None:
             gblock = dict(block["gate"])
             _known_keys(gblock, {"tau"}, "casestudy.prune.gate")
@@ -216,6 +244,11 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             score_frames=None if block.get("score_frames") is None else tuple(int(x) for x in block["score_frames"]),
             kept_index=None if block.get("kept_index") is None else tuple(int(x) for x in block["kept_index"]),
             steer=steer,
+            video_eager=bool(block.get("video_eager", False)),
+            steer_video=steer_video,
+            video_full_kv=bool(block.get("video_full_kv", False)),
+            oracle_kv=bool(block.get("oracle_kv", False)),
+            dense_bias=bool(block.get("dense_bias", False)),
         )
         _require(prune.selection in SELECTIONS, f"prune.selection must be one of {SELECTIONS}")
         _require(0.0 < prune.keep_ratio <= 1.0, "prune.keep_ratio must be in (0, 1]")
@@ -240,11 +273,25 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             _require(len(set(prune.kept_index)) == len(prune.kept_index), "prune.kept_index has duplicates")
             _require(all(x >= 0 for x in prune.kept_index), "prune.kept_index must be non-negative")
             _require(0 < len(prune.kept_index), "prune.kept_index must not be empty")
-        if prune.steer is not None:
-            _require(math.isfinite(prune.steer.lam), "prune.steer.lam must be finite")
-            _require(prune.steer.clamp > 0, "prune.steer.clamp must be > 0")
-            _require(not prune.reselect_every_step, "prune.steer needs a kept set fixed after warm-up")
-            _require(not prune.action_full_kv, "prune.steer and prune.action_full_kv are exclusive")
+        for name, st in (("steer", prune.steer), ("steer_video", prune.steer_video)):
+            if st is not None:
+                _require(math.isfinite(st.lam), f"prune.{name}.lam must be finite")
+                _require(st.clamp > 0, f"prune.{name}.clamp must be > 0")
+                _require(not prune.reselect_every_step, f"prune.{name} needs a kept set fixed after warm-up")
+                _require(prune.warmup_steps == 1, f"prune.{name} needs warmup_steps == 1")
+        new_path = prune.video_eager or prune.steer_video is not None or prune.video_full_kv or prune.oracle_kv or prune.dense_bias
+        if new_path:
+            _require(prune.steer is not None, "the context probes need prune.steer (the shared action-row path)")
+            _require(prune.selection != "vv" and prune.kept_index is None and prune.extra_keep_ratio == 0.0,
+                     "the context probes are defined for an attention-scored kept set without extras")
+        _require(prune.steer_video is None or prune.video_eager, "prune.steer_video needs prune.video_eager")
+        _require(not prune.video_full_kv or (prune.action_full_kv and prune.video_eager),
+                 "prune.video_full_kv needs prune.action_full_kv and prune.video_eager")
+        _require(not prune.oracle_kv or not prune.action_full_kv, "prune.oracle_kv and prune.action_full_kv are exclusive")
+        if prune.dense_bias:
+            _require(not (prune.video_eager or prune.steer_video is not None or prune.action_full_kv or prune.oracle_kv
+                          or prune.full_steps or prune.gate is not None),
+                     "prune.dense_bias is plain dense compute plus the action-row bias")
     else:
         _require(raw.get("prune") is None, "prune block given but method != prune")
 
@@ -295,12 +342,20 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
         record_vv=bool(raw.get("record_vv", False)),
         record_future_share=bool(raw.get("record_future_share", False)),
         record_motion=bool(raw.get("record_motion", False)),
+        record_video_frame0=bool(raw.get("record_video_frame0", False)),
+        record_motion_steps=bool(raw.get("record_motion_steps", False)),
         dump=dump,
     )
     _require(cfg.score_layer is None or cfg.score_layer >= 0, "casestudy.score_layer must be >= 0")
     _require(cfg.prune is None or not cfg.record_vv or cfg.prune.warmup_steps == 1,
              "record_vv needs prune.warmup_steps == 1 (V→V is captured at step 0)")
     return cfg
+
+
+def _steer(raw: Any, where: str) -> SteerConfig:
+    block = dict(raw)
+    _known_keys(block, {f for f in SteerConfig.__dataclass_fields__}, where)
+    return SteerConfig(lam=float(block.get("lam", 0.0)), clamp=float(block.get("clamp", 3.0)))
 
 
 def call_seed(episode_key: str, call_index: int, offset: int = 0) -> int:

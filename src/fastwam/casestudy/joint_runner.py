@@ -18,7 +18,13 @@ Methods (see ``config.py``): token pruning of future video tokens after warm-up 
 tokens leave the sequence and their latents keep moving with their last velocity),
 TeaCache step skipping of the whole joint stack, and attention-output noise on the
 action stream. ``prune.steer`` runs the action rows of pruned steps in plain fp32 attention
-with a per-row bias on the kept future columns (see ``_steer_bias``); video rows keep SDPA.
+with a per-row bias on the kept future columns (see ``_steer_bias``); video rows keep SDPA
+unless ``prune.video_eager`` (then also fp32, with the optional ``steer_video`` bias and the
+``video_full_kv`` keys). ``oracle_kv`` runs a dense pass of the same call first and gives the
+action rows of pruned steps its kept-token K/V; ``dense_bias`` never prunes and biases the
+action rows' future columns. ``record_video_frame0`` / ``record_motion_steps`` log per step the
+video rows' frame-0 share and the frame-1 motion of the clean estimate; ``diag["cost"]`` holds
+the token and key counts for a relative-compute estimate.
 ``frame0_cache=false`` (dense only) calls the model's native
 ``infer_action`` unchanged, as the reference for equivalence checks. ``cfg.dump`` writes
 one call's attention, action hidden states and decoded video to an ``.npz``.
@@ -28,6 +34,7 @@ from __future__ import annotations
 
 import base64
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Optional
 
@@ -66,6 +73,7 @@ class JointCaseStudyRunner:
             raise ValueError("frame0_cache=false is the native reference path and supports method=dense only")
         self._prompt_cache: dict[str, tuple[torch.Tensor, torch.Tensor, int]] = {}
         self._layers: Optional[dict[str, int]] = None
+        self._cost: Optional[dict] = None
 
     # ------------------------------------------------------------------ episode
     def reset_episode(self) -> None:
@@ -114,32 +122,37 @@ class JointCaseStudyRunner:
         return (qh @ kh.transpose(-1, -2)) * (qh.shape[-1] ** -0.5)
 
     @staticmethod
-    def _steered_probs(logits: torch.Tensor, kept_cols: slice, bias: torch.Tensor, lam: float) -> torch.Tensor:
-        """softmax over keys after adding ``lam * bias`` [H, Sq] to the kept future columns."""
+    def _steered_probs(logits: torch.Tensor, cols, bias: Optional[torch.Tensor], lam: float) -> torch.Tensor:
+        """softmax over keys after adding ``lam * bias`` [H, Sq] to the columns ``cols`` (a slice
+        or an index tensor)."""
         if lam != 0.0:
             logits = logits.clone()
-            logits[..., kept_cols] += lam * bias.unsqueeze(-1)
+            logits[..., cols] += lam * bias.unsqueeze(-1)
         return torch.softmax(logits, dim=-1)
 
-    def _steered_attention(self, q, k, v, kept_cols: slice, bias: torch.Tensor, lam: float):
-        """Action rows of a pruned step, keys ``[frame-0 | kept future | action]``, in plain fp32
-        attention -> (output [1, Sq, H*d] in q's dtype, future share [H, Sq])."""
-        probs = self._steered_probs(self._head_logits(q, k), kept_cols, bias, lam)
+    def _steered_attention(self, q, k, v, cols, bias: Optional[torch.Tensor], lam: float):
+        """Plain fp32 attention with ``lam * bias`` on the columns ``cols`` -> (output [1, Sq, H*d]
+        in q's dtype, probabilities [H, Sq, Sk]). Action rows of pruned steps (``steer``) and, with
+        ``video_eager``, video rows of pruned steps."""
+        probs = self._steered_probs(self._head_logits(q, k), cols, bias, lam)
         vh = rearrange(v, "b s (n d) -> b n s d", n=self.num_heads)[0].float()
         out = rearrange(probs @ vh, "n s d -> 1 s (n d)").to(dtype=q.dtype)
-        return out, probs[..., kept_cols].sum(dim=-1)
+        return out, probs
 
-    def _steer_bias(self, steer, fut_probs: dict, logits: dict, kept: torch.Tensor, f0: int, num_future: int):
+    def _steer_bias(self, steer, fut_probs: dict, logits: dict, kept: torch.Tensor, f0: int, num_future: int,
+                    dense_bias: bool = False):
         """Per-layer bias b = log(mF / mFk) [H, A], clamped at ``steer.clamp``, from the action rows'
         probabilities at the last warm-up (full) step: mF on all future tokens, mFk on the kept ones.
 
         Also the formula check: that step's logits restricted to ``[frame-0 | kept | action]``, with
         b added to the kept columns (lam = 1), must give the future share mF wherever b is not
         clamped (adding log(mF/mFk) scales the kept weights so they sum to the dense future weight).
+        With ``dense_bias`` and lam = -1, also: the full logits with -b on every future column must
+        give the share of the restricted (sparse) row, mFk / (1 - mF + mFk).
         """
         nk = int(kept.numel())
         bias: dict[int, torch.Tensor] = {}
-        rows = {"b": [], "err": [], "clamped": [], "m_f": [], "m_fk": []}
+        rows = {"b": [], "err": [], "clamped": [], "m_f": [], "m_fk": [], "err_dense": []}
         for layer in sorted(fut_probs):
             p = fut_probs[layer]
             m_f = p.sum(dim=-1)
@@ -156,9 +169,13 @@ class JointCaseStudyRunner:
             for key, value in (("b", b), ("err", (share - m_f).abs()), ("clamped", raw > steer.clamp),
                                ("m_f", m_f), ("m_fk", m_fk)):
                 rows[key].append(value)
-        t = {key: torch.stack(value) for key, value in rows.items()}  # [L, H, A]
+            if dense_bias and steer.lam == -1.0:
+                fut = slice(f0, f0 + num_future)
+                d_share = self._steered_probs(lg, fut, b, -1.0)[..., fut].sum(dim=-1)
+                rows["err_dense"].append((d_share - m_fk / (1.0 - m_f + m_fk)).abs())
+        t = {key: torch.stack(value) for key, value in rows.items() if value}  # [L, H, A]
         free = ~t["clamped"]
-        return bias, {
+        out = {
             "lam": float(steer.lam), "clamp": float(steer.clamp), "layers": len(bias),
             "b_mean": float(t["b"].mean()), "b_max": float(t["b"].max()), "b_min": float(t["b"].min()),
             "b_layer_mean": [round(float(x), 5) for x in t["b"].mean(dim=(1, 2))],
@@ -168,6 +185,57 @@ class JointCaseStudyRunner:
             "dense_future_share": float(t["m_f"].mean()),
             "kept_future_share": float(t["m_fk"].mean()),
         }
+        if "err_dense" in t:
+            out["dense_bias_check_max_abs"] = float(t["err_dense"][free].max()) if bool(free.any()) else None
+        return bias, out
+
+    def _steer_video_bias(self, steer, fut_probs: dict, logits: dict, kept: torch.Tensor, f0: int):
+        """Per-layer bias b_v = log(mF / mFk) [H, kept queries], clamped at ``steer.clamp``, from the
+        video rows' probabilities at step 0 ([H, Kf queries, Kf keys]): for each kept future query,
+        mF on all future keys and mFk on the kept ones. Formula check as in ``_steer_bias``: that
+        step's logits of the kept queries restricted to ``[frame-0 | kept]``, plus b_v on the kept
+        columns, give the future share mF wherever b_v is not clamped."""
+        nk = int(kept.numel())
+        bias: dict[int, torch.Tensor] = {}
+        rows = {"b": [], "err": [], "clamped": [], "m_f": [], "m_fk": []}
+        for layer in sorted(fut_probs):
+            p = fut_probs[layer][:, kept]  # [H, nk, Kf], a contiguous copy
+            m_f = p.sum(dim=-1)
+            m_fk = p[..., kept].sum(dim=-1)  # same layout as p when every token is kept: b_v == 0 exactly
+            raw = torch.log(m_f.clamp_min(1e-30) / m_fk.clamp_min(1e-30))
+            b = raw.clamp(max=steer.clamp)
+            bias[layer] = b
+            lg = logits[layer][:, kept]
+            cols = torch.cat([torch.arange(f0, device=lg.device), kept + f0])
+            share = self._steered_probs(lg[..., cols], slice(f0, f0 + nk), b, 1.0)[..., f0:].sum(dim=-1)
+            for key, value in (("b", b), ("err", (share - m_f).abs()), ("clamped", raw > steer.clamp),
+                               ("m_f", m_f), ("m_fk", m_fk)):
+                rows[key].append(value)
+        t = {key: torch.stack(value) for key, value in rows.items()}  # [L, H, nk]
+        free = ~t["clamped"]
+        return bias, {
+            "lam": float(steer.lam), "clamp": float(steer.clamp), "layers": len(bias),
+            "b_mean": float(t["b"].mean()), "b_max": float(t["b"].max()), "b_min": float(t["b"].min()),
+            "clamped_fraction": float(t["clamped"].float().mean()),
+            "check_max_abs": float(t["err"][free].max()) if bool(free.any()) else None,
+            "check_max_abs_clamped": float(t["err"][t["clamped"]].max()) if bool(t["clamped"].any()) else None,
+            "dense_future_share": float(t["m_f"].mean()),
+            "kept_future_share": float(t["m_fk"].mean()),
+        }
+
+    def _cost_model(self) -> dict:
+        """Parameter counts for the relative-compute estimate (per block; context K/V projections
+        apart, since they run on the context tokens, not on the queries)."""
+        if self._cost is None:
+            def split(block) -> tuple[int, int]:
+                total = sum(p.numel() for p in block.parameters())
+                ctx = sum(p.numel() for n, p in block.named_parameters() if n.startswith(("cross_attn.k.", "cross_attn.v.")))
+                return int(total), int(ctx)
+            pv, pv_ctx = split(self.video.blocks[0])
+            pa, pa_ctx = split(self.action.blocks[0])
+            self._cost = {"video_block_params": pv, "video_ctx_kv_params": pv_ctx,
+                          "action_block_params": pa, "action_ctx_kv_params": pa_ctx, "layers": self.num_layers}
+        return dict(self._cost)
 
     def _post(self, block, io: tuple, mixed: torch.Tensor, context_payload: dict) -> torch.Tensor:
         _q, _k, _v, residual_x, gate_msa, shift_mlp, scale_mlp, gate_mlp, _ckpt = io
@@ -229,10 +297,22 @@ class JointCaseStudyRunner:
         seed: int,
         sigma_shift: Optional[float] = None,
         rand_device: str = "cpu",
+        _capture_kv: Optional[dict] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         cfg = self.cfg
         model = self.model
         steps = int(cfg.num_inference_steps)
+        # X2 (prune.oracle_kv): a dense pass of the same call and seed first, keeping every
+        # step's future K/V per layer for the action rows of the pruned pass below.
+        oracle: Optional[dict] = None
+        if cfg.prune is not None and cfg.prune.oracle_kv:
+            oracle = {}
+            dense_cfg = replace(cfg, method="dense", prune=None, record_attention=False, record_future_share=False,
+                                record_motion=False, record_video_frame0=False, record_motion_steps=False, dump=None)
+            JointCaseStudyRunner(model, dense_cfg, prompt_store=self.prompt_store).infer_action(
+                prompt, input_image, proprio, action_horizon, num_video_frames, seed,
+                sigma_shift=sigma_shift, rand_device=rand_device, _capture_kv=oracle,
+            )
         if not cfg.frame0_cache:
             text = {"prompt": prompt}
             if self.prompt_store is not None:
@@ -367,6 +447,23 @@ class JointCaseStudyRunner:
         steer_logits: dict[int, torch.Tensor] = {}
         steer_bias: dict[int, torch.Tensor] = {}
         share_rows: list[torch.Tensor] = []
+        # Context probes: video rows of pruned steps in fp32 (video_eager), their re-budget
+        # (steer_video: step-0 future probabilities [H, Kf, Kf] and logits, then the bias
+        # [H, kept]), dropped K/V for the video rows too (video_full_kv), and dense_bias.
+        video_eager = prune is not None and prune.video_eager
+        steer_v = prune.steer_video if prune is not None else None
+        video_full_kv = prune is not None and prune.video_full_kv
+        dense_bias = prune is not None and prune.dense_bias
+        steer_vfut: dict[int, torch.Tensor] = {}
+        steer_vlogits: dict[int, torch.Tensor] = {}
+        steer_vbias: dict[int, torch.Tensor] = {}
+        want_vf0 = cfg.record_video_frame0
+        vf0_rows: list[torch.Tensor] = []
+        want_motion_steps = cfg.record_motion_steps
+        motion_rows: list[torch.Tensor] = []
+        pt, ph, pw = (int(x) for x in patch)
+        cost_steps: list[list[int]] = []
+        cost_dim = 0
         dump = cfg.dump
         d_future = d_obs = d_act = d_hidden = None
         d_latents: list[torch.Tensor] = []
@@ -382,7 +479,8 @@ class JointCaseStudyRunner:
 
             # ---- mode for this step
             mode = "full"
-            if prune is not None and s >= prune.warmup_steps and not gated_dense and s not in prune.full_steps:
+            if (prune is not None and not dense_bias and s >= prune.warmup_steps and not gated_dense
+                    and s not in prune.full_steps):
                 mode = "pruned"
             if tea is not None:
                 block0 = self.video.blocks[0]
@@ -405,6 +503,7 @@ class JointCaseStudyRunner:
             xv_in, xa_in = xv, xa
 
             share_layers: list[torch.Tensor] = []
+            vf0_layers: list[torch.Tensor] = []
             if mode == "skip":
                 xv = xv_in + tea_res_v
                 xa = xa_in + tea_res_a
@@ -430,24 +529,68 @@ class JointCaseStudyRunner:
                     )
                     k_vid = torch.cat([kv0[layer]["k"], io_v[1]], dim=1)
                     v_vid = torch.cat([kv0[layer]["v"], io_v[2]], dim=1)
-                    out_v = flash_attention(q=io_v[0], k=k_vid, v=v_vid, num_heads=self.num_heads)
+                    if _capture_kv is not None and s > 0:
+                        _capture_kv[(s, layer)] = (io_v[1], io_v[2])
                     if full_kv and mode == "full":
                         kv_future_full[layer] = (io_v[1], io_v[2])
+                    k_fut = v_fut = None
                     if full_kv and mode == "pruned" and layer in kv_future_full:
                         # P5: dropped tokens keep the K/V of the last full step, kept ones are fresh.
                         k_fut, v_fut = (x.clone() for x in kv_future_full[layer])
                         k_fut[:, idx_rel] = io_v[1]
                         v_fut[:, idx_rel] = io_v[2]
+                    n_q = int(idx_rel.numel())
+                    vf0 = None
+                    if video_eager and mode == "pruned":
+                        if video_full_kv and k_fut is not None:
+                            # V2: the video rows also see the dropped tokens' K/V of the last full step.
+                            kv_k = torch.cat([kv0[layer]["k"], k_fut], dim=1)
+                            kv_v = torch.cat([kv0[layer]["v"], v_fut], dim=1)
+                            v_cols = idx_rel + f0
+                        else:
+                            kv_k, kv_v, v_cols = k_vid, v_vid, slice(f0, f0 + n_q)
+                        out_v, pv = self._steered_attention(
+                            io_v[0], kv_k, kv_v, v_cols, steer_vbias.get(layer), steer_v.lam if steer_v is not None else 0.0
+                        )
+                        vf0 = pv[..., :f0].sum(dim=-1)
+                        n_vk = int(kv_k.shape[1])
+                    else:
+                        out_v = flash_attention(q=io_v[0], k=k_vid, v=v_vid, num_heads=self.num_heads)
+                        n_vk = int(k_vid.shape[1])
+                        steer_v_warm = steer_v is not None and s == 0
+                        if want_vf0 or steer_v_warm:
+                            # Beside the forward pass, as for the action rows below.
+                            logits_v = self._head_logits(io_v[0], k_vid)
+                            pv = torch.softmax(logits_v, dim=-1)
+                            vf0 = pv[..., :f0].sum(dim=-1)
+                            if steer_v_warm:
+                                steer_vfut[layer] = pv[..., f0:]
+                                steer_vlogits[layer] = logits_v
+                    if want_vf0:
+                        vf0_layers.append(vf0.mean(dim=0))  # [queries], head mean
+                    if k_fut is not None:
                         k_all = torch.cat([kv0[layer]["k"], k_fut, io_a[1]], dim=1)
                         v_all = torch.cat([kv0[layer]["v"], v_fut, io_a[2]], dim=1)
+                        kept_cols = idx_rel + f0
+                    elif oracle is not None and mode == "pruned":
+                        # X2: the kept tokens' K/V of the dense pass at this step and layer.
+                        k_o, v_o = oracle[(s, layer)]
+                        k_all = torch.cat([kv0[layer]["k"], k_o[:, idx_rel], io_a[1]], dim=1)
+                        v_all = torch.cat([kv0[layer]["v"], v_o[:, idx_rel], io_a[2]], dim=1)
+                        kept_cols = slice(f0, f0 + n_q)
                     else:
                         k_all = torch.cat([k_vid, io_a[1]], dim=1)
                         v_all = torch.cat([v_vid, io_a[2]], dim=1)
-                    if steer is not None and mode == "pruned":
-                        n_kept = int(idx_rel.numel())
-                        out_a, share = self._steered_attention(
-                            io_a[0], k_all, v_all, slice(f0, f0 + n_kept), steer_bias[layer], steer.lam
-                        )
+                        kept_cols = slice(f0, f0 + n_q)
+                    if layer == 0:
+                        cost_steps.append([n_q, n_vk, int(io_a[0].shape[1]), int(k_all.shape[1])])
+                        cost_dim = int(io_v[0].shape[-1])
+                    biased = steer is not None and (mode == "pruned" or (dense_bias and s >= prune.warmup_steps))
+                    if biased:
+                        nf = k_all.shape[1] - f0 - io_a[1].shape[1]
+                        cols = slice(f0, f0 + nf) if dense_bias else kept_cols
+                        out_a, pa_ = self._steered_attention(io_a[0], k_all, v_all, cols, steer_bias[layer], steer.lam)
+                        share = pa_[..., f0:f0 + nf].sum(dim=-1)
                     else:
                         out_a = flash_attention(q=io_a[0], k=k_all, v=v_all, num_heads=self.num_heads)
                         share = None
@@ -515,6 +658,11 @@ class JointCaseStudyRunner:
             if want_share:
                 share_rows.append(torch.stack(share_layers) if share_layers
                                   else torch.full((self.num_layers,), float("nan"), device=model.device))
+            if want_vf0:
+                row = torch.full((num_future,), float("nan"), device=model.device)
+                if vf0_layers:
+                    row[idx_rel] = torch.stack(vf0_layers).mean(dim=0)
+                vf0_rows.append(row)
 
             # ---- heads and scheduler step
             vel_part = self.video.head(xv, pre_v["t"][:, idx_abs])
@@ -522,6 +670,13 @@ class JointCaseStudyRunner:
                 vel_tokens = torch.zeros((1, f0 + num_future, vel_part.shape[-1]), device=vel_part.device, dtype=vel_part.dtype)
             vel_tokens[:, idx_abs] = vel_part  # pruned tokens keep their last velocity
             pred_video = self.video.unpatchify(vel_tokens, pre_v["meta"]["grid_size"])
+            if want_motion_steps:
+                # This step's clean estimate x - sigma * v (sigma_s = -sum of the remaining deltas; the
+                # schedule ends at 0, so at the last step it is the final latent), frame 1 vs frame 0.
+                sigma = -d_video[s:].float().sum()
+                x0 = latents_video.float() - sigma * pred_video.float()
+                z = rearrange(x0[0], "c (f a) (h b) (w e) -> f (h w) (c a b e)", a=pt, b=ph, e=pw)
+                motion_rows.append((z[1] - z[0]).norm(dim=-1))
             pred_action = self.action.post_dit(xa, pre_a)
             latents_video = model.infer_video_scheduler.step(pred_video, d_video[s], latents_video)
             latents_action = model.infer_action_scheduler.step(pred_action, d_action[s], latents_action)
@@ -608,9 +763,15 @@ class JointCaseStudyRunner:
                         diag["extra_kept"] = int(m)
                 kept = torch.sort(kept).values
                 if steer is not None and s == prune.warmup_steps - 1:
-                    steer_bias, diag["steer"] = self._steer_bias(steer, steer_fut, steer_logits, kept, f0, num_future)
+                    steer_bias, diag["steer"] = self._steer_bias(
+                        steer, steer_fut, steer_logits, kept, f0, num_future, dense_bias=dense_bias
+                    )
                     steer_fut.clear()
                     steer_logits.clear()
+                if steer_v is not None and s == 0:
+                    steer_vbias, diag["steer_video"] = self._steer_video_bias(steer_v, steer_vfut, steer_vlogits, kept, f0)
+                    steer_vfut.clear()
+                    steer_vlogits.clear()
                 if s == prune.warmup_steps - 1:
                     av = sel.av_scores(act_probs_sel[self._layers["act"]], grid) if act_probs_sel else None
                     diag["score_step"] = int(score_step)
@@ -643,9 +804,19 @@ class JointCaseStudyRunner:
         if cfg.record_motion:
             # Final latents are the clean prediction (the schedule ends at sigma 0). Token order
             # follows the patch embedding: (frame, row, column) of patches.
-            pt, ph, pw = (int(x) for x in patch)
             z = rearrange(latents_video[0].float(), "c (f a) (h b) (w e) -> f (h w) (c a b e)", a=pt, b=ph, e=pw)
             diag["motion_f32"] = _f32_b64((z[1:] - z[:1]).norm(dim=-1).flatten())
+        if want_vf0:
+            diag["video_frame0_f32"] = _f32_b64(torch.stack(vf0_rows))  # [steps, Kf]
+        if want_motion_steps:
+            diag["motion_steps_f32"] = _f32_b64(torch.stack(motion_rows))  # [steps, tokens of frame 1]
+        diag["paths"] = {"action_eager": steer is not None, "video_eager": video_eager, "oracle_kv": oracle is not None,
+                         "action_full_kv": full_kv, "video_full_kv": video_full_kv, "dense_bias": dense_bias,
+                         "steer_video": steer_v is not None}
+        # Relative compute (token passes + attention): per step [video queries, video keys, action
+        # queries, action keys] at layer 0, the parameter counts and the context length.
+        diag["cost"] = {**self._cost_model(), "attn_dim": cost_dim, "ctx": int(context.shape[1]), "f0": int(f0),
+                        "steps": cost_steps, "oracle_pass": oracle is not None}
         if dump is not None:
             arrays = {"seed": np.int64(seed), "modes": np.asarray(modes), "grid": np.asarray(diag["grid"]),
                       "kept_index": kept.cpu().numpy(), "action_latents": torch.stack(d_latents).numpy()}
