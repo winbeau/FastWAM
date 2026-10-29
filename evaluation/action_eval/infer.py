@@ -35,6 +35,15 @@ Options (``policy.options``):
                          every call, with the per-call seed of its own ``seed_offset``; its actions
                          are logged, never executed.
 ``shadow_executed``      actions per chunk counted as executed in shadow metrics (default 10).
+``probe_arms``           optional list of {name, casestudy}: open-loop probes. At every call (or only the
+                         calls in ``probe_calls``) each probe arm runs on the same observation once per
+                         offset in ``probe_seed_offsets`` (default [0]; offset 0 is the executed arm's
+                         noise), sharing the episode's layer choice with the executed arm. Chunks and the
+                         arm's attention / motion diagnostics go to ``diagnostics.probes["<name>@<offset>"]``;
+                         probe actions are never executed.
+``seed_offset_per_repeat`` add the episode's repeat index to every seed offset (executed, shadow, probes),
+                         so repeats of one episode are independent noise draws; repeat 0 keeps the noise
+                         of a single-repeat run.
 ``episode_plans``        optional JSON {episode_id: {"calls": {"<k>": casestudy}, "from_call":
                          {"call": k, "casestudy": {...}}}}: per-call arm overrides used by the
                          attribution (patch at one call) and switch-point (arm from call k on)
@@ -238,6 +247,18 @@ class FastWAMJointPolicy:
         if options.get("shadow_casestudy") is not None:
             self.shadow = make_runner(self.model, parse_config(options["shadow_casestudy"]), prompt_store=self.prompt_store)
         self.shadow_executed = int(options.get("shadow_executed", 10))
+        self.probes: list[tuple[str, object]] = []
+        for item in options.get("probe_arms") or []:
+            name = str(item["name"])
+            if "@" in name or name in {n for n, _ in self.probes}:
+                raise ValueError(f"probe arm names must be unique and free of '@': {name!r}")
+            self.probes.append((name, make_runner(self.model, parse_config(item["casestudy"]), prompt_store=self.prompt_store)))
+        self.probe_seed_offsets = [int(x) for x in options.get("probe_seed_offsets") or [0]]
+        self.probe_calls = None if options.get("probe_calls") is None else {int(x) for x in options["probe_calls"]}
+        self.seed_offset_per_repeat = bool(options.get("seed_offset_per_repeat", False))
+        if (self.probes or self.seed_offset_per_repeat) and self.casestudy.seed_mode != "episode_call_hash":
+            raise ValueError("probe_arms and seed_offset_per_repeat need seed_mode=episode_call_hash")
+        self._repeat_offset = 0
         self.episode_plans = {}
         self.episode_plans_sha256 = None
         if options.get("episode_plans"):
@@ -281,6 +302,10 @@ class FastWAMJointPolicy:
             "prompt_embeddings_sha256": self.prompt_store_sha256,
             "episode_plans_sha256": self.episode_plans_sha256,
             "episode_plans_count": len(self.episode_plans),
+            "probes": [{"name": n, "casestudy": r.cfg.describe()} for n, r in self.probes] or None,
+            "probe_seed_offsets": self.probe_seed_offsets if self.probes else None,
+            "probe_calls": None if self.probe_calls is None else sorted(self.probe_calls),
+            "seed_offset_per_repeat": self.seed_offset_per_repeat,
         }
         notes = (
             "FastWAM-Joint through its native Hydra build and shared policy_io transforms; the benchmark "
@@ -304,7 +329,10 @@ class FastWAMJointPolicy:
             self.shadow.reset_episode()
         for runner in self._override_runners.values():
             runner.reset_episode()
+        for _name, runner in self.probes:
+            runner.reset_episode()
         self.predict_calls = 0
+        self._repeat_offset = int(episode.get("repeat") or 0) if self.seed_offset_per_repeat else 0
         # Seed key = (instruction, task, init, protocol seed); the repeat index is left out so
         # that replays of one episode (patch / switch-point experiments use repeats to index
         # variants) draw exactly the noise of the original rollout at every call index.
@@ -339,7 +367,7 @@ class FastWAMJointPolicy:
         runner, override = self._runner_for_call(call_index)
         if self.casestudy.seed_mode == "episode_call_hash":
             offset = runner.cfg.seed_offset if override is not None else self.casestudy.seed_offset
-            seed = self._call_seed(self._episode_key, call_index, offset)
+            seed = self._call_seed(self._episode_key, call_index, offset + self._repeat_offset)
         else:
             seed = self.native_seed
 
@@ -372,9 +400,11 @@ class FastWAMJointPolicy:
             # (a dense-reseed shadow measures the policy's sampling spread; a plain dense shadow
             # on a dense arm reproduces the executed action exactly).
             shadow_offset = getattr(self.shadow.cfg, "seed_offset", self.casestudy.seed_offset)
-            shadow_seed = (self._call_seed(self._episode_key, call_index, shadow_offset)
+            shadow_seed = (self._call_seed(self._episode_key, call_index, shadow_offset + self._repeat_offset)
                            if self.casestudy.seed_mode == "episode_call_hash" else seed)
             diag["shadow"] = self._shadow_metrics(prompt, image, proprio, shadow_seed, action, actions)
+        if self.probes and (self.probe_calls is None or call_index in self.probe_calls):
+            diag["probes"] = self._probe_metrics(prompt, image, proprio, call_index)
         return Prediction(
             actions=actions,
             timing={"predict_seconds": round(time.perf_counter() - started, 6), "model_seconds": round(model_seconds, 6)},
@@ -436,6 +466,27 @@ class FastWAMJointPolicy:
             "shadow_kept_index": shadow_diag.get("kept_index"),
             **{f"shadow_{key}": value for key, value in self._chunk_logs(shadow_action).items()},
         }
+
+    def _probe_metrics(self, prompt, image, proprio, call_index: int) -> dict:
+        """Every probe arm at every probe seed offset on this observation: chunks and diagnostics."""
+        layers = getattr(self.runner, "_layers", None)
+        out = {}
+        for offset in self.probe_seed_offsets:
+            seed = self._call_seed(self._episode_key, call_index, offset + self._repeat_offset)
+            for name, runner in self.probes:
+                if layers is not None and int(layers.get("act", -1)) >= 0:
+                    runner._layers = dict(layers)
+                action, d = runner.infer_action(
+                    prompt=prompt, input_image=image, proprio=proprio,
+                    action_horizon=self.action_horizon, num_video_frames=self.num_video_frames,
+                    seed=seed, sigma_shift=self.sigma_shift, rand_device=self.rand_device,
+                )
+                entry = {"seed": int(seed), **self._chunk_logs(action)}
+                for key in ("kept_index", "steer", "future_share_f32", "future_share_step", "motion_f32", "layer_act"):
+                    if d.get(key) is not None:
+                        entry[key] = d[key]
+                out[f"{name}@{offset}"] = entry
+        return out
 
     def _chunk_logs(self, action) -> dict:
         """Full chunk as float32 base64 [T, 7]: normalized model output, and de-normalized

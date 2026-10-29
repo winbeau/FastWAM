@@ -17,7 +17,9 @@ groups are run as two unmasked attention calls.
 Methods (see ``config.py``): token pruning of future video tokens after warm-up (pruned
 tokens leave the sequence and their latents keep moving with their last velocity),
 TeaCache step skipping of the whole joint stack, and attention-output noise on the
-action stream. ``frame0_cache=false`` (dense only) calls the model's native
+action stream. ``prune.steer`` runs the action rows of pruned steps in plain fp32 attention
+with a per-row bias on the kept future columns (see ``_steer_bias``); video rows keep SDPA.
+``frame0_cache=false`` (dense only) calls the model's native
 ``infer_action`` unchanged, as the reference for equivalence checks. ``cfg.dump`` writes
 one call's attention, action hidden states and decoded video to an ``.npz``.
 """
@@ -41,6 +43,10 @@ from . import selection as sel
 
 def _f16_b64(x: torch.Tensor) -> str:
     return base64.b64encode(x.detach().float().cpu().numpy().astype(np.float16).tobytes()).decode()
+
+
+def _f32_b64(x: torch.Tensor) -> str:
+    return base64.b64encode(x.detach().float().cpu().numpy().astype(np.float32).tobytes()).decode()
 
 
 class JointCaseStudyRunner:
@@ -100,6 +106,68 @@ class JointCaseStudyRunner:
         kh = rearrange(k, "b s (n d) -> b n s d", n=self.num_heads)
         logits = (qh.float() @ kh.float().transpose(-1, -2)) * (qh.shape[-1] ** -0.5)
         return torch.softmax(logits, dim=-1).mean(dim=1)[0]
+
+    def _head_logits(self, q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+        """Per-head q k^T / sqrt(d) for batch 1 -> [H, Sq, Sk] (fp32)."""
+        qh = rearrange(q, "b s (n d) -> b n s d", n=self.num_heads)[0].float()
+        kh = rearrange(k, "b s (n d) -> b n s d", n=self.num_heads)[0].float()
+        return (qh @ kh.transpose(-1, -2)) * (qh.shape[-1] ** -0.5)
+
+    @staticmethod
+    def _steered_probs(logits: torch.Tensor, kept_cols: slice, bias: torch.Tensor, lam: float) -> torch.Tensor:
+        """softmax over keys after adding ``lam * bias`` [H, Sq] to the kept future columns."""
+        if lam != 0.0:
+            logits = logits.clone()
+            logits[..., kept_cols] += lam * bias.unsqueeze(-1)
+        return torch.softmax(logits, dim=-1)
+
+    def _steered_attention(self, q, k, v, kept_cols: slice, bias: torch.Tensor, lam: float):
+        """Action rows of a pruned step, keys ``[frame-0 | kept future | action]``, in plain fp32
+        attention -> (output [1, Sq, H*d] in q's dtype, future share [H, Sq])."""
+        probs = self._steered_probs(self._head_logits(q, k), kept_cols, bias, lam)
+        vh = rearrange(v, "b s (n d) -> b n s d", n=self.num_heads)[0].float()
+        out = rearrange(probs @ vh, "n s d -> 1 s (n d)").to(dtype=q.dtype)
+        return out, probs[..., kept_cols].sum(dim=-1)
+
+    def _steer_bias(self, steer, fut_probs: dict, logits: dict, kept: torch.Tensor, f0: int, num_future: int):
+        """Per-layer bias b = log(mF / mFk) [H, A], clamped at ``steer.clamp``, from the action rows'
+        probabilities at the last warm-up (full) step: mF on all future tokens, mFk on the kept ones.
+
+        Also the formula check: that step's logits restricted to ``[frame-0 | kept | action]``, with
+        b added to the kept columns (lam = 1), must give the future share mF wherever b is not
+        clamped (adding log(mF/mFk) scales the kept weights so they sum to the dense future weight).
+        """
+        nk = int(kept.numel())
+        bias: dict[int, torch.Tensor] = {}
+        rows = {"b": [], "err": [], "clamped": [], "m_f": [], "m_fk": []}
+        for layer in sorted(fut_probs):
+            p = fut_probs[layer]
+            m_f = p.sum(dim=-1)
+            m_fk = p[..., kept].sum(dim=-1)
+            raw = torch.log(m_f.clamp_min(1e-30) / m_fk.clamp_min(1e-30))
+            b = raw.clamp(max=steer.clamp)
+            bias[layer] = b
+            lg = logits[layer]
+            cols = torch.cat([
+                torch.arange(f0, device=lg.device), kept + f0,
+                torch.arange(f0 + num_future, lg.shape[-1], device=lg.device),
+            ])
+            share = self._steered_probs(lg[..., cols], slice(f0, f0 + nk), b, 1.0)[..., f0:f0 + nk].sum(dim=-1)
+            for key, value in (("b", b), ("err", (share - m_f).abs()), ("clamped", raw > steer.clamp),
+                               ("m_f", m_f), ("m_fk", m_fk)):
+                rows[key].append(value)
+        t = {key: torch.stack(value) for key, value in rows.items()}  # [L, H, A]
+        free = ~t["clamped"]
+        return bias, {
+            "lam": float(steer.lam), "clamp": float(steer.clamp), "layers": len(bias),
+            "b_mean": float(t["b"].mean()), "b_max": float(t["b"].max()), "b_min": float(t["b"].min()),
+            "b_layer_mean": [round(float(x), 5) for x in t["b"].mean(dim=(1, 2))],
+            "clamped_fraction": float(t["clamped"].float().mean()),
+            "check_max_abs": float(t["err"][free].max()) if bool(free.any()) else None,
+            "check_max_abs_clamped": float(t["err"][t["clamped"]].max()) if bool(t["clamped"].any()) else None,
+            "dense_future_share": float(t["m_f"].mean()),
+            "kept_future_share": float(t["m_fk"].mean()),
+        }
 
     def _post(self, block, io: tuple, mixed: torch.Tensor, context_payload: dict) -> torch.Tensor:
         _q, _k, _v, residual_x, gate_msa, shift_mlp, scale_mlp, gate_mlp, _ckpt = io
@@ -291,6 +359,14 @@ class JointCaseStudyRunner:
                 raise ValueError(f"prune.score_frames {bad} outside the future frames 1..{grid.frames - 1}")
             allowed = torch.tensor(sorted(set(prune.score_frames)), device=model.device)
             frame_exclude = torch.nonzero(~torch.isin(grid.future_frame_index(model.device), allowed)).flatten()
+        steer = prune.steer if prune is not None else None
+        want_share = cfg.record_future_share
+        # Steer: per layer, the action rows' future probabilities [H, A, Kf] and logits at the last
+        # warm-up step (until the kept set is known), then the bias [H, A] for the pruned steps.
+        steer_fut: dict[int, torch.Tensor] = {}
+        steer_logits: dict[int, torch.Tensor] = {}
+        steer_bias: dict[int, torch.Tensor] = {}
+        share_rows: list[torch.Tensor] = []
         dump = cfg.dump
         d_future = d_obs = d_act = d_hidden = None
         d_latents: list[torch.Tensor] = []
@@ -328,6 +404,7 @@ class JointCaseStudyRunner:
             xa = pre_a["tokens"]
             xv_in, xa_in = xv, xa
 
+            share_layers: list[torch.Tensor] = []
             if mode == "skip":
                 xv = xv_in + tea_res_v
                 xa = xa_in + tea_res_a
@@ -366,7 +443,27 @@ class JointCaseStudyRunner:
                     else:
                         k_all = torch.cat([k_vid, io_a[1]], dim=1)
                         v_all = torch.cat([v_vid, io_a[2]], dim=1)
-                    out_a = flash_attention(q=io_a[0], k=k_all, v=v_all, num_heads=self.num_heads)
+                    if steer is not None and mode == "pruned":
+                        n_kept = int(idx_rel.numel())
+                        out_a, share = self._steered_attention(
+                            io_a[0], k_all, v_all, slice(f0, f0 + n_kept), steer_bias[layer], steer.lam
+                        )
+                    else:
+                        out_a = flash_attention(q=io_a[0], k=k_all, v=v_all, num_heads=self.num_heads)
+                        share = None
+                        steer_warm = steer is not None and s == prune.warmup_steps - 1
+                        if want_share or steer_warm:
+                            # Beside the forward pass: the SDPA output above is what the arm uses.
+                            logits = self._head_logits(io_a[0], k_all)
+                            nf = k_all.shape[1] - f0 - io_a[1].shape[1]
+                            fut = torch.softmax(logits, dim=-1)[..., f0:f0 + nf]
+                            share = fut.sum(dim=-1)
+                            if steer_warm:
+                                # Contiguous, so that with every token kept mFk is summed exactly like mF.
+                                steer_fut[layer] = fut.contiguous()
+                                steer_logits[layer] = logits
+                    if want_share:
+                        share_layers.append(share.mean())
                     if dump is not None and dump.attention:
                         pa = self._attention_probs(io_a[0], k_all)  # [A, f0 + future keys + A]
                         nf = k_all.shape[1] - f0 - io_a[1].shape[1]
@@ -415,6 +512,9 @@ class JointCaseStudyRunner:
                     act_probs_step0 = step_probs
                 if s == score_step:
                     act_probs_sel = step_probs
+            if want_share:
+                share_rows.append(torch.stack(share_layers) if share_layers
+                                  else torch.full((self.num_layers,), float("nan"), device=model.device))
 
             # ---- heads and scheduler step
             vel_part = self.video.head(xv, pre_v["t"][:, idx_abs])
@@ -507,6 +607,10 @@ class JointCaseStudyRunner:
                         kept = torch.cat([kept, extra])
                         diag["extra_kept"] = int(m)
                 kept = torch.sort(kept).values
+                if steer is not None and s == prune.warmup_steps - 1:
+                    steer_bias, diag["steer"] = self._steer_bias(steer, steer_fut, steer_logits, kept, f0, num_future)
+                    steer_fut.clear()
+                    steer_logits.clear()
                 if s == prune.warmup_steps - 1:
                     av = sel.av_scores(act_probs_sel[self._layers["act"]], grid) if act_probs_sel else None
                     diag["score_step"] = int(score_step)
@@ -532,6 +636,16 @@ class JointCaseStudyRunner:
             diag["action_full_kv"] = True
         if frame_exclude is not None:
             diag["score_frames"] = list(prune.score_frames)
+        if want_share:
+            shares = torch.stack(share_rows)  # [steps, layers]
+            diag["future_share_f32"] = _f32_b64(shares)
+            diag["future_share_step"] = [round(float(x), 6) for x in shares.mean(dim=1)]
+        if cfg.record_motion:
+            # Final latents are the clean prediction (the schedule ends at sigma 0). Token order
+            # follows the patch embedding: (frame, row, column) of patches.
+            pt, ph, pw = (int(x) for x in patch)
+            z = rearrange(latents_video[0].float(), "c (f a) (h b) (w e) -> f (h w) (c a b e)", a=pt, b=ph, e=pw)
+            diag["motion_f32"] = _f32_b64((z[1:] - z[:1]).norm(dim=-1).flatten())
         if dump is not None:
             arrays = {"seed": np.int64(seed), "modes": np.asarray(modes), "grid": np.asarray(diag["grid"]),
                       "kept_index": kept.cpu().numpy(), "action_latents": torch.stack(d_latents).numpy()}

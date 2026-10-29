@@ -22,6 +22,12 @@ Methods
               output (perturbation control, no speedup).
 Fewer denoising steps is ``dense`` with a smaller ``num_inference_steps``.
 
+``prune.steer`` re-budgets the action rows' attention on pruned steps: the kept future
+columns get ``lam * b`` added to their logits, ``b = log(mF / mFk)`` measured at the last
+warm-up step (mF: the row's probability on all future tokens, mFk: on the kept ones), so
+``lam = 1`` gives back the dense future share. With ``steer`` set the action rows of pruned
+steps run in plain fp32 attention, also at ``lam = 0``.
+
 ``dump`` (any method) writes one call's internals to an ``.npz``: the action query's
 attention over the video tokens and the action hidden states after every layer and step,
 and the decoded predicted video. Capture does not change the numerics; it is meant for a
@@ -32,6 +38,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
@@ -45,6 +52,15 @@ SEED_MODES = ("episode_call_hash", "native_fixed")
 class GateConfig:
     #: Precision phase (dense) when C = (H_third - H_wrist) + (H_early - H_late) > tau.
     tau: float
+
+
+@dataclass(frozen=True)
+class SteerConfig:
+    #: Multiplier of the bias on the kept future columns (0 = plain sparse attention,
+    #: 1 = dense future share, < 0 = less future share than sparse).
+    lam: float = 0.0
+    #: Upper clamp of b = log(mF / mFk), per layer, head and action row.
+    clamp: float = 3.0
 
 
 @dataclass(frozen=True)
@@ -81,6 +97,8 @@ class PruneConfig:
     #: rollout). When given, ``selection`` is not consulted and no score is computed, so a
     #: dense-derived keep-set can be replayed inside a sparse rollout at that call.
     kept_index: Optional[tuple[int, ...]] = None
+    #: Attention re-budget of the action rows on pruned steps (see the module docstring).
+    steer: Optional[SteerConfig] = None
 
 
 @dataclass(frozen=True)
@@ -128,6 +146,12 @@ class CaseStudyConfig:
     #: Also log the V→V mass on future tokens at the captured layer (dense score dumps
     #: and the ``vv`` selection). Requires the selection step to be step 0.
     record_vv: bool = False
+    #: Log, per denoising step and layer, the action rows' attention share on future video
+    #: tokens (head- and row-mean). Computed beside the forward pass on full steps.
+    record_future_share: bool = False
+    #: Log, per future token, the distance of the final (clean) latent to the frame-0
+    #: latent at the same position: how much the predicted future moves.
+    record_motion: bool = False
     #: Write this call's internals to an ``.npz`` (see the module docstring).
     dump: Optional[DumpConfig] = None
 
@@ -166,6 +190,11 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
         block = dict(raw.get("prune") or {})
         _known_keys(block, {f for f in PruneConfig.__dataclass_fields__}, "casestudy.prune")
         gate = None
+        steer = None
+        if block.get("steer") is not None:
+            sblock = dict(block["steer"])
+            _known_keys(sblock, {f for f in SteerConfig.__dataclass_fields__}, "casestudy.prune.steer")
+            steer = SteerConfig(lam=float(sblock.get("lam", 0.0)), clamp=float(sblock.get("clamp", 3.0)))
         if block.get("gate") is not None:
             gblock = dict(block["gate"])
             _known_keys(gblock, {"tau"}, "casestudy.prune.gate")
@@ -186,6 +215,7 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             action_full_kv=bool(block.get("action_full_kv", False)),
             score_frames=None if block.get("score_frames") is None else tuple(int(x) for x in block["score_frames"]),
             kept_index=None if block.get("kept_index") is None else tuple(int(x) for x in block["kept_index"]),
+            steer=steer,
         )
         _require(prune.selection in SELECTIONS, f"prune.selection must be one of {SELECTIONS}")
         _require(0.0 < prune.keep_ratio <= 1.0, "prune.keep_ratio must be in (0, 1]")
@@ -210,6 +240,11 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             _require(len(set(prune.kept_index)) == len(prune.kept_index), "prune.kept_index has duplicates")
             _require(all(x >= 0 for x in prune.kept_index), "prune.kept_index must be non-negative")
             _require(0 < len(prune.kept_index), "prune.kept_index must not be empty")
+        if prune.steer is not None:
+            _require(math.isfinite(prune.steer.lam), "prune.steer.lam must be finite")
+            _require(prune.steer.clamp > 0, "prune.steer.clamp must be > 0")
+            _require(not prune.reselect_every_step, "prune.steer needs a kept set fixed after warm-up")
+            _require(not prune.action_full_kv, "prune.steer and prune.action_full_kv are exclusive")
     else:
         _require(raw.get("prune") is None, "prune block given but method != prune")
 
@@ -258,6 +293,8 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
         record_attention=bool(raw.get("record_attention", True)),
         score_layer=None if raw.get("score_layer") is None else int(raw["score_layer"]),
         record_vv=bool(raw.get("record_vv", False)),
+        record_future_share=bool(raw.get("record_future_share", False)),
+        record_motion=bool(raw.get("record_motion", False)),
         dump=dump,
     )
     _require(cfg.score_layer is None or cfg.score_layer >= 0, "casestudy.score_layer must be >= 0")
@@ -282,6 +319,7 @@ __all__ = [
     "GateConfig",
     "NoiseConfig",
     "PruneConfig",
+    "SteerConfig",
     "TeaCacheConfig",
     "call_seed",
     "parse_config",
