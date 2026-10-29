@@ -160,3 +160,51 @@ def test_context_probe_config():
         parse_config({"method": "prune", "prune": {**plain, "video_full_kv": True, "reselect_every_step": True}})
     with pytest.raises(ValueError):  # every context probe needs the shared action-row path
         parse_config({"method": "prune", "prune": {"selection": "av", "keep_ratio": 0.2, "video_eager": True}})
+
+
+def test_summary_groups_and_means():
+    from fastwam.casestudy import selection as sel
+
+    grid = sel.Grid(frames=3, height=7, width=14)  # 2 future frames x (7 x 7 per camera, 2 cameras)
+    for n, total in ((1, 4), (2, 16), (3, 36)):
+        gid = JointCaseStudyRunner._summary_groups(grid, n, 2, "cpu")
+        assert gid.shape == (grid.num_future,) and int(gid.unique().numel()) == total
+    gid = JointCaseStudyRunner._summary_groups(grid, 1, 2, "cpu")
+    third, _ = grid.future_view_masks("cpu")
+    frame = grid.future_frame_index("cpu")
+    assert torch.equal(gid, (frame - 1) * 2 + (~third).long())  # 1 x 1: one region per (frame, camera)
+    g = torch.Generator().manual_seed(6)
+    k, v = torch.randn(1, grid.num_future, 8, generator=g), torch.randn(1, grid.num_future, 8, generator=g)
+    # token t: frame t // 98, column (t % 98) % 14, camera = column // 7
+    dropped = torch.tensor([0, 1, 9, 100, 150])  # (f1, cam 0), (f1, cam 0), (f1, cam 1), (f2, cam 0), (f2, cam 1)
+    k_s, v_s, counts, member = JointCaseStudyRunner._summary_build(k, v, dropped, gid)
+    assert counts.tolist() == [2.0, 1.0, 1.0, 1.0]
+    assert torch.allclose(k_s[0, 0], k[0, [0, 1]].mean(0)) and torch.allclose(v_s[0, 3], v[0, 150])
+    assert member.sum().item() == 5 and member[0, [0, 1]].tolist() == [1.0, 1.0]
+
+
+def test_summary_lse_bias_is_exact():
+    runner = _runner()
+    g = torch.Generator().manual_seed(7)
+    q = torch.randn(1, 5, HEADS * DIM, generator=g)
+    k = torch.randn(1, 12, HEADS * DIM, generator=g)
+    gid = torch.tensor([0, 0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3])
+    dropped = torch.tensor([0, 1, 3, 4, 5, 6, 7])  # regions 0, 1, 2 (3 not dropped)
+    k_s, _v, counts, member = JointCaseStudyRunner._summary_build(k, k, dropped, gid)
+    bias = runner._summary_lse_bias(q, k, k_s, member)  # [H, 5, 3]
+    full = runner._head_logits(q, k)
+    for r, members in enumerate(([0, 1], [3, 4], [5, 6, 7])):
+        want = torch.logsumexp(full[..., members], dim=-1)
+        got = runner._head_logits(q, k_s)[..., r] + bias[..., r]
+        assert torch.allclose(got, want, atol=1e-5)
+
+
+def test_summary_config():
+    plain = {"selection": "av", "keep_ratio": 0.2, "warmup_steps": 1}
+    for n, bias in ((1, "count"), (3, "lse")):
+        cfg = parse_config({"method": "prune", "prune": {**plain, "summary_grid": n, "summary_bias": bias}})
+        assert cfg.prune.summary_grid == n and cfg.prune.summary_bias == bias
+    for bad in ({"summary_grid": 2, "action_full_kv": True}, {"summary_grid": 2, "summary_bias": "max"},
+                {"summary_grid": 2, "steer": {"lam": 0.0}}, {"summary_grid": 2, "full_steps": [6]}, {"summary_grid": -1}):
+        with pytest.raises(ValueError):
+            parse_config({"method": "prune", "prune": {**plain, **bad}})

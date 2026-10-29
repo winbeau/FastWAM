@@ -121,6 +121,15 @@ class PruneConfig:
     video_full_kv: bool = False
     #: Action rows of pruned steps read the kept tokens' K/V from a dense pass (diagnostic).
     oracle_kv: bool = False
+    #: E (summary tokens): on pruned steps the dropped tokens are replaced, as keys of the video
+    #: and action rows, by one token per spatial region of dropped tokens: K and V = the mean of
+    #: the region's step-0 K / V, with ``log(count)`` added to its logit (``summary_bias:
+    #: count``) or, per query and head, the region's true step-0 log-sum-exp minus the mean
+    #: key's logit (``lse``). Regions: every (future frame, camera view) block split
+    #: ``summary_grid`` x ``summary_grid``; 0 = off. ``summary_views`` cameras side by side.
+    summary_grid: int = 0
+    summary_views: int = 2
+    summary_bias: str = "count"
     #: Never prune; the action rows add ``steer.lam * b`` to every future column after warm-up.
     dense_bias: bool = False
 
@@ -252,6 +261,9 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             video_full_kv=bool(block.get("video_full_kv", False)),
             oracle_kv=bool(block.get("oracle_kv", False)),
             dense_bias=bool(block.get("dense_bias", False)),
+            summary_grid=int(block.get("summary_grid", 0)),
+            summary_views=int(block.get("summary_views", 2)),
+            summary_bias=str(block.get("summary_bias", "count")),
         )
         _require(prune.selection in SELECTIONS, f"prune.selection must be one of {SELECTIONS}")
         _require(0.0 < prune.keep_ratio <= 1.0, "prune.keep_ratio must be in (0, 1]")
@@ -291,6 +303,14 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
         cache = prune.action_full_kv or prune.video_full_kv
         _require(not (cache and prune.reselect_every_step), "cached dropped K/V needs a kept set fixed after warm-up")
         _require(not (prune.oracle_kv and cache), "prune.oracle_kv and the cached dropped K/V are exclusive")
+        _require(prune.summary_grid >= 0 and prune.summary_views >= 1, "prune.summary_grid >= 0, summary_views >= 1")
+        _require(prune.summary_bias in ("count", "lse"), "prune.summary_bias must be count or lse")
+        if prune.summary_grid:
+            _require(not (cache or prune.oracle_kv or prune.dense_bias or prune.video_eager or prune.steer is not None
+                          or prune.steer_video is not None or prune.full_steps or prune.reselect_every_step
+                          or prune.gate is not None),
+                     "prune.summary_grid is S0 plus the summary keys (no other option)")
+            _require(prune.warmup_steps == 1, "prune.summary_grid needs warmup_steps == 1 (step-0 K/V)")
         if prune.dense_bias:
             _require(not (prune.video_eager or prune.steer_video is not None or cache or prune.oracle_kv
                           or prune.full_steps or prune.gate is not None),

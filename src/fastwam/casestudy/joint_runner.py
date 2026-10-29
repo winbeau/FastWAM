@@ -223,6 +223,40 @@ class JointCaseStudyRunner:
             "kept_future_share": float(t["m_fk"].mean()),
         }
 
+    @staticmethod
+    def _summary_groups(grid, n: int, views: int, device) -> torch.Tensor:
+        """Region id of every future token [Kf]: each (future frame, camera view) block of the
+        latent grid split ``n`` x ``n`` (rows and columns as ``np.array_split``)."""
+        h, w = int(grid.height), int(grid.width)
+        wv = w // views
+        rows = np.concatenate([np.full(len(c), i) for i, c in enumerate(np.array_split(np.arange(h), n))])
+        cols = np.concatenate([np.full(len(c), i) for i, c in enumerate(np.array_split(np.arange(wv), n))])
+        f, r, c = np.meshgrid(np.arange(int(grid.frames) - 1), np.arange(h), np.arange(w), indexing="ij")
+        gid = ((f * views + c // wv) * n + rows[r]) * n + cols[c % wv]
+        return torch.as_tensor(gid.reshape(-1), dtype=torch.long, device=device)
+
+    @staticmethod
+    def _summary_build(k_full: torch.Tensor, v_full: torch.Tensor, dropped: torch.Tensor, gid: torch.Tensor):
+        """Summary tokens of the dropped tokens: one per non-empty region, K / V = the region's mean
+        -> (k [1, G, D], v [1, G, D], counts [G], membership [G, Kf] as 0 / 1)."""
+        groups, inverse = torch.unique(gid[dropped], return_inverse=True)
+        member = torch.zeros((groups.numel(), gid.numel()), dtype=torch.float32, device=gid.device)
+        member[inverse, dropped] = 1.0
+        counts = member.sum(dim=1)
+        avg = member / counts.unsqueeze(1)
+        k = (avg @ k_full[0].float()).unsqueeze(0).to(k_full.dtype)
+        v = (avg @ v_full[0].float()).unsqueeze(0).to(v_full.dtype)
+        return k, v, counts, member
+
+    def _summary_lse_bias(self, q: torch.Tensor, k_full: torch.Tensor, k_sum: torch.Tensor, member: torch.Tensor) -> torch.Tensor:
+        """Per head and query [H, Sq, G]: the region's true log-sum-exp of q k / sqrt(d) over its
+        members minus the summary key's logit, so that the summary carries the region's exact
+        attention weight for that query (at the step these tensors come from)."""
+        full = self._head_logits(q, k_full)  # [H, Sq, Kf]
+        mask = torch.where(member > 0, 0.0, float("-inf"))  # [G, Kf]
+        lse = torch.logsumexp(full.unsqueeze(-2) + mask, dim=-1)  # [H, Sq, G]
+        return lse - self._head_logits(q, k_sum)
+
     def _cost_model(self) -> dict:
         """Parameter counts for the relative-compute estimate (per block; context K/V projections
         apart, since they run on the context tokens, not on the queries)."""
@@ -440,6 +474,16 @@ class JointCaseStudyRunner:
         kv_future_full: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         kv_drop: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         dropped: Optional[torch.Tensor] = None
+        # E: summary tokens of the dropped tokens (step-0 K/V averaged per region) and the additive
+        # logit masks of the video / action rows (log count, or the per-query log-sum-exp gap).
+        summary = prune is not None and prune.summary_grid > 0
+        summary_lse = summary and prune.summary_bias == "lse"
+        kv_sum: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        sum_mask_v: dict[int, torch.Tensor] = {}
+        sum_mask_a: dict[int, torch.Tensor] = {}
+        q0_v: dict[int, torch.Tensor] = {}
+        q0_a: dict[int, torch.Tensor] = {}
+        n_sum = 0
         # P6: future tokens outside the listed latent frames cannot be kept.
         frame_exclude = None
         if prune is not None and prune.score_frames is not None:
@@ -538,12 +582,14 @@ class JointCaseStudyRunner:
                     v_vid = torch.cat([kv0[layer]["v"], io_v[2]], dim=1)
                     if _capture_kv is not None and s > 0:
                         _capture_kv[(s, layer)] = (io_v[1], io_v[2])
-                    if cache_kv and mode == "full":
+                    if summary_lse and s == 0:
+                        q0_v[layer], q0_a[layer] = io_v[0], io_a[0]
+                    if (cache_kv or summary) and mode == "full":
                         if dropped is None or video_eager:
                             kv_future_full[layer] = (io_v[1], io_v[2])
                         else:  # a full step after warm-up refreshes the dropped tokens' block
                             kv_drop[layer] = (io_v[1][:, dropped], io_v[2][:, dropped])
-                    k_fut = v_fut = k_drop = v_drop = None
+                    k_fut = v_fut = k_drop = v_drop = amask = None
                     if cache_kv and mode == "pruned":
                         if video_eager:
                             if layer in kv_future_full:
@@ -569,17 +615,25 @@ class JointCaseStudyRunner:
                         vf0 = pv[..., :f0].sum(dim=-1)
                         n_vk = int(kv_k.shape[1])
                     else:
+                        vmask = None
                         if video_full_kv and k_drop is not None:
                             kv_k = torch.cat([kv0[layer]["k"], k_drop, io_v[1]], dim=1)
                             kv_v = torch.cat([kv0[layer]["v"], v_drop, io_v[2]], dim=1)
+                        elif summary and mode == "pruned" and n_sum:
+                            k_s, v_s = kv_sum[layer]
+                            kv_k = torch.cat([kv0[layer]["k"], k_s, io_v[1]], dim=1)
+                            kv_v = torch.cat([kv0[layer]["v"], v_s, io_v[2]], dim=1)
+                            vmask = sum_mask_v[layer]
                         else:
                             kv_k, kv_v = k_vid, v_vid
-                        out_v = flash_attention(q=io_v[0], k=kv_k, v=kv_v, num_heads=self.num_heads)
+                        out_v = flash_attention(q=io_v[0], k=kv_k, v=kv_v, num_heads=self.num_heads, ctx_mask=vmask)
                         n_vk = int(kv_k.shape[1])
                         steer_v_warm = steer_v is not None and s == 0
                         if want_vf0 or steer_v_warm:
                             # Beside the forward pass, as for the action rows below.
                             logits_v = self._head_logits(io_v[0], kv_k)
+                            if vmask is not None:
+                                logits_v = logits_v + vmask[0].float()
                             pv = torch.softmax(logits_v, dim=-1)
                             vf0 = pv[..., :f0].sum(dim=-1)
                             if steer_v_warm:
@@ -596,6 +650,12 @@ class JointCaseStudyRunner:
                         v_all = torch.cat([kv0[layer]["v"], v_drop, io_v[2], io_a[2]], dim=1)
                         n_d = int(k_drop.shape[1])
                         kept_cols = slice(f0 + n_d, f0 + n_d + n_q)
+                    elif summary and mode == "pruned" and n_sum:
+                        k_s, v_s = kv_sum[layer]
+                        k_all = torch.cat([kv0[layer]["k"], k_s, io_v[1], io_a[1]], dim=1)
+                        v_all = torch.cat([kv0[layer]["v"], v_s, io_v[2], io_a[2]], dim=1)
+                        kept_cols = slice(f0 + n_sum, f0 + n_sum + n_q)
+                        amask = sum_mask_a[layer]
                     elif oracle is not None and mode == "pruned":
                         # X2: the kept tokens' K/V of the dense pass at this step and layer.
                         k_o, v_o = oracle[(s, layer)]
@@ -616,12 +676,14 @@ class JointCaseStudyRunner:
                         out_a, pa_ = self._steered_attention(io_a[0], k_all, v_all, cols, steer_bias[layer], steer.lam)
                         share = pa_[..., f0:f0 + nf].sum(dim=-1)
                     else:
-                        out_a = flash_attention(q=io_a[0], k=k_all, v=v_all, num_heads=self.num_heads)
+                        out_a = flash_attention(q=io_a[0], k=k_all, v=v_all, num_heads=self.num_heads, ctx_mask=amask)
                         share = None
                         steer_warm = steer is not None and s == prune.warmup_steps - 1
                         if want_share or steer_warm:
                             # Beside the forward pass: the SDPA output above is what the arm uses.
                             logits = self._head_logits(io_a[0], k_all)
+                            if amask is not None:
+                                logits = logits + amask[0].float()
                             nf = k_all.shape[1] - f0 - io_a[1].shape[1]
                             fut = torch.softmax(logits, dim=-1)[..., f0:f0 + nf]
                             share = fut.sum(dim=-1)
@@ -794,6 +856,42 @@ class JointCaseStudyRunner:
                     kv_future_full.clear()
                     diag["cache_kv_bytes"] = int(sum(k.numel() * k.element_size() + v.numel() * v.element_size()
                                                      for k, v in kv_drop.values()))
+                if summary and s == prune.warmup_steps - 1:
+                    keep_mask = torch.ones(num_future, dtype=torch.bool, device=kept.device)
+                    keep_mask[kept] = False
+                    dropped = torch.nonzero(keep_mask).flatten()
+                    nk, n_act = int(kept.numel()), int(pre_a["tokens"].shape[1])
+                    info: dict[str, Any] = {"grid": int(prune.summary_grid), "bias": prune.summary_bias,
+                                            "dropped": int(dropped.numel()), "groups": 0}
+                    if dropped.numel():
+                        gid = self._summary_groups(grid, prune.summary_grid, prune.summary_views, kept.device)
+                        lse_means = []
+                        for layer, (k_f, v_f) in kv_future_full.items():
+                            k_s, v_s, counts, member = self._summary_build(k_f, v_f, dropped, gid)
+                            kv_sum[layer] = (k_s, v_s)
+                            n_sum = int(k_s.shape[1])
+                            heads = self.num_heads if summary_lse else 1
+                            mv = torch.zeros((1, heads, nk if summary_lse else 1, f0 + n_sum + nk), device=kept.device)
+                            ma = torch.zeros((1, heads, n_act if summary_lse else 1, f0 + n_sum + nk + n_act), device=kept.device)
+                            if summary_lse:
+                                bv = self._summary_lse_bias(q0_v[layer][:, kept], k_f, k_s, member)
+                                ba = self._summary_lse_bias(q0_a[layer], k_f, k_s, member)
+                                mv[0, :, :, f0:f0 + n_sum], ma[0, :, :, f0:f0 + n_sum] = bv, ba
+                                lse_means.append(float(torch.cat([bv.flatten(), ba.flatten()]).mean()))
+                            else:
+                                mv[..., f0:f0 + n_sum] = torch.log(counts)
+                                ma[..., f0:f0 + n_sum] = torch.log(counts)
+                            sum_mask_v[layer] = mv.to(model.torch_dtype)
+                            sum_mask_a[layer] = ma.to(model.torch_dtype)
+                        info.update({"groups": n_sum, "counts": [int(c) for c in counts.tolist()],
+                                     "keys_video": f0 + n_sum + nk, "keys_action": f0 + n_sum + nk + n_act,
+                                     "kv_bytes": int(sum(2 * k.numel() * k.element_size() for k, _ in kv_sum.values()))})
+                        if lse_means:
+                            info["lse_bias_mean"] = float(np.mean(lse_means))
+                    diag["summary"] = info
+                    kv_future_full.clear()
+                    q0_v.clear()
+                    q0_a.clear()
                 if steer is not None and s == prune.warmup_steps - 1:
                     steer_bias, diag["steer"] = self._steer_bias(
                         steer, steer_fut, steer_logits, kept, f0, num_future, dense_bias=dense_bias
