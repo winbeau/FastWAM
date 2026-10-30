@@ -70,7 +70,8 @@ def test_plans(method):
         assert p.fixed.numel() == 39 and sinks <= set(p.fixed.tolist())
         return
     assert p.core.numel() == 20 and not (set(p.core.tolist()) & sinks)
-    assert set(torch.topk(torch.where(torch.tensor([j in sinks for j in range(196)]), -1.0, av), 10).indices.tolist()) <= set(p.core.tolist())
+    if method != "interlace_wfar":  # the far-frame core skips near-frame A->V leaders
+        assert set(torch.topk(torch.where(torch.tensor([j in sinks for j in range(196)]), -1.0, av), 10).indices.tolist()) <= set(p.core.tolist())
     assert p.periphery.numel() == 173
     if method == "rep":
         assert len(p.bias_real) <= 16 and p.fixed.numel() == 23 + len(p.bias_real)
@@ -106,3 +107,58 @@ def test_config():
     with pytest.raises(ValueError):
         parse_config({"method": "prune", "record_future_attn": True, "prune": {"keep_ratio": 0.2, "fovea": "rep"}})
     assert parse_config({"method": "prune", "record_future_attn": True, "prune": {"keep_ratio": 0.2, "fovea": "sink"}})
+
+
+def test_g2_n_of_N_with_log_N_over_n_equals_N_identical_members():
+    g = torch.Generator().manual_seed(7)
+    d = HEADS * 16
+    q = torch.randn(1, 5, d, generator=g, dtype=torch.float64)
+    base_k, base_v = torch.randn(1, 7, d, generator=g, dtype=torch.float64), torch.randn(1, 7, d, generator=g, dtype=torch.float64)
+    mk, mv = torch.randn(1, 1, d, generator=g, dtype=torch.float64), torch.randn(1, 1, d, generator=g, dtype=torch.float64)
+    for big, n in ((173, 16), (114, 13), (19, 2), (5, 5)):
+        full = flash_attention(q, torch.cat([base_k, mk.repeat(1, big, 1)], 1), torch.cat([base_v, mv.repeat(1, big, 1)], 1), HEADS)
+        mask = torch.zeros(1, 1, 1, 7 + n, dtype=torch.float64)
+        mask[..., 7:] = math.log(big / n)
+        part = flash_attention(q, torch.cat([base_k, mk.repeat(1, n, 1)], 1), torch.cat([base_v, mv.repeat(1, n, 1)], 1), HEADS,
+                               ctx_mask=mask)
+        assert torch.allclose(full, part, atol=1e-10, rtol=0)
+
+
+def test_weighted_and_far_plans():
+    av, diff, recv, x0 = _scores(5)
+    base = fv.make_plan("interlace", 39, GRID, av, diff, recv)
+    w = fv.make_plan("interlace_w", 39, GRID, av, diff, recv)
+    assert torch.equal(w.fixed, base.fixed) and all(torch.equal(a, b) for a, b in zip(w.slices, base.slices))
+    assert w.periphery.numel() == 173 and len(w.slice_bias) == 9
+    assert all(abs(b - math.log(173 / x.numel())) < 1e-12 for b, x in zip(w.slice_bias, w.slices))
+    for s in range(1, 10):
+        bias = w.bias_at(s)
+        assert set(bias) == set(w.slices[(s - 1) % 9].tolist()) and not (set(bias) & set(w.fixed.tolist()))
+    assert base.bias_at(3) == {} and not base.slice_bias
+    z = fv.make_plan("interlace_w", 39, GRID, av, diff, recv, wzero=True)
+    assert not z.slice_bias and z.bias_at(2) == {} and torch.equal(z.fixed, base.fixed)
+    far = fv.make_plan("interlace_wfar", 39, GRID, av, diff, recv)
+    assert far.core.numel() == 20 and bool((far.core >= GRID.per_frame).all())
+    near = [j for j in range(GRID.per_frame) if j not in set(far.sinks.tolist())]
+    assert set(near) <= set(far.periphery.tolist()) and len(far.slice_bias) == 9
+    nofar = fv.make_plan("interlace_wfar", 39, GRID, av, diff, recv, nofar=True)
+    assert torch.equal(nofar.fixed, w.fixed) and nofar.slice_bias == w.slice_bias
+    assert all(torch.equal(a, b) for a, b in zip(nofar.slices, w.slices))
+    half = fv.make_plan("interlace_wfar", 98, GRID, av, diff, recv)  # keep 50 %: 79 core tokens fit in the far frame
+    assert half.core.numel() == 79 and bool((half.core >= GRID.per_frame).all()) and half.periphery.numel() == 114
+    for m in ("interlace_w", "interlace_wfar"):
+        full = fv.make_plan(m, 196, GRID, av, diff, recv)
+        assert torch.equal(full.fixed, torch.arange(196)) and not full.slices and not full.slice_bias
+
+
+def test_fovea_w_config():
+    ok = parse_config({"method": "prune", "record_future_share": True,
+                       "prune": {"keep_ratio": 0.2, "fovea": "interlace_wfar", "fovea_nofar": True}})
+    assert ok.prune.fovea_nofar and ok.record_future_share
+    assert parse_config({"method": "prune", "prune": {"keep_ratio": 0.2, "fovea": "interlace_w", "fovea_wzero": True}}).prune.fovea_wzero
+    for bad in ({"fovea": "interlace", "fovea_wzero": True}, {"fovea": "interlace_w", "fovea_nofar": True}):
+        with pytest.raises(ValueError):
+            parse_config({"method": "prune", "prune": {"keep_ratio": 0.2, **bad}})
+    assert parse_config({"method": "dense", "video_freeze": True}).video_freeze
+    with pytest.raises(ValueError):
+        parse_config({"method": "prune", "video_freeze": True, "prune": {"keep_ratio": 0.2}})

@@ -9,6 +9,10 @@ Methods: ``sink`` (S0's top-k with the sinks forced in), ``rep`` (one real repre
 ``fov_grid`` / ``fov_cluster`` (one synthetic region token: mean member embedding, fractional RoPE position, logit + log n,
 its velocity given to every member; regions by the grid or by step-0 k-means on the clean estimate), ``interlace`` (the
 periphery in 9 slices, slice s computed on pruned step s). A periphery that fits its R slots is computed token by token.
+fovea-w round: ``interlace_w`` adds log(N / n_k) to the key logits of step k's slice (N = all periphery tokens, truncated
+ones included; n_k = the slice's size), every row; ``interlace_wfar`` also takes the core from the far future frame only
+(latent frame 2, both cameras; the near frame's tokens go to the periphery), filling from the near frame by A->V only
+when the far frame cannot fill it (keep above ~50 %).
 Pure functions; the runner applies the plan.
 """
 
@@ -22,7 +26,8 @@ import torch
 from . import selection as sel
 
 N_SINKS, N_AV, N_DIFF, R_SLOTS, N_SLICES = 3, 10, 10, 16, 9
-METHODS = ("sink", "rep", "fov_grid", "fov_cluster", "interlace")
+METHODS = ("sink", "rep", "fov_grid", "fov_cluster", "interlace", "interlace_w", "interlace_wfar")
+INTERLACE = ("interlace", "interlace_w", "interlace_wfar")
 
 
 def grid_regions(grid: sel.Grid) -> torch.Tensor:
@@ -93,23 +98,34 @@ class Plan:
     bias_real: dict = field(default_factory=dict)  # future index -> log n (rep)
     regions: list = field(default_factory=list)  # fov: (members [m], log n) per synthetic token
     region_pos: torch.Tensor | None = None  # fov: [G, 3] (frame, mean h, mean w)
+    slice_bias: list = field(default_factory=list)  # interlace_w: log(N / n_k) per slice
 
     def to(self, dev) -> "Plan":
         mv = lambda t: None if t is None else t.to(dev)  # noqa: E731
         return Plan(self.method, mv(self.sinks), mv(self.core), mv(self.periphery), mv(self.fixed),
                     [x.to(dev) for x in self.slices], mv(self.truncated), dict(self.bias_real),
-                    [(g.to(dev), lg) for g, lg in self.regions], self.region_pos)
+                    [(g.to(dev), lg) for g, lg in self.regions], self.region_pos, list(self.slice_bias))
 
     def real(self, s: int) -> torch.Tensor:
         if self.slices:
             return torch.sort(torch.cat([self.fixed, self.slices[(s - 1) % len(self.slices)].to(self.fixed.device)])).values
         return self.fixed
 
+    def bias_at(self, s: int) -> dict:
+        """Future index -> key logit bias on pruned step s: the representatives' log n (rep) or this step's slice
+        log(N / n_k) (interlace_w)."""
+        if self.slice_bias:
+            k = (s - 1) % len(self.slices)
+            return {int(j): self.slice_bias[k] for j in self.slices[k].tolist()}
+        return self.bias_real
+
 
 def make_plan(method: str, k: int, grid: sel.Grid, av: torch.Tensor, diff: torch.Tensor, recv: torch.Tensor,
-              x0_future: torch.Tensor | None = None, gen: torch.Generator | None = None, off: bool = False) -> Plan:
+              x0_future: torch.Tensor | None = None, gen: torch.Generator | None = None, off: bool = False,
+              wzero: bool = False, nofar: bool = False) -> Plan:
     """The plan of ``method`` for budget k from the step-0 scores (A->V, Diff, received attention) [Kf]; ``off`` gives S0
-    (A->V top-k, nothing else)."""
+    (A->V top-k, nothing else). Self-checks: ``wzero`` drops interlace_w's slice bias (= interlace), ``nofar`` lifts
+    interlace_wfar's far-frame core (= interlace_w)."""
     dev = av.device
     kf = grid.num_future
     empty = torch.zeros(0, dtype=torch.long, device=dev)
@@ -128,7 +144,8 @@ def make_plan(method: str, k: int, grid: sel.Grid, av: torch.Tensor, diff: torch
         kept = torch.sort(kept).values
         return Plan(method, sinks, kept, empty, kept)
     c = max(0, k - N_SINKS - R_SLOTS)
-    excl = sinks
+    far = method == "interlace_wfar" and not nofar
+    excl = torch.cat([sinks, torch.arange(grid.per_frame, device=dev)]) if far else sinks  # far: near-frame tokens out
     core_set: list[int] = []
     for score, n in ((av, N_AV), (diff, N_DIFF)):
         for j in sel.topk_indices(score, min(n, c), exclude=excl).tolist():
@@ -139,6 +156,12 @@ def make_plan(method: str, k: int, grid: sel.Grid, av: torch.Tensor, diff: torch
             break
         if j not in core_set:
             core_set.append(j)
+    if far and len(core_set) < c:  # the far frame cannot fill the core (keep above ~50 %): the near frame by A->V
+        for j in sel.topk_indices(av, kf, exclude=sinks).tolist():
+            if len(core_set) >= c:
+                break
+            if j not in core_set:
+                core_set.append(j)
     core = torch.sort(torch.tensor(core_set[:c], dtype=torch.long, device=dev)).values
     mask = torch.ones(kf, dtype=torch.bool, device=dev)
     mask[sinks] = False
@@ -147,9 +170,10 @@ def make_plan(method: str, k: int, grid: sel.Grid, av: torch.Tensor, diff: torch
     fixed = torch.sort(torch.cat([sinks, core])).values
     if periphery.numel() <= R_SLOTS:  # the periphery fits its slots: computed token by token
         return Plan(method, sinks, core, periphery, torch.sort(torch.cat([fixed, periphery])).values)
-    if method == "interlace":
+    if method in INTERLACE:
         slices, cut = interlace_slices(periphery, av)
-        return Plan(method, sinks, core, periphery, fixed, slices=slices, truncated=cut)
+        bias = [] if method == "interlace" or wzero else [math.log(int(periphery.numel()) / int(x.numel())) for x in slices]
+        return Plan(method, sinks, core, periphery, fixed, slices=slices, truncated=cut, slice_bias=bias)
     if method in ("rep", "fov_grid"):
         rid = grid_regions(grid).to(dev)[periphery]
         groups = [periphery[rid == g] for g in torch.unique(rid).tolist()]
@@ -175,4 +199,4 @@ def make_plan(method: str, k: int, grid: sel.Grid, av: torch.Tensor, diff: torch
                 region_pos=pos)
 
 
-__all__ = ["METHODS", "Plan", "grid_regions", "interlace_slices", "kmeans", "make_plan", "rope_freqs_at"]
+__all__ = ["INTERLACE", "METHODS", "Plan", "grid_regions", "interlace_slices", "kmeans", "make_plan", "rope_freqs_at"]

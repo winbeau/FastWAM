@@ -627,6 +627,7 @@ class JointCaseStudyRunner:
         dump = cfg.dump
         d_future = d_obs = d_act = d_hidden = d_cur = None
         d_latents: list[torch.Tensor] = []
+        pre_v_freeze: Optional[dict] = None
 
         for s in range(steps):
             ts_v = t_video[s].unsqueeze(0).to(dtype=latents_video.dtype, device=model.device)
@@ -635,6 +636,13 @@ class JointCaseStudyRunner:
                 x=latents_video, timestep=ts_v, context=context, context_mask=context_mask,
                 action=None, fuse_vae_embedding_in_latents=fuse,
             )
+            if cfg.video_freeze:
+                # fovea-w G4: every step recomputes the video stream from step 0's latents and sigma, so the action
+                # rows read freshly computed future K/V equal to step 0's (V2-k0 reads them from a cache).
+                if s == 0:
+                    pre_v_freeze = dict(pre_v)
+                else:
+                    pre_v = pre_v_freeze
             pre_a = self.action.pre_dit(action_tokens=latents_action, timestep=ts_a, context=context, context_mask=context_mask)
 
             # ---- mode for this step
@@ -702,7 +710,7 @@ class JointCaseStudyRunner:
                     # Key logit bias log(n_g) of representatives (rep) and region tokens (fov), for every row; no mask at
                     # all without a bias, so that the kernel is S0's.
                     bias = torch.zeros(n_q, device=model.device)
-                    for j, lg in fplan.bias_real.items():
+                    for j, lg in fplan.bias_at(s).items():  # rep: log n; interlace_w: this step's slice log(N / n_k)
                         bias[torch.nonzero(idx_rel == j).flatten()] = lg
                     for g, (_, lg) in enumerate(fplan.regions):
                         bias[int(idx_rel.numel()) + g] = lg
@@ -1129,7 +1137,8 @@ class JointCaseStudyRunner:
                     recv = recv_acc / self.num_layers
                     gen = torch.Generator(device="cpu").manual_seed((int(seed) + 3) & 0x7FFFFFFF)
                     fplan = fv.make_plan(fovea_m, k, grid, av_all.float().cpu(), diff_score.float().cpu(), recv.float().cpu(),
-                                         None if x0_fut is None else x0_fut.cpu(), gen, off=prune.fovea_off).to(kept.device)
+                                         None if x0_fut is None else x0_fut.cpu(), gen, off=prune.fovea_off,
+                                         wzero=prune.fovea_wzero, nofar=prune.fovea_nofar).to(kept.device)
                     kept = fplan.fixed
                     fv_members = [g + f0 for g, _ in fplan.regions]
                     if fv_members:
@@ -1143,6 +1152,7 @@ class JointCaseStudyRunner:
                         "regions": [int(g.numel()) for g, _ in fplan.regions], "reps": len(fplan.bias_real),
                         "slices": [int(x.numel()) for x in fplan.slices],
                         "truncated": 0 if fplan.truncated is None else int(fplan.truncated.numel()),
+                        "core_index": fplan.core.tolist(), "slice_bias": [round(x, 6) for x in fplan.slice_bias],
                     }
                 if cache_kv and not video_eager and s == prune.warmup_steps - 1:
                     keep_mask = torch.ones(num_future, dtype=torch.bool, device=kept.device)
