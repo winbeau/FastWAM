@@ -122,6 +122,12 @@ def topk_indices(score: torch.Tensor, k: int, exclude: torch.Tensor | None = Non
     return torch.topk(s, k).indices
 
 
+def diff_scores(x0_future: torch.Tensor, z0: torch.Tensor, grid: Grid) -> torch.Tensor:
+    """[Kf] Diff score (as on main): L2 distance of each future token's clean estimate (x - sigma v at the warm-up step) to
+    the current-frame latent at the same (h, w), over the token's full latent patch. ``x0_future`` [Kf, D], ``z0`` [per_frame, D]."""
+    return (x0_future.float() - z0.float()[grid.future_obs_index(z0.device)]).norm(dim=-1)
+
+
 def complementary_topk(s_act: torch.Tensor, s_inst: torch.Tensor, k: int) -> torch.Tensor:
     """CF-Prune's disjoint union: half the budget by action relevance, the rest by
     instruction relevance among the tokens not already kept."""

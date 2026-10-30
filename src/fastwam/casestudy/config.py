@@ -67,6 +67,11 @@ class PruneConfig:
     #: fovea-w V2-k0: future tokens only on stage-1 step 0 (keep_ratio 0, latents extrapolated afterwards) and the
     #: action stage reads those step-0 future K/V instead of the clean stage-2 re-encode.
     reuse_step0_kv: bool = False
+    #: fovea-w (revision 2): ``interlace`` / ``interlace_w`` (``fovea.py``, as on main) in stage 1; the action stage reads a
+    #: clean re-encode of every token stage 1 computed and sees frame 0 + sinks + core + one slice per action step.
+    #: ``fovea_off`` keeps the code path with S0's A->V top-k only (self-check).
+    fovea: Optional[str] = None
+    fovea_off: bool = False
 
 
 @dataclass(frozen=True)
@@ -154,7 +159,14 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             extra_selection=str(block.get("extra_selection", "av")),
             full_steps=tuple(int(x) for x in block.get("full_steps", ())),
             reuse_step0_kv=bool(block.get("reuse_step0_kv", False)),
+            fovea=None if block.get("fovea") is None else str(block["fovea"]),
+            fovea_off=bool(block.get("fovea_off", False)),
         )
+        if prune.fovea is not None or prune.fovea_off:
+            _require(prune.fovea in ("interlace", "interlace_w"), "prune.fovea on IDM is interlace or interlace_w")
+            _require(prune.selection == "av" and prune.warmup_steps == 1 and prune.keep_ratio > 0.0 and not (
+                prune.reuse_step0_kv or prune.extra_keep_ratio or prune.full_steps or prune.gate is not None
+                or prune.reselect_every_step), "prune.fovea is S0 (selection av, warm-up 1, keep > 0) plus the fovea plan only")
         _require(prune.selection in SELECTIONS, f"prune.selection must be one of {SELECTIONS}")
         _require(0.0 < prune.keep_ratio <= 1.0 or (prune.reuse_step0_kv and prune.keep_ratio == 0.0),
                  "prune.keep_ratio must be in (0, 1] (0 only with reuse_step0_kv)")

@@ -472,7 +472,7 @@ class FastWAMJointPolicy:
                 )
                 entry = {"seed": int(seed), **self._chunk_logs(action)}
                 for key in ("kept_index", "kept_count", "layer_act", "modes", "av_scores_f16", "gate_score", "future_token_steps",
-                            "future_token_steps_dense", "reuse_step0_kv", "path"):
+                            "future_token_steps_dense", "reuse_step0_kv", "path", "fovea"):
                     if d.get(key) is not None:
                         entry[key] = d[key]
                 out[f"{name}"] = entry

@@ -36,6 +36,7 @@ from einops import rearrange
 from fastwam.models.wan22.wan_video_dit import flash_attention, modulate
 
 from .config import CaseStudyConfig
+from . import fovea as fv
 from . import selection as sel
 
 
@@ -90,21 +91,25 @@ class IDMCaseStudyRunner:
             shift_mlp=io[5], scale_mlp=io[6], gate_mlp=io[7], context=context, context_mask=context_mask,
         )
 
-    def _video_layers(self, x, freqs, t_mod, ctx, ctx_mask, kv0, keep_kv: bool):
-        """Video stack over the given (future) tokens with frame-0 K/V prepended."""
+    def _video_layers(self, x, freqs, t_mod, ctx, ctx_mask, kv0, keep_kv: bool, mask=None, recv=None):
+        """Video stack over the given (future) tokens with frame-0 K/V prepended. ``mask``: additive key bias (fovea-w);
+        ``recv``: [Kf] accumulator of the attention every future key receives from these rows (head mean, summed)."""
         kv = []
+        f0 = kv0[0][0].shape[1]
         for layer in range(self.num_layers):
             block = self.video.blocks[layer]
             io = self.mot._build_expert_attention_io(expert=self.video, block=block, x=x, freqs=freqs, t_mod=t_mod)
             k = torch.cat([kv0[layer][0], io[1]], dim=1)
             v = torch.cat([kv0[layer][1], io[2]], dim=1)
-            out = flash_attention(q=io[0], k=k, v=v, num_heads=self.num_heads)
+            out = flash_attention(q=io[0], k=k, v=v, num_heads=self.num_heads, ctx_mask=mask)
+            if recv is not None:
+                recv += self._probs(io[0], k)[:, f0:].sum(dim=0)
             if keep_kv:
                 kv.append((k, v))
             x = self._post(block, io, out, ctx, ctx_mask)
         return x, kv
 
-    def _action_layers(self, latents_action, ts_a, context, context_mask, cache, capture: set[int], noise_gen=None):
+    def _action_layers(self, latents_action, ts_a, context, context_mask, cache, capture: set[int], noise_gen=None, mask=None):
         tokens, _t, t_mod, a_ctx, a_ctx_mask, freqs = self.action.prepare(
             action_tokens=latents_action, timestep=ts_a, context=context, context_mask=context_mask
         )
@@ -115,7 +120,7 @@ class IDMCaseStudyRunner:
             io = self.mot._build_expert_attention_io(expert=self.action, block=block, x=x, freqs=freqs, t_mod=t_mod)
             k = torch.cat([cache[layer][0], io[1]], dim=1)
             v = torch.cat([cache[layer][1], io[2]], dim=1)
-            out = flash_attention(q=io[0], k=k, v=v, num_heads=self.num_heads)
+            out = flash_attention(q=io[0], k=k, v=v, num_heads=self.num_heads, ctx_mask=mask)
             if layer in capture:
                 probs[layer] = self._probs(io[0], k)
             if noise_gen is not None:
@@ -211,6 +216,15 @@ class IDMCaseStudyRunner:
         probe_probs: dict[int, torch.Tensor] = {}
         v2k0 = prune is not None and prune.reuse_step0_kv
         kv_step0 = None
+        # fovea-w revision 2 (M4 / M4w on IDM): the plan of stage 1, the step-0 attention every future token receives
+        # (video rows and the probe's action rows, all layers), the step-0 Diff score, interlace bookkeeping.
+        fovea_m = prune.fovea if prune is not None else None
+        fplan = None
+        recv_acc = torch.zeros(num_future, device=model.device) if fovea_m is not None else None
+        diff_score = None
+        fv_count = torch.zeros(num_future, dtype=torch.long, device=model.device) if fovea_m is not None else None
+        fv_rows: list[int] = []
+        pt, ph, pw = (int(x) for x in patch)
         for s in range(steps):
             ts_v = t_video[s].unsqueeze(0).to(dtype=latents_video.dtype, device=model.device)
             xt, tt, tmodt, ctxt, ctxmt, freqst, f, h, w, _tpf = self.video.prepare(
@@ -231,8 +245,19 @@ class IDMCaseStudyRunner:
                         if tea_acc < tea.thresh and tea_cons < tea.max_consecutive_skips and tea_res is not None:
                             mode = "skip"
                 tea_prev = signal
-            idx_rel = kept if mode == "pruned" else all_future
+            idx_rel = (fplan.real(s) if fplan is not None else kept) if mode == "pruned" else all_future
             idx_abs = idx_rel + f0
+            vmask = None
+            if fplan is not None and mode == "pruned":
+                bias = torch.zeros(int(idx_rel.numel()), device=model.device)
+                for j, lg in fplan.bias_at(s).items():  # interlace_w: this step's slice log(N / n_s)
+                    bias[torch.nonzero(idx_rel == j).flatten()] = lg
+                if bool((bias != 0).any()):
+                    vmask = torch.zeros((1, 1, 1, f0 + int(idx_rel.numel())), device=model.device)
+                    vmask[..., f0:] = bias
+                    vmask = vmask.to(latents_video.dtype)
+                fv_rows.append(int(idx_rel.numel()))
+                fv_count[idx_rel] += 1
             if idx_rel.numel():  # V2-k0: no future token after step 0, the latents keep step 0's velocity
                 xv_in = xt[:, idx_abs]
                 if mode == "skip":
@@ -241,20 +266,31 @@ class IDMCaseStudyRunner:
                 else:
                     need_kv = s == 0 and (probe or v2k0)
                     xv, kv_step = self._video_layers(xv_in, freqst[idx_abs], tmodt[:, idx_abs], ctxt, ctxmt[:, idx_abs], kv0,
-                                                     keep_kv=need_kv)
+                                                     keep_kv=need_kv, mask=vmask,
+                                                     recv=recv_acc if (s == 0 and recv_acc is not None) else None)
                     if tea is not None:
                         tea_res, tea_acc, tea_cons = xv - xv_in, 0.0, 0
                     if need_kv and probe:
                         # Probe: one action pass at the first action timestep against step-0 video K/V.
                         ts_a0 = t_action[0].unsqueeze(0).to(dtype=latents_action.dtype, device=model.device)
-                        _pred, probe_probs = self._action_layers(latents_action, ts_a0, context, context_mask, kv_step,
-                                                                 act_layers)
+                        cap = set(range(self.num_layers)) if fovea_m is not None else act_layers
+                        _pred, probe_probs = self._action_layers(latents_action, ts_a0, context, context_mask, kv_step, cap)
+                        if recv_acc is not None:
+                            for p in probe_probs.values():
+                                recv_acc += p[:, f0:f0 + num_future].sum(dim=0)
                     if need_kv and v2k0:
                         kv_step0 = kv_step
                 part = self.video.head(xv, tt[:, idx_abs])
                 if vel is None:
                     vel = torch.zeros((1, f0 + num_future, part.shape[-1]), device=part.device, dtype=part.dtype)
                 vel[:, idx_abs] = part
+            if s == 0 and fovea_m is not None:
+                # Diff (as on main): step 0's clean estimate x - sigma_0 v of every future token against the current frame.
+                sigma_v = t_video[0].float() / float(model.infer_video_scheduler.num_train_timesteps)
+                x0 = latents_video.float() - sigma_v * self.video.unpatchify(vel, (f, h, w)).float()
+                z = rearrange(x0[0], "c (f a) (h b) (w e) -> f (h w) (c a b e)", a=pt, b=ph, e=pw)
+                z_cur = rearrange(latents_video[0, :, 0:pt].float(), "c (f a) (h b) (w e) -> f (h w) (c a b e)", a=pt, b=ph, e=pw)[0]
+                diff_score = sel.diff_scores(z[1:].reshape(-1, z.shape[-1]), z_cur, grid)
             latents_video = model.infer_video_scheduler.step(self.video.unpatchify(vel, (f, h, w)), d_video[s], latents_video)
             latents_video[:, :, 0:1] = first.clone()
             modes.append(mode)
@@ -303,6 +339,18 @@ class IDMCaseStudyRunner:
                             extra = dropped[torch.topk(sel.av_scores(probe_probs[self._layers["act"]], grid)[dropped], m).indices]
                         kept = torch.cat([kept, extra])
                 kept = torch.sort(kept).values
+                if fovea_m is not None:
+                    # M4 / M4w on IDM (revision 2): the plan from step 0's A->V (probe), Diff and received attention.
+                    recv = recv_acc / self.num_layers
+                    fplan = fv.make_plan(fovea_m, k, grid, sel.av_scores(probe_probs[self._layers["act"]], grid).float().cpu(),
+                                         diff_score.float().cpu(), recv.float().cpu(), off=prune.fovea_off).to(kept.device)
+                    kept = fplan.fixed
+                    diag["fovea"] = {
+                        "method": fovea_m, "off": bool(prune.fovea_off), "k": int(k), "sinks": fplan.sinks.tolist(),
+                        "sink_share_step0": float(recv[fplan.sinks].sum() / recv.sum()), "core_index": fplan.core.tolist(),
+                        "periphery": int(fplan.periphery.numel()), "slices": [int(x.numel()) for x in fplan.slices],
+                        "truncated": 0 if fplan.truncated is None else int(fplan.truncated.numel()),
+                        "slice_bias": [round(x, 6) for x in fplan.slice_bias]}
                 diag["kept_count"] = int(kept.numel())
                 diag["kept_index"] = kept.tolist()
                 if probe_probs:
@@ -317,7 +365,11 @@ class IDMCaseStudyRunner:
             cache = kv_step0
             diag["reuse_step0_kv"] = True
         else:
-            idx2 = keep2 + f0
+            idx2_rel = keep2
+            if fplan is not None and fplan.slices:  # M4 / M4w: every token stage 1 computed after step 0
+                idx2_rel = torch.sort(torch.cat([fplan.fixed] + [x.to(fplan.fixed.device) for x in fplan.slices])).values
+            keep2 = idx2_rel
+            idx2 = idx2_rel + f0
             xc, _tc, tmodc, ctxc, ctxmc, freqsc, *_ = self.video.prepare(
                 x=latents_video, timestep=zero_t, context=context, context_mask=context_mask, action=None,
                 fuse_vae_embedding_in_latents=fuse)
@@ -327,14 +379,38 @@ class IDMCaseStudyRunner:
             noise_gen = torch.Generator(device=model.device).manual_seed((int(seed) ^ 0x5EED) & 0x7FFFFFFF)
         for s in range(steps):
             ts_a = t_action[s].unsqueeze(0).to(dtype=latents_action.dtype, device=model.device)
-            pred, _ = self._action_layers(latents_action, ts_a, context, context_mask, cache, set(), noise_gen)
+            cache_s, amask = cache, None
+            if fplan is not None and fplan.slices:
+                # M4 / M4w: action step s sees frame 0 + sinks + core + slice (s - 1) mod 9 of the clean re-encode.
+                vis = fplan.real(s)
+                cols = torch.cat([torch.arange(f0, device=vis.device), f0 + torch.searchsorted(idx2_rel, vis)])
+                cache_s = [(kk[:, cols], vv[:, cols]) for kk, vv in cache]
+                bias_s = fplan.bias_at(s)
+                if bias_s:
+                    n_act = int(latents_action.shape[1])
+                    amask = torch.zeros((1, 1, 1, f0 + int(vis.numel()) + n_act), device=model.device)
+                    for j, lg in bias_s.items():
+                        amask[..., f0 + torch.nonzero(vis == j).flatten()] = lg
+                    amask = amask.to(latents_action.dtype)
+            pred, _ = self._action_layers(latents_action, ts_a, context, context_mask, cache_s, set(), noise_gen, mask=amask)
             latents_action = model.infer_action_scheduler.step(pred, d_action[s], latents_action)
 
         diag["modes"] = modes
         diag["computed_steps"] = sum(1 for m in modes if m != "skip")
         if prune is not None:
             pruned = sum(1 for m in modes if m == "pruned")
-            diag["future_token_steps"] = (steps - pruned) * num_future + pruned * int(kept.numel()) + int(keep2.numel())
+            rows = sum(fv_rows) if fplan is not None else pruned * int(kept.numel())
+            diag["future_token_steps"] = (steps - pruned) * num_future + rows + int(keep2.numel())
+        if fplan is not None:
+            diag["fovea"]["rows_per_step"] = fv_rows
+            diag["fovea"]["stage2_reencoded"] = int(keep2.numel())
+            if fplan.slices:
+                cut = set(fplan.truncated.tolist())
+                cnt = fv_count[fplan.periphery].tolist()
+                once = all((c == 0) if int(j) in cut else (c == 1) for j, c in zip(fplan.periphery.tolist(), cnt))
+                diag["fovea"]["interlace_once"] = once
+                if not once and len(fv_rows) == len(fplan.slices):
+                    raise RuntimeError("fovea interlace: a periphery token was not computed exactly once")
             diag["future_token_steps_dense"] = steps * num_future + num_future
         if tea is not None:
             diag["teacache_rel_l1"] = [round(r, 6) for r in tea_rel]
