@@ -476,7 +476,7 @@ class JointCaseStudyRunner:
         prune = cfg.prune
         is_cf = prune is not None and prune.selection == "cf"
         first_call = self._layers is None
-        want_scores = prune is not None and prune.selection in ("av", "vv", "cf")
+        want_scores = prune is not None and prune.selection in ("av", "vv", "cf", "diff", "diff_global")
         # V→V mass: dumped on dense score runs (record_vv) and needed by selection=vv.
         want_vv = cfg.record_vv or (prune is not None and prune.selection == "vv")
         capture_first_step = cfg.record_attention or want_scores
@@ -582,6 +582,10 @@ class JointCaseStudyRunner:
         want_pilot = cfg.record_pilot or cfg.agc is not None
         # S0-noF: action rows of pruned steps without future keys; EX: a second, no-future action stream on
         # pruned steps and the extrapolated velocity v_s + w * (v_s - v_noF).
+        want_fattn = cfg.record_future_attn
+        fattn_rows: list[torch.Tensor] = []
+        # diff selections: the warm-up step's clean-estimate distance of every future token to the current frame
+        diff_score: Optional[torch.Tensor] = None
         no_future = prune is not None and prune.action_no_future
         ex_w = prune.extrapolate_w if prune is not None else None
         cost_extra: list[list[int]] = []
@@ -607,7 +611,7 @@ class JointCaseStudyRunner:
         cost_recon: list[int] = []
         cost_dim = 0
         dump = cfg.dump
-        d_future = d_obs = d_act = d_hidden = None
+        d_future = d_obs = d_act = d_hidden = d_cur = None
         d_latents: list[torch.Tensor] = []
 
         for s in range(steps):
@@ -646,6 +650,7 @@ class JointCaseStudyRunner:
             ex_step = ex_w is not None and mode == "pruned"
             xa_nf = pre_a["tokens"] if ex_step else None
 
+            fattn_acc = torch.zeros(f0 + num_future, device=model.device) if want_fattn and mode != "skip" else None
             share_layers: list[torch.Tensor] = []
             vf0_layers: list[torch.Tensor] = []
             if mode == "skip":
@@ -854,6 +859,15 @@ class JointCaseStudyRunner:
                         d_future[s, layer][:, fut_idx] = pa[:, f0:f0 + nf].half().cpu()
                         d_obs[s, layer] = pa[:, :f0].sum(dim=-1).half().cpu()
                         d_act[s, layer] = pa[:, f0 + nf:].sum(dim=-1).half().cpu()
+                        if d_cur is None:
+                            d_cur = torch.zeros((steps, self.num_layers, pa.shape[0], f0), dtype=torch.float16)
+                        d_cur[s, layer] = pa[:, :f0].half().cpu()  # per frame-0 key
+                    if fattn_acc is not None:
+                        # Beside the forward pass: head- and query-mean attention on [frame-0 | kept future] keys
+                        # (the plain key layout, checked in the config), summed over layers.
+                        pa_m = self._attention_probs(io_a[0], k_all).mean(dim=0)
+                        fattn_acc[:f0] += pa_m[:f0]
+                        fattn_acc[f0 + idx_rel] += pa_m[f0:f0 + n_q]
                     if layer in capture_layers:
                         if idx_rel.numel() != num_future:
                             # P2 reselection on a pruned step: score every future token, with
@@ -908,6 +922,12 @@ class JointCaseStudyRunner:
                 if vf0_layers:
                     row[idx_rel] = torch.stack(vf0_layers).mean(dim=0)
                 vf0_rows.append(row)
+            if want_fattn:
+                row = torch.full((f0 + num_future,), float("nan"), device=model.device)
+                if fattn_acc is not None:
+                    present = torch.cat([torch.arange(f0, device=model.device), f0 + idx_rel])
+                    row[present] = fattn_acc[present] / self.num_layers
+                fattn_rows.append(row)
 
             # ---- heads and scheduler step
             if idx_abs.numel():  # keep 0: no future token is recomputed after warm-up
@@ -923,6 +943,16 @@ class JointCaseStudyRunner:
                 x0 = latents_video.float() - sigma * pred_video.float()
                 z = rearrange(x0[0], "c (f a) (h b) (w e) -> f (h w) (c a b e)", a=pt, b=ph, e=pw)
                 motion_rows.append((z[1] - z[0]).norm(dim=-1))
+            if s == 0 and prune is not None and prune.selection in ("diff", "diff_global"):
+                # diff: x0 = x - sigma_v v of the warm-up (full) step, every future token against the pinned current
+                # frame's latent at the same (h, w), over the token's full latent patch.
+                sigma_v = t_video[0].float() / float(model.infer_video_scheduler.num_train_timesteps)
+                x0 = latents_video.float() - sigma_v * pred_video.float()
+                z = rearrange(x0[0], "c (f a) (h b) (w e) -> f (h w) (c a b e)", a=pt, b=ph, e=pw)
+                z_cur = rearrange(latents_video[0, :, 0:pt].float(), "c (f a) (h b) (w e) -> f (h w) (c a b e)", a=pt, b=ph, e=pw)[0]
+                diff_score = sel.diff_scores(z[1:].reshape(-1, z.shape[-1]), z_cur, grid)
+                diag["diff_scores_f16"] = _f16_b64(diff_score)
+                diag["diff_sigma_v"] = float(sigma_v)
             pred_action = self.action.post_dit(xa, pre_a)
             if ex_step:
                 # EX: v = v_s + w * (v_s - v_noF) in fp32, back to the model dtype (w = 0 gives v_s bit for bit).
@@ -994,6 +1024,10 @@ class JointCaseStudyRunner:
                                 if p_vid is not None else all_future[:k])
                     elif prune.selection == "av":
                         kept = sel.topk_indices(sel.av_scores(p_act, grid), k, exclude=frame_exclude)
+                    elif prune.selection in ("diff", "diff_global"):
+                        score = sel.av_scores(p_act, grid) if prune.diff_debug_av else diff_score
+                        kept = (sel.topk_indices(score, k) if prune.selection == "diff_global"
+                                else sel.per_view_topk(score, k, grid))
                     else:
                         s_act = sel.cf_action_scores(p_act, grid)
                         s_inst = sel.cf_instruction_scores(inst_mass[self._layers["inst"]], grid)
@@ -1141,6 +1175,9 @@ class JointCaseStudyRunner:
             diag["video_frame0_f32"] = _f32_b64(torch.stack(vf0_rows))  # [steps, Kf]
         if want_motion_steps:
             diag["motion_steps_f32"] = _f32_b64(torch.stack(motion_rows))  # [steps, tokens of frame 1]
+        if want_fattn:
+            diag["future_attn_f32"] = _f32_b64(torch.stack(fattn_rows))  # [steps, frame-0 + future keys]
+            diag["future_attn_shape"] = [len(fattn_rows), int(f0 + num_future)]
         diag["paths"] = {"action_eager": steer is not None, "video_eager": video_eager, "oracle_kv": oracle is not None,
                          "action_full_kv": full_kv, "video_full_kv": video_full_kv, "dense_bias": dense_bias,
                          "steer_video": steer_v is not None, "recon": recon, "action_no_future": no_future,
@@ -1165,7 +1202,7 @@ class JointCaseStudyRunner:
             if self._layers is not None:
                 arrays["layer_act"] = np.int64(self._layers["act"])
             if d_future is not None:
-                arrays.update(attn_future=d_future.numpy(), attn_obs=d_obs.numpy(), attn_act=d_act.numpy())
+                arrays.update(attn_future=d_future.numpy(), attn_obs=d_obs.numpy(), attn_act=d_act.numpy(), attn_cur=d_cur.numpy())
             if d_hidden is not None:
                 arrays["hidden"] = d_hidden.numpy()
             if dump.video:

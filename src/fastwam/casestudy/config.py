@@ -62,6 +62,11 @@ below the component's threshold), or ``const`` gives ``g = clip(gain, lo, hi)``.
 translation and rotation are multiplied by their gains and clipped to the environment range; the
 gripper is never touched and a component with ``g = 1`` is left as it is (see ``agc.py``; applied by
 the adapter). ``record_pilot`` logs the pilot without any gain (calibration of ``c``).
+``prune.selection: diff`` scores each future token by the distance of the warm-up step's clean video estimate
+``x - sigma_v * v`` to the current-frame latent at the same (h, w) and keeps the top ceil(k/2) of the third-person
+camera and floor(k/2) of the wrist camera (``diff_global``: the top k overall); pruned steps are S0's.
+``record_future_attn`` logs per step the action rows' attention on every video key, averaged over layers, heads
+and queries.
 ``prune.action_no_future`` (S0-noF) gives the action rows of pruned steps the keys [frame-0 | action] only;
 ``prune.extrapolate_w`` (EX) runs the action expert a second time on pruned steps with those keys (its own
 token stream; the video side is shared) and steps with ``v_s + w * (v_s - v_noF)``.
@@ -81,7 +86,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
 METHODS = ("dense", "prune", "teacache", "noise")
-SELECTIONS = ("av", "vv", "cf", "random")
+SELECTIONS = ("av", "vv", "cf", "random", "diff", "diff_global")
 LAYER_RULES = ("min_entropy", "fixed")
 SEED_MODES = ("episode_call_hash", "native_fixed")
 
@@ -165,6 +170,9 @@ class PruneConfig:
     #: EX: on pruned steps the action expert also runs without future keys (its own token stream,
     #: keys [frame-0 | action]) and the action velocity becomes v_s + w * (v_s - v_noF).
     extrapolate_w: Optional[float] = None
+    #: Self-check of the diff selections: score with A->V instead of the clean-estimate distance, through the
+    #: same code path (diff_global with it must equal av bit for bit).
+    diff_debug_av: bool = False
 
 
 @dataclass(frozen=True)
@@ -258,6 +266,9 @@ class CaseStudyConfig:
     record_pilot: bool = False
     #: Pilot + automatic gain on the output chunk (see the module docstring).
     agc: Optional[AGCConfig] = None
+    #: Log per step the action rows' attention on every video key (frame 0 and future), averaged over layers, heads
+    #: and action queries (NaN for keys not in the step's sequence); computed beside the forward pass.
+    record_future_attn: bool = False
 
     def describe(self) -> dict[str, Any]:
         return asdict(self)
@@ -332,8 +343,14 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             recon=None if block.get("recon") is None else str(block["recon"]),
             action_no_future=bool(block.get("action_no_future", False)),
             extrapolate_w=None if block.get("extrapolate_w") is None else float(block["extrapolate_w"]),
+            diff_debug_av=bool(block.get("diff_debug_av", False)),
         )
         _require(prune.selection in SELECTIONS, f"prune.selection must be one of {SELECTIONS}")
+        if prune.selection in ("diff", "diff_global"):
+            _require(prune.warmup_steps == 1 and prune.score_step is None and prune.kept_index is None
+                     and prune.score_frames is None and not prune.reselect_every_step and prune.extra_keep_ratio == 0.0
+                     and prune.gate is None, "the diff selections score once at the warm-up step 0 (no other selection option)")
+        _require(not prune.diff_debug_av or prune.selection in ("diff", "diff_global"), "prune.diff_debug_av needs a diff selection")
         _require(0.0 <= prune.keep_ratio <= 1.0, "prune.keep_ratio must be in [0, 1]")
         _require(1 <= prune.warmup_steps < steps, "prune.warmup_steps must be in [1, num_inference_steps)")
         _require(prune.layer_rule in LAYER_RULES, f"prune.layer_rule must be one of {LAYER_RULES}")
@@ -479,7 +496,13 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
         record_recon_quality=bool(raw.get("record_recon_quality", False)),
         record_pilot=bool(raw.get("record_pilot", False)),
         agc=agc,
+        record_future_attn=bool(raw.get("record_future_attn", False)),
     )
+    p = cfg.prune
+    _require(not cfg.record_future_attn or p is None or not (
+        p.action_full_kv or p.video_full_kv or p.summary_grid or p.oracle_kv or p.recon is not None or p.steer is not None
+        or p.dense_bias or p.action_no_future or p.extrapolate_w is not None),
+        "record_future_attn is defined on the plain dense / S0 key layout")
     _require(not (cfg.record_pilot or cfg.agc is not None) or cfg.frame0_cache,
              "the pilot (record_pilot, agc) is logged on the frame-0-cache path only")
     _require(cfg.video_sigma_shift is None or cfg.video_sigma_shift > 0, "casestudy.video_sigma_shift must be > 0")

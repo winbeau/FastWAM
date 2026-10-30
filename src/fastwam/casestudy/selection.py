@@ -136,6 +136,20 @@ def topk_indices(score: torch.Tensor, k: int, exclude: torch.Tensor | None = Non
     return torch.topk(s, k).indices
 
 
+def diff_scores(x0_future: torch.Tensor, z0: torch.Tensor, grid: Grid) -> torch.Tensor:
+    """[Kf] Diff score: L2 distance of each future token's clean estimate (x - sigma v at the warm-up step) to the
+    current-frame latent at the same (h, w), over the token's full latent patch. ``x0_future`` [Kf, D], ``z0`` [per_frame, D]."""
+    return (x0_future.float() - z0.float()[grid.future_obs_index(z0.device)]).norm(dim=-1)
+
+
+def per_view_topk(score: torch.Tensor, k: int, grid: Grid) -> torch.Tensor:
+    """Top ceil(k/2) of the third-person camera's future tokens and top floor(k/2) of the wrist camera's."""
+    third, wrist = grid.future_view_masks(score.device)
+    k_third = (int(k) + 1) // 2
+    return torch.cat([topk_indices(score, k_third, exclude=torch.nonzero(~third).flatten()),
+                      topk_indices(score, int(k) - k_third, exclude=torch.nonzero(~wrist).flatten())])
+
+
 def complementary_topk(s_act: torch.Tensor, s_inst: torch.Tensor, k: int) -> torch.Tensor:
     """CF-Prune's disjoint union: half the budget by action relevance, the rest by
     instruction relevance among the tokens not already kept."""

@@ -663,7 +663,8 @@ class FastWAMJointPolicy:
                 for key in ("kept_index", "steer", "future_share_f32", "future_share_step", "motion_f32", "layer_act",
                             "steer_video", "video_frame0_f32", "motion_steps_f32", "paths", "cost", "modes",
                             "summary", "cache_kv_bytes", "recon", "recon_quality_f32", "recon_quality_shape",
-                            "recon_checks"):
+                            "recon_checks", "av_scores_f16", "diff_scores_f16", "diff_sigma_v", "future_attn_f32",
+                            "future_attn_shape", "dump_path", "gate_score"):
                     if d.get(key) is not None:
                         entry[key] = d[key]
                 out[f"{name}@{offset}"] = entry
