@@ -27,7 +27,9 @@ video rows' frame-0 share and the frame-1 motion of the clean estimate; ``diag["
 the token and key counts for a relative-compute estimate. ``prune.recon`` (r0 / r1 / r2) never
 computes or caches the dropped positions: each pruned step infers their K/V from the frame-0 token
 at the same (h, w) and appends them to the keys of both row groups; ``keep_ratio: 0`` drops the
-video rows of pruned steps altogether (V2-k0, R0-k0).
+video rows of pruned steps altogether (V2-k0, R0-k0). ``agc`` / ``record_pilot`` log the pilot, the
+warm-up step's clean action estimate ``x - sigma_0 * v_0`` (``diag["pilot_f32"]``, normalized); the gain
+itself is applied by the adapter in simulator units (``agc.py``).
 ``frame0_cache=false`` (dense only) calls the model's native
 ``infer_action`` unchanged, as the reference for equivalence checks. ``cfg.dump`` writes
 one call's attention, action hidden states and decoded video to an ``.npz``.
@@ -400,7 +402,7 @@ class JointCaseStudyRunner:
             dense_kv = {}
             dense_cfg = replace(cfg, method="dense", prune=None, record_attention=False, record_future_share=False,
                                 record_motion=False, record_video_frame0=False, record_motion_steps=False, dump=None,
-                                record_recon_quality=False)
+                                record_recon_quality=False, record_pilot=False, agc=None)
             JointCaseStudyRunner(model, dense_cfg, prompt_store=self.prompt_store).infer_action(
                 prompt, input_image, proprio, action_horizon, num_video_frames, seed,
                 sigma_shift=sigma_shift, rand_device=rand_device, _capture_kv=dense_kv,
@@ -574,6 +576,7 @@ class JointCaseStudyRunner:
         vf0_rows: list[torch.Tensor] = []
         want_motion_steps = cfg.record_motion_steps
         motion_rows: list[torch.Tensor] = []
+        want_pilot = cfg.record_pilot or cfg.agc is not None
         # Reconstruction (prune.recon): the per-call layout of the dropped positions (set with the kept
         # set), the quality against dense_kv per [k, v, k step-0, v step-0] x step x layer x view, and
         # the self-checks (worst |diff| and the matching |true| scale per check).
@@ -895,6 +898,12 @@ class JointCaseStudyRunner:
                 z = rearrange(x0[0], "c (f a) (h b) (w e) -> f (h w) (c a b e)", a=pt, b=ph, e=pw)
                 motion_rows.append((z[1] - z[0]).norm(dim=-1))
             pred_action = self.action.post_dit(xa, pre_a)
+            if want_pilot and s == 0:
+                # Pilot (agc / record_pilot): the dense warm-up step's clean action estimate x - sigma_0 * v_0
+                # in fp32, beside the forward pass.
+                sigma0 = t_action[0].float() / float(model.infer_action_scheduler.num_train_timesteps)
+                diag["pilot_f32"] = _f32_b64(latents_action[0].float() - sigma0 * pred_action[0].float())
+                diag["pilot_sigma0"] = float(sigma0)
             latents_video = model.infer_video_scheduler.step(pred_video, d_video[s], latents_video)
             latents_action = model.infer_action_scheduler.step(pred_action, d_action[s], latents_action)
             latents_video[:, :, 0:1] = first.clone()

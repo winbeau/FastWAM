@@ -56,6 +56,13 @@ Options (``policy.options``):
 ``hash_checkpoint``      default true.
 ``checkpoint_sha256``    optional expected digest; a mismatch is fatal.
 
+An arm with ``casestudy.agc`` (pilot + automatic gain, ``fastwam/casestudy/agc.py``) has its de-normalized
+chunk rescaled here, for the executed arm, the shadow and the probes alike: ``cont_actions_f32`` and the
+executed actions are the rescaled chunk, ``raw_actions_f32`` stays the model's normalized output, and
+``pre_agc_cont_actions_f32`` / ``agc`` hold the chunk before the gain and the gains. Arms that log the pilot
+(``agc``, ``record_pilot``) add ``pilot_cont_actions_f32``, the pilot in the same units. The shadow's
+normalized deviation metrics (``rms_*``) compare the model outputs, before any gain.
+
 The checkpoint is third-party (BadWAM, LIQIIIII/badwam-libero-joint-wam@086a861), not an
 official FastWAM release. It is loaded with strict key and shape checks instead of the
 native ``load_checkpoint`` (``strict=False``), so a partial load cannot pass silently.
@@ -166,6 +173,7 @@ class FastWAMJointPolicy:
         from hydra.utils import instantiate
 
         from experiments.libero import policy_io
+        from fastwam.casestudy import agc as agc_mod
         from fastwam.casestudy import call_seed, make_runner, parse_config
         from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
         from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
@@ -175,6 +183,7 @@ class FastWAMJointPolicy:
             raise RuntimeError("CUDA device requested but torch sees no GPU; refusing to fall back to CPU")
         self._torch = torch
         self._io = policy_io
+        self._agc_mod = agc_mod
         self._call_seed = call_seed
         self._prompt_template = DEFAULT_PROMPT
         self.device = device
@@ -384,11 +393,13 @@ class FastWAMJointPolicy:
         model_seconds = time.perf_counter() - model_started
         actions = self._io.postprocess_action(action.clone(), self.processor, binarize_gripper=self.binarize_gripper)
         actions = np.asarray(actions, dtype=np.float32)
+        cont, actions, agc_log = self._agc(runner.cfg, diag, self._continuous(action), actions)
         if not np.isfinite(actions).all():
             raise ValueError("FastWAM produced non-finite actions")
         self.predict_calls += 1
         diag.update({"call_index": call_index, "model_seconds": round(model_seconds, 6)})
-        diag.update(self._chunk_logs(action))
+        diag.update(self._chunk_logs(action, cont))
+        diag.update(agc_log)
         if diag.get("kept_index") is not None and diag.get("grid") is not None:
             per_frame = int(diag["grid"][1]) * int(diag["grid"][2])
             diag["kept_frame"] = [int(i) // per_frame + 1 for i in diag["kept_index"]]
@@ -448,6 +459,7 @@ class FastWAMJointPolicy:
             self._io.postprocess_action(shadow_action.clone(), self.processor, binarize_gripper=self.binarize_gripper),
             dtype=np.float32,
         )
+        shadow_cont, shadow_sim, shadow_agc = self._agc(self.shadow.cfg, shadow_diag, self._continuous(shadow_action), shadow_sim)
         a = action.numpy()
         b = shadow_action.numpy()
         k = self.shadow_executed
@@ -464,7 +476,7 @@ class FastWAMJointPolicy:
             "shadow_sim_actions_f16": base64.b64encode(shadow_sim.astype(np.float16).tobytes()).decode(),
             "shadow_gate_score": shadow_diag.get("gate_score"),
             "shadow_kept_index": shadow_diag.get("kept_index"),
-            **{f"shadow_{key}": value for key, value in self._chunk_logs(shadow_action).items()},
+            **{f"shadow_{key}": value for key, value in {**self._chunk_logs(shadow_action, shadow_cont), **shadow_agc}.items()},
         }
 
     def _probe_metrics(self, prompt, image, proprio, call_index: int) -> dict:
@@ -481,7 +493,8 @@ class FastWAMJointPolicy:
                     action_horizon=self.action_horizon, num_video_frames=self.num_video_frames,
                     seed=seed, sigma_shift=self.sigma_shift, rand_device=self.rand_device,
                 )
-                entry = {"seed": int(seed), **self._chunk_logs(action)}
+                cont, _, agc_log = self._agc(runner.cfg, d, self._continuous(action))
+                entry = {"seed": int(seed), **self._chunk_logs(action, cont), **agc_log}
                 for key in ("kept_index", "steer", "future_share_f32", "future_share_step", "motion_f32", "layer_act",
                             "steer_video", "video_frame0_f32", "motion_steps_f32", "paths", "cost", "modes",
                             "summary", "cache_kv_bytes", "recon", "recon_quality_f32", "recon_quality_shape",
@@ -491,12 +504,48 @@ class FastWAMJointPolicy:
                 out[f"{name}@{offset}"] = entry
         return out
 
-    def _chunk_logs(self, action) -> dict:
-        """Full chunk as float32 base64 [T, 7]: normalized model output, and de-normalized
-        before gripper binarisation (the executed chunk differs only in the gripper sign)."""
+    def _continuous(self, action) -> np.ndarray:
+        """De-normalized chunk [T, 7] before gripper binarisation (float32)."""
+        return np.asarray(self._io.postprocess_action(action.clone(), self.processor, binarize_gripper=False), dtype=np.float32)
+
+    def _agc(self, cfg, diag: dict, cont: np.ndarray, sim: np.ndarray | None = None):
+        """Pilot logging and the arm's automatic gain (``cfg.agc``) on one chunk -> (cont, sim, log).
+
+        Pops the runner's normalized pilot from ``diag`` and logs it de-normalized. Without ``agc`` the
+        chunks come back as given; with it both are rescaled by ``agc.apply`` with the gains of the
+        continuous chunk (dims 0-5 of ``cont`` and ``sim`` are identical), 1 / 1 under ``force_unit``."""
         import base64
 
-        continuous = self._io.postprocess_action(action.clone(), self.processor, binarize_gripper=False)
+        def b64(x) -> str:
+            return base64.b64encode(np.asarray(x, dtype=np.float32).tobytes()).decode()
+
+        log: dict = {}
+        pilot = None
+        raw = diag.pop("pilot_f32", None)
+        if raw is not None:
+            p = np.frombuffer(base64.b64decode(raw), dtype=np.float32).reshape(cont.shape)
+            pilot = self._continuous(self._torch.from_numpy(p.copy()))
+            log.update(pilot_cont_actions_f32=b64(pilot), pilot_sigma0=diag.pop("pilot_sigma0", None))
+        agc = cfg.agc
+        if agc is None:
+            return cont, sim, log
+        info = self._agc_mod.gains(agc, cont, pilot)
+        g_t, g_r = (1.0, 1.0) if agc.force_unit else (info["g_t"], info["g_r"])
+        out = self._agc_mod.apply(cont, g_t, g_r, agc.limit)
+        clipped = sum(int(np.sum(np.abs(cont[:, sl].astype(np.float64) * g) > agc.limit))
+                      for sl, g in ((self._agc_mod.TRANS, g_t), (self._agc_mod.ROT, g_r)) if g != 1.0)
+        info.update(applied_t=g_t, applied_r=g_r, clipped=clipped)
+        log.update(pre_agc_cont_actions_f32=b64(cont), agc=info)
+        return out, None if sim is None else self._agc_mod.apply(sim, g_t, g_r, agc.limit), log
+
+    def _chunk_logs(self, action, continuous=None) -> dict:
+        """Full chunk as float32 base64 [T, 7]: normalized model output, and de-normalized
+        before gripper binarisation (the executed chunk differs only in the gripper sign; with
+        ``agc``, ``continuous`` is the rescaled chunk)."""
+        import base64
+
+        if continuous is None:
+            continuous = self._continuous(action)
         return {
             "raw_actions_f32": base64.b64encode(np.asarray(action.numpy(), dtype=np.float32).tobytes()).decode(),
             "cont_actions_f32": base64.b64encode(np.asarray(continuous, dtype=np.float32).tobytes()).decode(),

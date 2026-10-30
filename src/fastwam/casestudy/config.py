@@ -54,6 +54,15 @@ cosine of the reconstructed K / V to the dense ones at the dropped positions (pe
 and view), plus the RoPE / projection self-checks. ``video_sigma_shift`` replaces the shift of
 the video schedule only (the action schedule keeps its own).
 
+``agc`` (pilot + automatic gain, any method on the frame-0-cache path): the dense warm-up step's
+clean action estimate ``x - sigma_0 * v_0`` (the pilot) and the arm's output are de-normalized to
+simulator units; their translation (dims 0-2) and rotation (dims 3-5) sums over the executed steps
+set per component the gain ``g = clip(c * |D(pilot)| / |D(out)|, lo, hi)`` (1 when either norm is
+below the component's threshold), or ``const`` gives ``g = clip(gain, lo, hi)``. The whole chunk's
+translation and rotation are multiplied by their gains and clipped to the environment range; the
+gripper is never touched and a component with ``g = 1`` is left as it is (see ``agc.py``; applied by
+the adapter). ``record_pilot`` logs the pilot without any gain (calibration of ``c``).
+
 ``dump`` (any method) writes one call's internals to an ``.npz``: the action query's
 attention over the video tokens and the action hidden states after every layer and step,
 and the decoded predicted video. Capture does not change the numerics; it is meant for a
@@ -166,6 +175,30 @@ class NoiseConfig:
 
 
 @dataclass(frozen=True)
+class AGCConfig:
+    #: ``pilot``: per component g = clip(c * |D(pilot)| / |D(out)|, lo, hi), 1 when |D(pilot)| or
+    #: |D(out)| is below the component's threshold; ``const``: g_t = g_r = clip(gain, lo, hi).
+    mode: str = "pilot"
+    c_t: float = 1.0
+    c_r: float = 1.0
+    #: Thresholds on |D| (translation) and |R| (rotation), simulator units.
+    tau_d: float = 0.0
+    tau_r: float = 0.0
+    gain: float = 1.0
+    lo: float = 1.0
+    hi: float = 1.5
+    #: Leading chunk steps summed into D and R (the protocol's replan_steps).
+    executed: int = 10
+    #: Environment range of the scaled dimensions (robosuite OSC_POSE input_min / input_max).
+    limit: float = 1.0
+    #: Compute and log the gains but apply 1 (self-check: bitwise the arm without AGC).
+    force_unit: bool = False
+
+
+AGC_MODES = ("pilot", "const")
+
+
+@dataclass(frozen=True)
 class DumpConfig:
     #: Output ``.npz``; parent directories are created, an existing file is replaced.
     path: str
@@ -213,6 +246,10 @@ class CaseStudyConfig:
     video_sigma_shift: Optional[float] = None
     #: With ``prune.recon``: reconstruction quality against a dense pass and the self-checks.
     record_recon_quality: bool = False
+    #: Log the pilot (the warm-up step's clean action estimate); implied by ``agc``.
+    record_pilot: bool = False
+    #: Pilot + automatic gain on the output chunk (see the module docstring).
+    agc: Optional[AGCConfig] = None
 
     def describe(self) -> dict[str, Any]:
         return asdict(self)
@@ -384,6 +421,24 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
                           hidden=bool(block.get("hidden", True)), video=bool(block.get("video", True)))
         _require(dump.path.endswith(".npz"), "casestudy.dump.path must end in .npz")
 
+    agc = None
+    if raw.get("agc") is not None:
+        block = dict(raw["agc"])
+        _known_keys(block, {f for f in AGCConfig.__dataclass_fields__}, "casestudy.agc")
+        agc = AGCConfig(
+            mode=str(block.get("mode", "pilot")),
+            c_t=float(block.get("c_t", 1.0)), c_r=float(block.get("c_r", 1.0)),
+            tau_d=float(block.get("tau_d", 0.0)), tau_r=float(block.get("tau_r", 0.0)),
+            gain=float(block.get("gain", 1.0)), lo=float(block.get("lo", 1.0)), hi=float(block.get("hi", 1.5)),
+            executed=int(block.get("executed", 10)), limit=float(block.get("limit", 1.0)),
+            force_unit=bool(block.get("force_unit", False)),
+        )
+        _require(agc.mode in AGC_MODES, f"agc.mode must be one of {AGC_MODES}")
+        _require(0.0 < agc.lo <= agc.hi and math.isfinite(agc.hi), "agc needs 0 < lo <= hi < inf")
+        _require(agc.c_t > 0 and agc.c_r > 0 and agc.gain > 0, "agc.c_t, agc.c_r and agc.gain must be > 0")
+        _require(agc.tau_d >= 0 and agc.tau_r >= 0, "agc.tau_d and agc.tau_r must be >= 0")
+        _require(agc.executed >= 1 and agc.limit > 0, "agc.executed >= 1 and agc.limit > 0")
+
     cfg = CaseStudyConfig(
         method=method,
         num_inference_steps=steps,
@@ -404,7 +459,11 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
         dump=dump,
         video_sigma_shift=None if raw.get("video_sigma_shift") is None else float(raw["video_sigma_shift"]),
         record_recon_quality=bool(raw.get("record_recon_quality", False)),
+        record_pilot=bool(raw.get("record_pilot", False)),
+        agc=agc,
     )
+    _require(not (cfg.record_pilot or cfg.agc is not None) or cfg.frame0_cache,
+             "the pilot (record_pilot, agc) is logged on the frame-0-cache path only")
     _require(cfg.video_sigma_shift is None or cfg.video_sigma_shift > 0, "casestudy.video_sigma_shift must be > 0")
     _require(not cfg.record_recon_quality or (cfg.prune is not None and cfg.prune.recon is not None),
              "record_recon_quality needs prune.recon")
@@ -432,6 +491,7 @@ def call_seed(episode_key: str, call_index: int, offset: int = 0) -> int:
 
 
 __all__ = [
+    "AGCConfig",
     "CaseStudyConfig",
     "DumpConfig",
     "GateConfig",
