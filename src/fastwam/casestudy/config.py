@@ -40,6 +40,20 @@ seed and step; ``dense_bias`` never prunes and adds ``steer.lam * b`` to every f
 of the action rows after warm-up (``lam = -1`` gives the sparse arm's future share with every
 token present).
 
+``recon`` (pure pruning plus reconstruction): on pruned steps the dropped positions are not
+computed or cached; each pruned step infers their K/V from the frame-0 token at the same (h, w)
+and they join the keys of the video rows ([frame-0 | kept | reconstructed]) and of the action rows
+([frame-0 | kept | reconstructed | action]), without any bias. ``r0``: RoPE_p of the frame-0 token's
+pre-RoPE key (after norm_k) and its value. ``r1``: r0 plus, per layer, step, future frame and camera
+view, the channel-wise median over the kept tokens of (kept - its frame-0 token), for keys before
+RoPE and for values. ``r2``: the frame-0 token's input hidden state of the layer, modulated with
+this step's future-frame time modulation, through W_k / norm_k / W_v. ``keep_ratio: 0`` keeps no
+future token after warm-up: V2-k0 (``action_full_kv``: the step-0 K/V of all of them) or R0-k0
+(``recon: r0``). ``record_recon_quality`` runs a dense pass of the same call first and logs the
+cosine of the reconstructed K / V to the dense ones at the dropped positions (per step, layer
+and view), plus the RoPE / projection self-checks. ``video_sigma_shift`` replaces the shift of
+the video schedule only (the action schedule keeps its own).
+
 ``dump`` (any method) writes one call's internals to an ``.npz``: the action query's
 attention over the video tokens and the action hidden states after every layer and step,
 and the decoded predicted video. Capture does not change the numerics; it is meant for a
@@ -132,6 +146,8 @@ class PruneConfig:
     summary_bias: str = "count"
     #: Never prune; the action rows add ``steer.lam * b`` to every future column after warm-up.
     dense_bias: bool = False
+    #: Reconstructed K/V of the dropped positions: r0 / r1 / r2 (module docstring); None = off.
+    recon: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -193,6 +209,10 @@ class CaseStudyConfig:
     record_motion_steps: bool = False
     #: Write this call's internals to an ``.npz`` (see the module docstring).
     dump: Optional[DumpConfig] = None
+    #: Shift of the video denoising schedule only (None = the call's sigma_shift / the model's).
+    video_sigma_shift: Optional[float] = None
+    #: With ``prune.recon``: reconstruction quality against a dense pass and the self-checks.
+    record_recon_quality: bool = False
 
     def describe(self) -> dict[str, Any]:
         return asdict(self)
@@ -264,9 +284,10 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             summary_grid=int(block.get("summary_grid", 0)),
             summary_views=int(block.get("summary_views", 2)),
             summary_bias=str(block.get("summary_bias", "count")),
+            recon=None if block.get("recon") is None else str(block["recon"]),
         )
         _require(prune.selection in SELECTIONS, f"prune.selection must be one of {SELECTIONS}")
-        _require(0.0 < prune.keep_ratio <= 1.0, "prune.keep_ratio must be in (0, 1]")
+        _require(0.0 <= prune.keep_ratio <= 1.0, "prune.keep_ratio must be in [0, 1]")
         _require(1 <= prune.warmup_steps < steps, "prune.warmup_steps must be in [1, num_inference_steps)")
         _require(prune.layer_rule in LAYER_RULES, f"prune.layer_rule must be one of {LAYER_RULES}")
         _require(prune.layer_rule != "fixed" or prune.layer is not None, "layer_rule=fixed needs prune.layer")
@@ -315,6 +336,19 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             _require(not (prune.video_eager or prune.steer_video is not None or cache or prune.oracle_kv
                           or prune.full_steps or prune.gate is not None),
                      "prune.dense_bias is plain dense compute plus the action-row bias")
+        _require(prune.recon in (None, "r0", "r1", "r2"), "prune.recon must be r0, r1 or r2")
+        if prune.recon is not None:
+            _require(not (cache or prune.oracle_kv or prune.dense_bias or prune.video_eager or prune.steer is not None
+                          or prune.steer_video is not None or prune.full_steps or prune.reselect_every_step
+                          or prune.gate is not None or prune.summary_grid),
+                     "prune.recon is S0 plus the reconstructed keys (no other option)")
+        if prune.keep_ratio == 0.0:
+            _require(prune.recon == "r0" or (prune.action_full_kv and not prune.video_eager and prune.steer is None),
+                     "keep_ratio 0 is V2-k0 (action_full_kv) or R0-k0 (recon r0)")
+            _require(prune.selection == "av" and prune.extra_keep_ratio == 0.0 and prune.kept_index is None
+                     and not prune.reselect_every_step and prune.gate is None and not prune.full_steps
+                     and not prune.summary_grid and not prune.oracle_kv and not prune.dense_bias,
+                     "keep_ratio 0 takes no other option")
     else:
         _require(raw.get("prune") is None, "prune block given but method != prune")
 
@@ -368,7 +402,13 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
         record_video_frame0=bool(raw.get("record_video_frame0", False)),
         record_motion_steps=bool(raw.get("record_motion_steps", False)),
         dump=dump,
+        video_sigma_shift=None if raw.get("video_sigma_shift") is None else float(raw["video_sigma_shift"]),
+        record_recon_quality=bool(raw.get("record_recon_quality", False)),
     )
+    _require(cfg.video_sigma_shift is None or cfg.video_sigma_shift > 0, "casestudy.video_sigma_shift must be > 0")
+    _require(not cfg.record_recon_quality or (cfg.prune is not None and cfg.prune.recon is not None),
+             "record_recon_quality needs prune.recon")
+    _require(cfg.dump is None or cfg.prune is None or cfg.prune.recon is None, "dump is not defined for prune.recon")
     _require(cfg.score_layer is None or cfg.score_layer >= 0, "casestudy.score_layer must be >= 0")
     _require(cfg.prune is None or not cfg.record_vv or cfg.prune.warmup_steps == 1,
              "record_vv needs prune.warmup_steps == 1 (V→V is captured at step 0)")

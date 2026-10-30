@@ -24,7 +24,10 @@ unless ``prune.video_eager`` (then also fp32, with the optional ``steer_video`` 
 action rows of pruned steps its kept-token K/V; ``dense_bias`` never prunes and biases the
 action rows' future columns. ``record_video_frame0`` / ``record_motion_steps`` log per step the
 video rows' frame-0 share and the frame-1 motion of the clean estimate; ``diag["cost"]`` holds
-the token and key counts for a relative-compute estimate.
+the token and key counts for a relative-compute estimate. ``prune.recon`` (r0 / r1 / r2) never
+computes or caches the dropped positions: each pruned step infers their K/V from the frame-0 token
+at the same (h, w) and appends them to the keys of both row groups; ``keep_ratio: 0`` drops the
+video rows of pruned steps altogether (V2-k0, R0-k0).
 ``frame0_cache=false`` (dense only) calls the model's native
 ``infer_action`` unchanged, as the reference for equivalence checks. ``cfg.dump`` writes
 one call's attention, action hidden states and decoded video to an ``.npz``.
@@ -42,7 +45,7 @@ import numpy as np
 import torch
 from einops import rearrange
 
-from fastwam.models.wan22.wan_video_dit import flash_attention, modulate
+from fastwam.models.wan22.wan_video_dit import flash_attention, modulate, rope_apply
 
 from .config import CaseStudyConfig
 from . import selection as sel
@@ -257,6 +260,46 @@ class JointCaseStudyRunner:
         lse = torch.logsumexp(full.unsqueeze(-2) + mask, dim=-1)  # [H, Sq, G]
         return lse - self._head_logits(q, k_sum)
 
+    def _io_pre_rope(self, expert, block, x: torch.Tensor, freqs: torch.Tensor, t_mod: torch.Tensor):
+        """``mot._build_expert_attention_io`` with the same operations in the same order (so the same
+        numbers), also returning the pre-RoPE key k~ (after norm_k) -> (io tuple, k~)."""
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.mot._split_modulation(block, t_mod)
+        attn_input = modulate(block.norm1(x), shift_msa, scale_msa)
+        q = block.self_attn.norm_q(block.self_attn.q(attn_input))
+        k_t = block.self_attn.norm_k(block.self_attn.k(attn_input))
+        v = block.self_attn.v(attn_input)
+        q = rope_apply(q, freqs, block.num_heads)
+        k = rope_apply(k_t, freqs, block.num_heads)
+        ckpt = bool(getattr(expert, "use_gradient_checkpointing", False))
+        return (q, k, v, x, gate_msa, shift_mlp, scale_mlp, gate_mlp, ckpt), k_t
+
+    def _r2_project(self, block, x: torch.Tensor, t_mod: torch.Tensor):
+        """R2: hidden states ``x`` with the time modulation ``t_mod`` through modulate(norm1(.)), W_k /
+        norm_k and W_v -> (pre-RoPE key k~, value)."""
+        shift_msa, scale_msa, *_ = self.mot._split_modulation(block, t_mod)
+        attn_input = modulate(block.norm1(x), shift_msa, scale_msa)
+        return block.self_attn.norm_k(block.self_attn.k(attn_input)), block.self_attn.v(attn_input)
+
+    @staticmethod
+    def _future_freqs(pre_v: dict, idx: torch.Tensor, f0: int) -> torch.Tensor:
+        """RoPE frequencies of future positions ``idx`` (0-based among the future tokens): the rows of
+        the full sequence's 3D table, i.e. the rotation of a real token at that (frame, h, w)."""
+        return pre_v["freqs"][idx + f0]
+
+    @staticmethod
+    def _median0(x: torch.Tensor) -> torch.Tensor:
+        """Channel-wise median over rows [n, D] in fp32, numpy's convention (mean of the two middle
+        values for even n)."""
+        s = torch.sort(x.float(), dim=0).values
+        n = int(s.shape[0])
+        return 0.5 * (s[(n - 1) // 2] + s[n // 2])
+
+    @staticmethod
+    def _cos_rows(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """Cosine per token over the whole vector (all heads): [1, n, D] x 2 -> [n] (fp32)."""
+        a, b = a[0].float(), b[0].float()
+        return (a * b).sum(-1) / (a.norm(dim=-1) * b.norm(dim=-1)).clamp_min(1e-12)
+
     def _cost_model(self) -> dict:
         """Parameter counts for the relative-compute estimate (per block; context K/V projections
         apart, since they run on the context tokens, not on the queries)."""
@@ -267,8 +310,11 @@ class JointCaseStudyRunner:
                 return int(total), int(ctx)
             pv, pv_ctx = split(self.video.blocks[0])
             pa, pa_ctx = split(self.action.blocks[0])
+            attn = self.video.blocks[0].self_attn
+            proj = sum(p.numel() for m in (attn.k, attn.v) for p in m.parameters())
             self._cost = {"video_block_params": pv, "video_ctx_kv_params": pv_ctx,
-                          "action_block_params": pa, "action_ctx_kv_params": pa_ctx, "layers": self.num_layers}
+                          "action_block_params": pa, "action_ctx_kv_params": pa_ctx, "layers": self.num_layers,
+                          "video_kv_proj_params": int(proj)}
         return dict(self._cost)
 
     def _post(self, block, io: tuple, mixed: torch.Tensor, context_payload: dict) -> torch.Tensor:
@@ -285,18 +331,24 @@ class JointCaseStudyRunner:
             context_payload=context_payload,
         )
 
-    def _prefill_frame0(self, pre0: dict, num_text: int, inst_layers: set[int]) -> tuple[list, dict[int, torch.Tensor]]:
+    def _prefill_frame0(self, pre0: dict, num_text: int, inst_layers: set[int],
+                        keep_pre: bool = False) -> tuple[list, dict[int, torch.Tensor]]:
         """Run frame-0 tokens alone through the video expert; return per-layer K/V and,
-        for ``inst_layers``, the cross-attention mass on real instruction tokens."""
+        for ``inst_layers``, the cross-attention mass on real instruction tokens. With ``keep_pre``
+        (prune.recon) also each layer's pre-RoPE key ``kt`` and input hidden states ``x``."""
         x = pre0["tokens"]
         payload = {"context": pre0["context"], "mask": pre0["context_mask"]}
         kv: list[dict[str, torch.Tensor]] = []
         inst_mass: dict[int, torch.Tensor] = {}
         for layer in range(self.num_layers):
             block = self.video.blocks[layer]
-            io = self.mot._build_expert_attention_io(
-                expert=self.video, block=block, x=x, freqs=pre0["freqs"], t_mod=pre0["t_mod"]
-            )
+            k_t = None
+            if keep_pre:
+                io, k_t = self._io_pre_rope(self.video, block, x, pre0["freqs"], pre0["t_mod"])
+            else:
+                io = self.mot._build_expert_attention_io(
+                    expert=self.video, block=block, x=x, freqs=pre0["freqs"], t_mod=pre0["t_mod"]
+                )
             q, k, v = io[0], io[1], io[2]
             mixed = flash_attention(q=q, k=k, v=v, num_heads=self.num_heads)
             if layer in inst_layers:
@@ -305,8 +357,11 @@ class JointCaseStudyRunner:
                 ck = block.cross_attn.norm_k(block.cross_attn.k(pre0["context"]))
                 probs = self._attention_probs(cq, ck)  # [Kv0, L]
                 inst_mass[layer] = probs[:, :num_text].sum(dim=-1)
+            entry = {"k": k, "v": v}
+            if keep_pre:
+                entry.update(kt=k_t, x=x)
             x = self._post(block, io, mixed, payload)
-            kv.append({"k": k, "v": v})
+            kv.append(entry)
         return kv, inst_mass
 
     def _choose_layers(self, act_probs: dict[int, torch.Tensor], inst_mass: dict[int, torch.Tensor], grid: sel.Grid) -> dict[str, int]:
@@ -338,15 +393,20 @@ class JointCaseStudyRunner:
         steps = int(cfg.num_inference_steps)
         # X2 (prune.oracle_kv): a dense pass of the same call and seed first, keeping every
         # step's future K/V per layer for the action rows of the pruned pass below.
+        # record_recon_quality: the same dense pass, its K/V only compared with the reconstruction.
         oracle: Optional[dict] = None
-        if cfg.prune is not None and cfg.prune.oracle_kv:
-            oracle = {}
+        dense_kv: Optional[dict] = None
+        if cfg.prune is not None and (cfg.prune.oracle_kv or cfg.record_recon_quality):
+            dense_kv = {}
             dense_cfg = replace(cfg, method="dense", prune=None, record_attention=False, record_future_share=False,
-                                record_motion=False, record_video_frame0=False, record_motion_steps=False, dump=None)
+                                record_motion=False, record_video_frame0=False, record_motion_steps=False, dump=None,
+                                record_recon_quality=False)
             JointCaseStudyRunner(model, dense_cfg, prompt_store=self.prompt_store).infer_action(
                 prompt, input_image, proprio, action_horizon, num_video_frames, seed,
-                sigma_shift=sigma_shift, rand_device=rand_device, _capture_kv=oracle,
+                sigma_shift=sigma_shift, rand_device=rand_device, _capture_kv=dense_kv,
             )
+            if cfg.prune.oracle_kv:
+                oracle = dense_kv
         if not cfg.frame0_cache:
             text = {"prompt": prompt}
             if self.prompt_store is not None:
@@ -401,7 +461,8 @@ class JointCaseStudyRunner:
             context, context_mask = model._append_proprio_to_context(context=context, context_mask=context_mask, proprio=proprio)
 
         t_video, d_video = model.infer_video_scheduler.build_inference_schedule(
-            num_inference_steps=steps, device=model.device, dtype=latents_video.dtype, shift_override=sigma_shift
+            num_inference_steps=steps, device=model.device, dtype=latents_video.dtype,
+            shift_override=sigma_shift if cfg.video_sigma_shift is None else cfg.video_sigma_shift,
         )
         t_action, d_action = model.infer_action_scheduler.build_inference_schedule(
             num_inference_steps=steps, device=model.device, dtype=latents_action.dtype, shift_override=sigma_shift
@@ -432,7 +493,8 @@ class JointCaseStudyRunner:
             action=None,
             fuse_vae_embedding_in_latents=fuse,
         )
-        kv0, inst_mass = self._prefill_frame0(pre0, num_text, inst_layers)
+        recon = prune.recon if prune is not None else None
+        kv0, inst_mass = self._prefill_frame0(pre0, num_text, inst_layers, keep_pre=recon is not None)
 
         # ---- denoising
         all_future = torch.arange(num_future, device=model.device)
@@ -512,8 +574,26 @@ class JointCaseStudyRunner:
         vf0_rows: list[torch.Tensor] = []
         want_motion_steps = cfg.record_motion_steps
         motion_rows: list[torch.Tensor] = []
+        # Reconstruction (prune.recon): the per-call layout of the dropped positions (set with the kept
+        # set), the quality against dense_kv per [k, v, k step-0, v step-0] x step x layer x view, and
+        # the self-checks (worst |diff| and the matching |true| scale per check).
+        rc: Optional[dict] = None
+        want_rq = cfg.record_recon_quality
+        rq = torch.full((4, steps, self.num_layers, 2), float("nan"), device=model.device) if want_rq else None
+        checks: dict[str, torch.Tensor] = {}
+
+        def _check(name: str, got: torch.Tensor, true: torch.Tensor) -> None:
+            if not got.numel():
+                return
+            new = torch.stack([(got.float() - true.float()).abs().max(), true.float().abs().max()])
+            checks[name] = torch.maximum(checks[name], new) if name in checks else new
+
+        if recon is not None and want_rq:
+            for layer in range(self.num_layers):  # RoPE of frame 0's own pre-RoPE key = its true key
+                _check("frame0_rope", rope_apply(kv0[layer]["kt"], pre0["freqs"], self.num_heads), kv0[layer]["k"])
         pt, ph, pw = (int(x) for x in patch)
         cost_steps: list[list[int]] = []
+        cost_recon: list[int] = []
         cost_dim = 0
         dump = cfg.dump
         d_future = d_obs = d_act = d_hidden = None
@@ -571,16 +651,63 @@ class JointCaseStudyRunner:
                 payload_v = {"context": pre_v["context"], "mask": pre_v["context_mask"][:, idx_abs]}
                 payload_a = {"context": pre_a["context"], "mask": pre_a["context_mask"]}
                 step_probs: dict[int, torch.Tensor] = {}
+                n_q = int(idx_rel.numel())  # 0 on the pruned steps of keep 0: no video rows at all
+                rc_step = recon is not None and mode == "pruned" and rc is not None and rc["n"] > 0
+                if rc_step and recon == "r2":
+                    tmod_src = pre_v["t_mod"][:, f0 + rc["src_u"]]  # this step's future-frame modulation
+                if recon is not None:  # R2's extra projections this step (frame-0 positions per layer)
+                    cost_recon.append(int(rc["src_u"].numel()) if rc_step and recon == "r2" else 0)
                 for layer in range(self.num_layers):
                     bv = self.video.blocks[layer]
                     ba = self.action.blocks[layer]
-                    io_v = self.mot._build_expert_attention_io(expert=self.video, block=bv, x=xv, freqs=freqs_v, t_mod=tmod_v)
+                    io_v = k_t = None
+                    if n_q and recon is not None:
+                        io_v, k_t = self._io_pre_rope(self.video, bv, xv, freqs_v, tmod_v)
+                    elif n_q:
+                        io_v = self.mot._build_expert_attention_io(expert=self.video, block=bv, x=xv, freqs=freqs_v, t_mod=tmod_v)
                     io_a = self.mot._build_expert_attention_io(
                         expert=self.action, block=ba, x=xa, freqs=pre_a["freqs"], t_mod=pre_a["t_mod"]
                     )
-                    k_vid = torch.cat([kv0[layer]["k"], io_v[1]], dim=1)
-                    v_vid = torch.cat([kv0[layer]["v"], io_v[2]], dim=1)
-                    if _capture_kv is not None and s > 0:
+                    k_new, v_new = (io_v[1], io_v[2]) if io_v is not None else (kv0[layer]["k"][:, :0], kv0[layer]["v"][:, :0])
+                    k_vid = torch.cat([kv0[layer]["k"], k_new], dim=1)
+                    v_vid = torch.cat([kv0[layer]["v"], v_new], dim=1)
+                    if rc_step:
+                        # Reconstructed K/V of the dropped positions from the frame-0 token at the same (h, w).
+                        if recon == "r2":
+                            kt_s, v_s = self._r2_project(bv, kv0[layer]["x"][:, rc["src_u"]], tmod_src)
+                            kt_hat, v_hat = kt_s[:, rc["inv"]], v_s[:, rc["inv"]]
+                        else:
+                            kt_hat, v_hat = kv0[layer]["kt"][:, rc["src"]], kv0[layer]["v"][:, rc["src"]]
+                            if recon == "r1":
+                                dk = k_t[0].float() - kv0[layer]["kt"][0, rc["kept_src"]].float()
+                                dv = io_v[2][0].float() - kv0[layer]["v"][0, rc["kept_src"]].float()
+                                delta_k = torch.zeros(kt_hat.shape[1:], dtype=torch.float32, device=kt_hat.device)
+                                delta_v = torch.zeros_like(delta_k)
+                                for g_src, rows_kept, rows_drop in rc["groups"]:
+                                    delta_k[rows_drop] = self._median0(dk[rows_kept])
+                                    delta_v[rows_drop] = self._median0(dv[rows_kept])
+                                kt_hat = (kt_hat.float() + delta_k).to(kt_hat.dtype)
+                                v_hat = (v_hat.float() + delta_v).to(v_hat.dtype)
+                        k_hat = rope_apply(kt_hat, rc["freqs"], self.num_heads)
+                        k_vid = torch.cat([k_vid, k_hat], dim=1)
+                        v_vid = torch.cat([v_vid, v_hat], dim=1)
+                        if want_rq:
+                            k_d, v_d = dense_kv[(s, layer)]
+                            k_d, v_d = k_d[:, rc["dropped"]], v_d[:, rc["dropped"]]
+                            k_0, v_0 = dense_kv[(0, layer)]
+                            vals = (self._cos_rows(k_hat, k_d), self._cos_rows(v_hat, v_d),
+                                    self._cos_rows(k_0[:, rc["dropped"]], k_d), self._cos_rows(v_0[:, rc["dropped"]], v_d))
+                            for i, c in enumerate(vals):
+                                for view, m in rc["view_masks"]:
+                                    rq[i, s, layer, view] = c[m].mean()
+                    if recon is not None and want_rq and mode == "pruned" and io_v is not None:
+                        # Self-checks on the kept tokens: the recon path's RoPE on their own k~, and R2's
+                        # projection on their own input hidden states and modulation.
+                        _check("kept_rope", rope_apply(k_t, self._future_freqs(pre_v, idx_rel, f0), self.num_heads), io_v[1])
+                        kt_c, v_c = self._r2_project(bv, xv, tmod_v)
+                        _check("r2_key", kt_c, k_t)
+                        _check("r2_value", v_c, io_v[2])
+                    if _capture_kv is not None and io_v is not None:
                         _capture_kv[(s, layer)] = (io_v[1], io_v[2])
                     if summary_lse and s == 0:
                         q0_v[layer], q0_a[layer] = io_v[0], io_a[0]
@@ -599,9 +726,11 @@ class JointCaseStudyRunner:
                                 v_fut[:, idx_rel] = io_v[2]
                         else:
                             k_drop, v_drop = kv_drop[layer]
-                    n_q = int(idx_rel.numel())
                     vf0 = None
-                    if video_eager and mode == "pruned":
+                    n_vk = 0
+                    if io_v is None:
+                        out_v = None  # keep 0: no video rows on this step
+                    elif video_eager and mode == "pruned":
                         if video_full_kv and k_fut is not None:
                             # V2: the video rows also see the dropped tokens' K/V of the last full step.
                             kv_k = torch.cat([kv0[layer]["k"], k_fut], dim=1)
@@ -639,15 +768,15 @@ class JointCaseStudyRunner:
                             if steer_v_warm:
                                 steer_vfut[layer] = pv[..., f0:]
                                 steer_vlogits[layer] = logits_v
-                    if want_vf0:
+                    if want_vf0 and vf0 is not None:
                         vf0_layers.append(vf0.mean(dim=0))  # [queries], head mean
                     if full_kv and k_fut is not None:
                         k_all = torch.cat([kv0[layer]["k"], k_fut, io_a[1]], dim=1)
                         v_all = torch.cat([kv0[layer]["v"], v_fut, io_a[2]], dim=1)
                         kept_cols = idx_rel + f0
                     elif full_kv and k_drop is not None:
-                        k_all = torch.cat([kv0[layer]["k"], k_drop, io_v[1], io_a[1]], dim=1)
-                        v_all = torch.cat([kv0[layer]["v"], v_drop, io_v[2], io_a[2]], dim=1)
+                        k_all = torch.cat([kv0[layer]["k"], k_drop, k_new, io_a[1]], dim=1)
+                        v_all = torch.cat([kv0[layer]["v"], v_drop, v_new, io_a[2]], dim=1)
                         n_d = int(k_drop.shape[1])
                         kept_cols = slice(f0 + n_d, f0 + n_d + n_q)
                     elif summary and mode == "pruned" and n_sum:
@@ -668,7 +797,7 @@ class JointCaseStudyRunner:
                         kept_cols = slice(f0, f0 + n_q)
                     if layer == 0:
                         cost_steps.append([n_q, n_vk, int(io_a[0].shape[1]), int(k_all.shape[1])])
-                        cost_dim = int(io_v[0].shape[-1])
+                        cost_dim = int(io_a[0].shape[-1])
                     biased = steer is not None and (mode == "pruned" or (dense_bias and s >= prune.warmup_steps))
                     if biased:
                         nf = k_all.shape[1] - f0 - io_a[1].shape[1]
@@ -726,7 +855,8 @@ class JointCaseStudyRunner:
                         out_a = out_a + (cfg.noise.sigma * rms * torch.randn(
                             out_a.shape, generator=noise_gen, device=out_a.device, dtype=torch.float32
                         )).to(out_a.dtype)
-                    xv = self._post(bv, io_v, out_v, payload_v)
+                    if io_v is not None:
+                        xv = self._post(bv, io_v, out_v, payload_v)
                     xa = self._post(ba, io_a, out_a, payload_a)
                     if dump is not None and dump.hidden:
                         if d_hidden is None:
@@ -751,10 +881,11 @@ class JointCaseStudyRunner:
                 vf0_rows.append(row)
 
             # ---- heads and scheduler step
-            vel_part = self.video.head(xv, pre_v["t"][:, idx_abs])
-            if vel_tokens is None:
-                vel_tokens = torch.zeros((1, f0 + num_future, vel_part.shape[-1]), device=vel_part.device, dtype=vel_part.dtype)
-            vel_tokens[:, idx_abs] = vel_part  # pruned tokens keep their last velocity
+            if idx_abs.numel():  # keep 0: no future token is recomputed after warm-up
+                vel_part = self.video.head(xv, pre_v["t"][:, idx_abs])
+                if vel_tokens is None:
+                    vel_tokens = torch.zeros((1, f0 + num_future, vel_part.shape[-1]), device=vel_part.device, dtype=vel_part.dtype)
+                vel_tokens[:, idx_abs] = vel_part  # pruned tokens keep their last velocity
             pred_video = self.video.unpatchify(vel_tokens, pre_v["meta"]["grid_size"])
             if want_motion_steps:
                 # This step's clean estimate x - sigma * v (sigma_s = -sum of the remaining deltas; the
@@ -803,7 +934,7 @@ class JointCaseStudyRunner:
                 else:
                     self._layers = {"act": -1, "inst": -1}
             if prune is not None and (s == prune.warmup_steps - 1 or (mode == "pruned" and prune.reselect_every_step)):
-                k = max(1, int(round(prune.keep_ratio * num_future)))
+                k = 0 if prune.keep_ratio == 0.0 else max(1, int(round(prune.keep_ratio * num_future)))
                 if prune.kept_index is not None:
                     # Keep-set taken from a dense rollout: no score is computed here.
                     kept = torch.tensor(
@@ -856,6 +987,37 @@ class JointCaseStudyRunner:
                     kv_future_full.clear()
                     diag["cache_kv_bytes"] = int(sum(k.numel() * k.element_size() + v.numel() * v.element_size()
                                                      for k, v in kv_drop.values()))
+                if recon is not None and s == prune.warmup_steps - 1:
+                    # Layout of the dropped positions p = (frame, h, w): frame-0 source (h, w), RoPE rows,
+                    # camera view (left half of the latent columns = agentview); R1's (frame, view) groups
+                    # with the fallback to the other frame of the same view (or none: delta 0).
+                    keep_mask = torch.ones(num_future, dtype=torch.bool, device=kept.device)
+                    keep_mask[kept] = False
+                    drop_idx = torch.nonzero(keep_mask).flatten()
+                    half = int(grid.width) // 2
+                    view_of = lambda idx: ((idx % f0) % int(grid.width) >= half).long()  # noqa: E731
+                    group_of = lambda idx: (idx // f0) * 2 + view_of(idx)  # noqa: E731
+                    src = drop_idx % f0
+                    src_u, inv = torch.unique(src, return_inverse=True)
+                    g_drop, g_kept = group_of(drop_idx), group_of(kept)
+                    present = set(int(g) for g in g_kept.tolist())
+                    groups, fb_other, fb_zero = [], 0, 0
+                    for g in sorted(set(int(x) for x in g_drop.tolist())):
+                        g_src = g if g in present else (g ^ 2 if (g ^ 2) in present else None)
+                        if g_src is None:
+                            fb_zero += 1
+                            continue
+                        fb_other += int(g_src != g)
+                        groups.append((g_src, g_kept == g_src, g_drop == g))
+                    rc = {"n": int(drop_idx.numel()), "dropped": drop_idx, "src": src, "src_u": src_u, "inv": inv,
+                          "kept_src": kept % f0, "view": view_of(drop_idx), "groups": groups,
+                          "freqs": self._future_freqs(pre_v, drop_idx, f0)}
+                    rc["view_masks"] = [(v, rc["view"] == v) for v in (0, 1) if bool((rc["view"] == v).any())]
+                    diag["recon"] = {"mode": recon, "dropped": rc["n"], "dropped_per_view": [int((rc["view"] == v).sum()) for v in (0, 1)],
+                                     "groups_with_dropped": len(set(int(x) for x in g_drop.tolist())),
+                                     "fallback_other_frame": fb_other if recon == "r1" else 0,
+                                     "fallback_zero": fb_zero if recon == "r1" else 0,
+                                     "r2_proj_tokens": int(src_u.numel()) if recon == "r2" else 0}
                 if summary and s == prune.warmup_steps - 1:
                     keep_mask = torch.ones(num_future, dtype=torch.bool, device=kept.device)
                     keep_mask[kept] = False
@@ -942,11 +1104,19 @@ class JointCaseStudyRunner:
             diag["motion_steps_f32"] = _f32_b64(torch.stack(motion_rows))  # [steps, tokens of frame 1]
         diag["paths"] = {"action_eager": steer is not None, "video_eager": video_eager, "oracle_kv": oracle is not None,
                          "action_full_kv": full_kv, "video_full_kv": video_full_kv, "dense_bias": dense_bias,
-                         "steer_video": steer_v is not None}
+                         "steer_video": steer_v is not None, "recon": recon}
+        if want_rq:
+            # [k, v, k of dense step 0 (V2's reuse), v of dense step 0] x step x layer x view (agentview, wrist):
+            # mean cosine to the dense K / V of the same step over the dropped tokens of the view.
+            diag["recon_quality_f32"] = _f32_b64(rq)
+            diag["recon_quality_shape"] = list(rq.shape)
+            diag["recon_checks"] = {k: {"max_abs_diff": float(v[0]), "max_abs_true": float(v[1])} for k, v in checks.items()}
         # Relative compute (token passes + attention): per step [video queries, video keys, action
         # queries, action keys] at layer 0, the parameter counts and the context length.
         diag["cost"] = {**self._cost_model(), "attn_dim": cost_dim, "ctx": int(context.shape[1]), "f0": int(f0),
                         "steps": cost_steps, "oracle_pass": oracle is not None}
+        if recon is not None:  # R2: frame-0 positions through W_k / W_v per layer, per step
+            diag["cost"]["recon_proj_tokens"] = cost_recon
         if dump is not None:
             arrays = {"seed": np.int64(seed), "modes": np.asarray(modes), "grid": np.asarray(diag["grid"]),
                       "kept_index": kept.cpu().numpy(), "action_latents": torch.stack(d_latents).numpy()}

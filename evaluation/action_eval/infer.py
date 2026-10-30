@@ -484,7 +484,8 @@ class FastWAMJointPolicy:
                 entry = {"seed": int(seed), **self._chunk_logs(action)}
                 for key in ("kept_index", "steer", "future_share_f32", "future_share_step", "motion_f32", "layer_act",
                             "steer_video", "video_frame0_f32", "motion_steps_f32", "paths", "cost", "modes",
-                            "summary", "cache_kv_bytes"):
+                            "summary", "cache_kv_bytes", "recon", "recon_quality_f32", "recon_quality_shape",
+                            "recon_checks"):
                     if d.get(key) is not None:
                         entry[key] = d[key]
                 out[f"{name}@{offset}"] = entry
