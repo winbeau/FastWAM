@@ -56,6 +56,15 @@ Options (``policy.options``):
 ``hash_checkpoint``      default true.
 ``checkpoint_sha256``    optional expected digest; a mismatch is fatal.
 
+``hybrid``               optional {mode, partner, calls, eps_d, eps_theta, executed, limit}: hybrid execution of the
+                         component study (``fastwam/casestudy/hybrid.py``). On the selected calls the ``partner`` arm
+                         (normally S0) also runs on the same observation and per-call seed, with the executed arm's
+                         layer choice, and the executed chunk becomes ``hybrid.mix(dense, partner, mode)`` in simulator
+                         units (gripper binarized). ``calls``: ``all``, ``{first: m}`` (calls 0..m-1), ``{every: n}``
+                         (calls 0, n, 2n, ...) or ``plan`` (the episode plan's ``hybrid_calls``). Other calls run the
+                         executed arm alone. ``diagnostics.hybrid`` logs the selection, the norms, skips, clipping and
+                         the partner's chunks.
+
 An arm with ``casestudy.agc`` (pilot + automatic gain, ``fastwam/casestudy/agc.py``) has its de-normalized
 chunk rescaled here, for the executed arm, the shadow and the probes alike: ``cont_actions_f32`` and the
 executed actions are the rescaled chunk, ``raw_actions_f32`` stays the model's normalized output, and
@@ -174,6 +183,7 @@ class FastWAMJointPolicy:
 
         from experiments.libero import policy_io
         from fastwam.casestudy import agc as agc_mod
+        from fastwam.casestudy import hybrid as hybrid_mod
         from fastwam.casestudy import call_seed, make_runner, parse_config
         from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
         from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
@@ -184,6 +194,7 @@ class FastWAMJointPolicy:
         self._torch = torch
         self._io = policy_io
         self._agc_mod = agc_mod
+        self._hybrid_mod = hybrid_mod
         self._call_seed = call_seed
         self._prompt_template = DEFAULT_PROMPT
         self.device = device
@@ -267,6 +278,25 @@ class FastWAMJointPolicy:
         self.seed_offset_per_repeat = bool(options.get("seed_offset_per_repeat", False))
         if (self.probes or self.seed_offset_per_repeat) and self.casestudy.seed_mode != "episode_call_hash":
             raise ValueError("probe_arms and seed_offset_per_repeat need seed_mode=episode_call_hash")
+        self.hybrid = None
+        self.hybrid_runner = None
+        if options.get("hybrid") is not None:
+            h = dict(options["hybrid"])
+            unknown = sorted(set(h) - {"mode", "partner", "calls", "eps_d", "eps_theta", "executed", "limit"})
+            if unknown:
+                raise ValueError(f"unknown keys in hybrid: {unknown}")
+            calls = h.get("calls", "all")
+            ok_calls = calls in ("all", "plan") or (isinstance(calls, dict) and len(calls) == 1 and (
+                int(calls.get("first", 0)) >= 1 or int(calls.get("every", 0)) >= 1))
+            if h.get("mode") not in hybrid_mod.MODES or not ok_calls or h.get("partner") is None:
+                raise ValueError(f"hybrid needs mode in {hybrid_mod.MODES}, a partner arm and calls all / plan / "
+                                 f"{{first: m}} / {{every: n}}, got {h}")
+            self.hybrid = {"mode": str(h["mode"]), "calls": calls, "eps_d": float(h.get("eps_d", 0.0)),
+                           "eps_theta": float(h.get("eps_theta", 0.0)), "executed": int(h.get("executed", 10)),
+                           "limit": float(h.get("limit", 1.0))}
+            self.hybrid_runner = make_runner(self.model, parse_config(h["partner"]), prompt_store=self.prompt_store)
+            if self.casestudy.seed_mode != "episode_call_hash":
+                raise ValueError("hybrid needs seed_mode=episode_call_hash")
         self._repeat_offset = 0
         self.episode_plans = {}
         self.episode_plans_sha256 = None
@@ -315,6 +345,7 @@ class FastWAMJointPolicy:
             "probe_seed_offsets": self.probe_seed_offsets if self.probes else None,
             "probe_calls": None if self.probe_calls is None else sorted(self.probe_calls),
             "seed_offset_per_repeat": self.seed_offset_per_repeat,
+            "hybrid": None if self.hybrid is None else {**self.hybrid, "partner": self.hybrid_runner.cfg.describe()},
         }
         notes = (
             "FastWAM-Joint through its native Hydra build and shared policy_io transforms; the benchmark "
@@ -340,6 +371,8 @@ class FastWAMJointPolicy:
             runner.reset_episode()
         for _name, runner in self.probes:
             runner.reset_episode()
+        if self.hybrid_runner is not None:
+            self.hybrid_runner.reset_episode()
         self.predict_calls = 0
         self._repeat_offset = int(episode.get("repeat") or 0) if self.seed_offset_per_repeat else 0
         # Seed key = (instruction, task, init, protocol seed); the repeat index is left out so
@@ -351,6 +384,8 @@ class FastWAMJointPolicy:
         self._episode_id = episode_id
         self._episode_key = f"{episode.get('instruction', '')}|{_re.sub(r'-r[0-9]+', '', episode_id)}"
         self._plan = self.episode_plans.get(episode_id, {})
+        if self.hybrid is not None and self.hybrid["calls"] == "plan" and "hybrid_calls" not in self._plan:
+            raise ValueError(f"hybrid calls: plan, but the episode plan of {episode_id} has no hybrid_calls")
 
     def predict(self, observation: dict) -> Prediction:
         torch = self._torch
@@ -394,12 +429,17 @@ class FastWAMJointPolicy:
         actions = self._io.postprocess_action(action.clone(), self.processor, binarize_gripper=self.binarize_gripper)
         actions = np.asarray(actions, dtype=np.float32)
         cont, actions, agc_log = self._agc(runner.cfg, diag, self._continuous(action), actions)
+        hybrid_log = None
+        if self.hybrid is not None:
+            actions, hybrid_log = self._hybrid_call(runner, call_index, prompt, image, proprio, seed, actions)
         if not np.isfinite(actions).all():
             raise ValueError("FastWAM produced non-finite actions")
         self.predict_calls += 1
         diag.update({"call_index": call_index, "model_seconds": round(model_seconds, 6)})
         diag.update(self._chunk_logs(action, cont))
         diag.update(agc_log)
+        if hybrid_log is not None:
+            diag["hybrid"] = hybrid_log
         if diag.get("kept_index") is not None and diag.get("grid") is not None:
             per_frame = int(diag["grid"][1]) * int(diag["grid"][2])
             diag["kept_frame"] = [int(i) // per_frame + 1 for i in diag["kept_index"]]
@@ -421,6 +461,38 @@ class FastWAMJointPolicy:
             timing={"predict_seconds": round(time.perf_counter() - started, 6), "model_seconds": round(model_seconds, 6)},
             diagnostics=diag,
         )
+
+    def _hybrid_call(self, runner, call_index: int, prompt, image, proprio, seed: int, actions: np.ndarray):
+        """Component study: on a selected call run the partner arm on the same input and seed (with the executed
+        arm's layer choice) and return ``hybrid.mix`` of the two simulator chunks -> (actions, log)."""
+        h = self.hybrid
+        calls = h["calls"]
+        if calls == "all":
+            selected = True
+        elif calls == "plan":
+            selected = call_index in {int(x) for x in self._plan["hybrid_calls"]}
+        elif "first" in calls:
+            selected = call_index < int(calls["first"])
+        else:
+            selected = call_index % int(calls["every"]) == 0
+        if not selected:
+            return actions, {"selected": False}
+        partner = self.hybrid_runner
+        layers = getattr(runner, "_layers", None)
+        if layers is not None and int(layers.get("act", -1)) >= 0:
+            partner._layers = dict(layers)
+        a_s, d_s = partner.infer_action(
+            prompt=prompt, input_image=image, proprio=proprio,
+            action_horizon=self.action_horizon, num_video_frames=self.num_video_frames,
+            seed=seed, sigma_shift=self.sigma_shift, rand_device=self.rand_device,
+        )
+        sim_s = np.asarray(
+            self._io.postprocess_action(a_s.clone(), self.processor, binarize_gripper=self.binarize_gripper), dtype=np.float32
+        )
+        out, info = self._hybrid_mod.mix(actions, sim_s, h["mode"], h["eps_d"], h["eps_theta"], h["executed"], h["limit"])
+        log = {"selected": True, **info, "partner_kept_index": d_s.get("kept_index"),
+               **{f"partner_{k}": v for k, v in self._chunk_logs(a_s).items()}}
+        return out, log
 
     def _runner_for_call(self, call_index: int):
         """Base runner, or the episode plan's override for this call."""
