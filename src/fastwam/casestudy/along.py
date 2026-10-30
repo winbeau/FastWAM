@@ -63,11 +63,12 @@ def project(points: np.ndarray, e: np.ndarray) -> tuple[float, np.ndarray, float
 
 
 def angle(u: np.ndarray, v: np.ndarray) -> float | None:
-    """Angle between two vectors in degrees; None when either is zero."""
-    nu, nv = float(np.linalg.norm(u)), float(np.linalg.norm(v))
-    if nu == 0.0 or nv == 0.0:
+    """Angle between two 3-vectors in degrees (atan2 of |u x v| and u . v: accurate near 0 and 180); None when either is
+    zero."""
+    u, v = np.asarray(u, dtype=np.float64), np.asarray(v, dtype=np.float64)
+    if not np.any(u) or not np.any(v):
         return None
-    return float(np.degrees(np.arccos(np.clip(float(np.asarray(u) @ np.asarray(v)) / (nu * nv), -1.0, 1.0))))
+    return float(np.degrees(np.arctan2(np.linalg.norm(np.cross(u, v)), float(u @ v))))
 
 
 def measure(a_d: np.ndarray, endpoint: np.ndarray, executed: int = 10) -> dict:
