@@ -56,14 +56,15 @@ Options (``policy.options``):
 ``hash_checkpoint``      default true.
 ``checkpoint_sha256``    optional expected digest; a mismatch is fatal.
 
-``hybrid``               optional {mode, partner, calls, eps_d, eps_theta, executed, limit}: hybrid execution of the
-                         component study (``fastwam/casestudy/hybrid.py``). On the selected calls the ``partner`` arm
-                         (normally S0) also runs on the same observation and per-call seed, with the executed arm's
+``hybrid``               optional {mode, partner, calls, eps_d, eps_theta, executed, limit, partner_seed_offset}: hybrid
+                         execution of the component study (``fastwam/casestudy/hybrid.py``). On the selected calls the
+                         ``partner`` arm (normally S0) also runs on the same observation and per-call seed, with the executed arm's
                          layer choice, and the executed chunk becomes ``hybrid.mix(dense, partner, mode)`` in simulator
                          units (gripper binarized). ``calls``: ``all``, ``{first: m}`` (calls 0..m-1), ``{every: n}``
                          (calls 0, n, 2n, ...) or ``plan`` (the episode plan's ``hybrid_calls``). Other calls run the
                          executed arm alone. ``diagnostics.hybrid`` logs the selection, the norms, skips, clipping and
-                         the partner's chunks.
+                         the partner's chunks. ``partner_seed_offset`` (along-cross placebo) gives the partner its own
+                         per-call seed offset instead of the executed arm's seed.
 
 ``inject_future``        optional {frames_dir, deltas, seeds, sparse, decode_dir}: future-injection probes. The executed
                          arm replays a dense rollout whose per-step observations were re-rendered into
@@ -291,7 +292,8 @@ class FastWAMJointPolicy:
         self.hybrid_runner = None
         if options.get("hybrid") is not None:
             h = dict(options["hybrid"])
-            unknown = sorted(set(h) - {"mode", "partner", "calls", "eps_d", "eps_theta", "executed", "limit"})
+            unknown = sorted(set(h) - {"mode", "partner", "calls", "eps_d", "eps_theta", "executed", "limit",
+                                       "partner_seed_offset"})
             if unknown:
                 raise ValueError(f"unknown keys in hybrid: {unknown}")
             calls = h.get("calls", "all")
@@ -303,6 +305,8 @@ class FastWAMJointPolicy:
             self.hybrid = {"mode": str(h["mode"]), "calls": calls, "eps_d": float(h.get("eps_d", 0.0)),
                            "eps_theta": float(h.get("eps_theta", 0.0)), "executed": int(h.get("executed", 10)),
                            "limit": float(h.get("limit", 1.0))}
+            if h.get("partner_seed_offset") is not None:  # along-cross placebo: the partner draws its own noise
+                self.hybrid["partner_seed_offset"] = int(h["partner_seed_offset"])
             self.hybrid_runner = make_runner(self.model, parse_config(h["partner"]), prompt_store=self.prompt_store)
             if self.casestudy.seed_mode != "episode_call_hash":
                 raise ValueError("hybrid needs seed_mode=episode_call_hash")
@@ -574,6 +578,8 @@ class FastWAMJointPolicy:
         layers = getattr(runner, "_layers", None)
         if layers is not None and int(layers.get("act", -1)) >= 0:
             partner._layers = dict(layers)
+        if h.get("partner_seed_offset") is not None:
+            seed = self._call_seed(self._episode_key, call_index, h["partner_seed_offset"] + self._repeat_offset)
         a_s, d_s = partner.infer_action(
             prompt=prompt, input_image=image, proprio=proprio,
             action_horizon=self.action_horizon, num_video_frames=self.num_video_frames,
