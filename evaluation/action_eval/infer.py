@@ -65,6 +65,15 @@ Options (``policy.options``):
                          executed arm alone. ``diagnostics.hybrid`` logs the selection, the norms, skips, clipping and
                          the partner's chunks.
 
+``inject_future``        optional {frames_dir, deltas, seeds, sparse, decode_dir}: future-injection probes. The executed
+                         arm replays a dense rollout whose per-step observations were re-rendered into
+                         ``<frames_dir>/<episode>.npz`` (``agentview`` / ``wrist`` [steps + 1, H, W, 3], frame k = after k
+                         executed steps; ``deltas``; ``call_ok`` [calls]; ``valid`` [calls, deltas]). On every ``call_ok``
+                         call and seed offset: dense (normal), ``sparse`` (normal), F_dense (``infer_inject`` with dense's
+                         final future latents) and, for each valid delta, F_real (the clip of the current frame and frames
+                         t + round(4 i delta), i = 1..8, through the VAE, injected). ``decode_dir`` saves dense's decoded
+                         future at seed offset 0. Logged in ``diagnostics.inject``.
+
 An arm with ``casestudy.agc`` (pilot + automatic gain, ``fastwam/casestudy/agc.py``) has its de-normalized
 chunk rescaled here, for the executed arm, the shadow and the probes alike: ``cont_actions_f32`` and the
 executed actions are the rescaled chunk, ``raw_actions_f32`` stays the model's normalized output, and
@@ -297,6 +306,20 @@ class FastWAMJointPolicy:
             self.hybrid_runner = make_runner(self.model, parse_config(h["partner"]), prompt_store=self.prompt_store)
             if self.casestudy.seed_mode != "episode_call_hash":
                 raise ValueError("hybrid needs seed_mode=episode_call_hash")
+        self.inject = None
+        self.inject_sparse = None
+        self._inject_frames = None
+        if options.get("inject_future") is not None:
+            f = dict(options["inject_future"])
+            unknown = sorted(set(f) - {"frames_dir", "deltas", "seeds", "sparse", "decode_dir"})
+            if unknown or not f.get("frames_dir") or f.get("sparse") is None:
+                raise ValueError(f"inject_future needs frames_dir and sparse (unknown keys: {unknown})")
+            self.inject = {"frames_dir": Path(str(f["frames_dir"])), "deltas": [float(x) for x in f.get("deltas") or ()],
+                           "seeds": [int(x) for x in f.get("seeds") or [0]],
+                           "decode_dir": None if not f.get("decode_dir") else Path(str(f["decode_dir"]))}
+            self.inject_sparse = make_runner(self.model, parse_config(f["sparse"]), prompt_store=self.prompt_store)
+            if self.casestudy.seed_mode != "episode_call_hash" or self.casestudy.method != "dense":
+                raise ValueError("inject_future needs a dense executed arm with seed_mode=episode_call_hash")
         self._repeat_offset = 0
         self.episode_plans = {}
         self.episode_plans_sha256 = None
@@ -346,6 +369,9 @@ class FastWAMJointPolicy:
             "probe_calls": None if self.probe_calls is None else sorted(self.probe_calls),
             "seed_offset_per_repeat": self.seed_offset_per_repeat,
             "hybrid": None if self.hybrid is None else {**self.hybrid, "partner": self.hybrid_runner.cfg.describe()},
+            "inject_future": None if self.inject is None else {
+                **{k: str(v) if isinstance(v, Path) else v for k, v in self.inject.items()},
+                "sparse": self.inject_sparse.cfg.describe()},
         }
         notes = (
             "FastWAM-Joint through its native Hydra build and shared policy_io transforms; the benchmark "
@@ -386,6 +412,15 @@ class FastWAMJointPolicy:
         self._plan = self.episode_plans.get(episode_id, {})
         if self.hybrid is not None and self.hybrid["calls"] == "plan" and "hybrid_calls" not in self._plan:
             raise ValueError(f"hybrid calls: plan, but the episode plan of {episode_id} has no hybrid_calls")
+        if self.inject is not None:
+            self.inject_sparse.reset_episode()
+            path = self.inject["frames_dir"] / f"{_re.sub(r'-r[0-9]+.*$', '', episode_id)}.npz"
+            if not path.is_file():
+                raise FileNotFoundError(f"inject_future: no rendered frames {path}")
+            with np.load(path) as z:
+                self._inject_frames = {k: z[k] for k in ("agentview", "wrist", "deltas", "call_ok", "valid")}
+            if [float(x) for x in self._inject_frames["deltas"]] != self.inject["deltas"]:
+                raise ValueError(f"inject_future: {path} has deltas {self._inject_frames['deltas']}, not {self.inject['deltas']}")
 
     def predict(self, observation: dict) -> Prediction:
         torch = self._torch
@@ -418,10 +453,12 @@ class FastWAMJointPolicy:
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         model_started = time.perf_counter()
+        video_cap = {} if self.inject is not None else None
         action, diag = runner.infer_action(
             prompt=prompt, input_image=image, proprio=proprio,
             action_horizon=self.action_horizon, num_video_frames=self.num_video_frames,
             seed=seed, sigma_shift=self.sigma_shift, rand_device=self.rand_device,
+            **({"_capture_video": video_cap} if video_cap is not None else {}),
         )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -456,11 +493,67 @@ class FastWAMJointPolicy:
             diag["shadow"] = self._shadow_metrics(prompt, image, proprio, shadow_seed, action, actions)
         if self.probes and (self.probe_calls is None or call_index in self.probe_calls):
             diag["probes"] = self._probe_metrics(prompt, image, proprio, call_index)
+        if self.inject is not None:
+            diag["inject"] = self._inject_call(runner, call_index, prompt, image, proprio, images, action, video_cap)
         return Prediction(
             actions=actions,
             timing={"predict_seconds": round(time.perf_counter() - started, 6), "model_seconds": round(model_seconds, 6)},
             diagnostics=diag,
         )
+
+    def _inject_call(self, runner, call_index: int, prompt, image, proprio, images: dict, dense_action, video_cap) -> dict:
+        """Future-injection probes of one call (option ``inject_future``): dense, sparse, F_dense and F_real(delta) at every
+        seed offset, on the observation of the replayed dense rollout."""
+        torch = self._torch
+        fr, inj = self._inject_frames, self.inject
+        if call_index >= len(fr["call_ok"]) or not bool(fr["call_ok"][call_index]):
+            return {"used": False}
+        t = 10 * call_index  # frame index of this call's observation: after 10 c executed steps
+        out: dict = {"used": True, "valid": [bool(x) for x in fr["valid"][call_index]],
+                     "current_frame_equal": bool(np.array_equal(fr["agentview"][t], images["agentview"])
+                                                 and np.array_equal(fr["wrist"][t], images["wrist"]))}
+
+        def model_frame(j: int):
+            rgb = self._io.compose_model_image(fr["agentview"][j], fr["wrist"][j], processor=self.processor,
+                                               concatenation=self.concatenation, width=self.input_w, height=self.input_h)
+            return self._io.image_to_model_tensor(rgb, device=self.device, dtype=self.model.torch_dtype)
+
+        first = self.model._encode_input_image_latents_tensor(input_image=image, tiled=False)
+        latents: dict[float, object] = {}
+        for k, delta in enumerate(inj["deltas"]):
+            if out["valid"][k]:
+                clip = torch.cat([image] + [model_frame(t + int(round(4 * i * delta))) for i in range(1, 9)], dim=0)
+                latents[delta] = runner.encode_clip(clip)
+        if latents:
+            out["frame0_latent_max_abs"] = max(float((z[:, :, 0:1].float() - first.float()).abs().max()) for z in latents.values())
+            out["frame0_latent_scale"] = float(first.float().abs().max())
+        layers = getattr(runner, "_layers", None)
+        entries = {}
+        common = dict(prompt=prompt, input_image=image, proprio=proprio, action_horizon=self.action_horizon,
+                      num_video_frames=self.num_video_frames, sigma_shift=self.sigma_shift, rand_device=self.rand_device)
+        for j in inj["seeds"]:
+            seed = self._call_seed(self._episode_key, call_index, j + self._repeat_offset)
+            if j == 0 and video_cap:
+                a_d, vid = dense_action, video_cap["latents"]
+            else:
+                cap: dict = {}
+                a_d, _ = runner.infer_action(seed=seed, _capture_video=cap, **common)
+                vid = cap["latents"]
+            entries[f"dense@{j}"] = self._chunk_logs(a_d)
+            if layers is not None and int(layers.get("act", -1)) >= 0:
+                self.inject_sparse._layers = dict(layers)
+            a_s, d_s = self.inject_sparse.infer_action(seed=seed, **common)
+            entries[f"S0@{j}"] = {**self._chunk_logs(a_s), "kept_count": d_s.get("kept_count")}
+            a_f, d_f = runner.infer_inject(seed=seed, future_latents=vid[:, :, 1:], **common)
+            entries[f"Fd@{j}"] = {**self._chunk_logs(a_f), "cost": d_f["cost"]}
+            for delta, z in latents.items():
+                a_r, _ = runner.infer_inject(seed=seed, future_latents=z[:, :, 1:], **common)
+                entries[f"Fr{delta:g}@{j}"] = self._chunk_logs(a_r)
+            if j == 0 and inj["decode_dir"] is not None:
+                inj["decode_dir"].mkdir(parents=True, exist_ok=True)
+                np.savez_compressed(inj["decode_dir"] / f"{self._episode_id}-c{call_index:02d}.npz", dense_future=runner.decode_video(vid))
+        out["entries"] = entries
+        return out
 
     def _hybrid_call(self, runner, call_index: int, prompt, image, proprio, seed: int, actions: np.ndarray):
         """Component study: on a selected call run the partner arm on the same input and seed (with the executed

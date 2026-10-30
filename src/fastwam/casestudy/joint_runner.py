@@ -391,6 +391,7 @@ class JointCaseStudyRunner:
         sigma_shift: Optional[float] = None,
         rand_device: str = "cpu",
         _capture_kv: Optional[dict] = None,
+        _capture_video: Optional[dict] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         cfg = self.cfg
         model = self.model
@@ -1172,6 +1173,118 @@ class JointCaseStudyRunner:
                 arrays["video"] = np.stack([np.asarray(f) for f in frames])
             _write_npz(Path(dump.path), arrays)
             diag["dump_path"] = dump.path
+        if _capture_video is not None:  # future-inject: the final (clean) video latents, for F_dense
+            _capture_video["latents"] = latents_video.detach().clone()
+        return latents_action[0].detach().to(device="cpu", dtype=torch.float32), diag
+
+    # ------------------------------------------------------------------ future injection
+    @torch.no_grad()
+    def encode_clip(self, frames: torch.Tensor) -> torch.Tensor:
+        """VAE latents [1, z, 3, h, w] of a clip [9, 3, H, W] (current frame + 8 future frames, model input range), the
+        way training encodes its video clips."""
+        video = frames.permute(1, 0, 2, 3).unsqueeze(0).to(device=self.model.device, dtype=self.model.torch_dtype)
+        return self.model._encode_video_latents(video)
+
+    @torch.no_grad()
+    def decode_video(self, latents: torch.Tensor) -> np.ndarray:
+        """Decoded frames [T, H, W, 3] uint8 of video latents [1, z, t, h, w]."""
+        return np.stack([np.asarray(f) for f in self.model._decode_latents(latents)])
+
+    @torch.no_grad()
+    def infer_inject(
+        self,
+        prompt: str,
+        input_image: torch.Tensor,
+        proprio: Optional[torch.Tensor],
+        action_horizon: int,
+        num_video_frames: int,
+        seed: int,
+        future_latents: torch.Tensor,
+        sigma_shift: Optional[float] = None,
+        rand_device: str = "cpu",
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """inject_future: the two future latent frames fixed to ``future_latents`` [1, z, 2, h, w], clean (timestep 0 for
+        every video token); frame 0 and its prefill as on the normal path. Only the action stream is denoised, with the
+        normal path's schedule, noise (the action generator of ``seed``), text and proprio. The video tokens' inputs never
+        change, so their per-layer K/V are computed once (the same numbers as resetting them after every step)."""
+        model = self.model
+        steps = int(self.cfg.num_inference_steps)
+        model.eval()
+        if input_image.ndim == 3:
+            input_image = input_image.unsqueeze(0)
+        _, _, height, width = input_image.shape
+        if proprio is not None:
+            proprio = proprio.reshape(1, -1).to(device=model.device, dtype=model.torch_dtype)
+        vae = model.vae
+        latent_t = (num_video_frames - 1) // vae.temporal_downsample_factor + 1
+        latent_h, latent_w = height // vae.upsampling_factor, width // vae.upsampling_factor
+        patch = self.video.patch_size
+        grid = sel.Grid(frames=latent_t // int(patch[0]), height=latent_h // int(patch[1]), width=latent_w // int(patch[2]))
+        f0 = grid.per_frame
+        if tuple(future_latents.shape[2:]) != (latent_t - 1, latent_h, latent_w):
+            raise ValueError(f"future latents {tuple(future_latents.shape)} do not match the grid ({latent_t - 1}, {latent_h}, {latent_w})")
+        # The normal path draws the video noise from its own generator: the action noise is the same draw here.
+        gen_a = torch.Generator(device=rand_device).manual_seed(int(seed))
+        latents_action = torch.randn(
+            (1, action_horizon, self.action.action_dim), generator=gen_a, device=rand_device, dtype=torch.float32
+        ).to(device=model.device, dtype=model.torch_dtype)
+        input_image = input_image.to(device=model.device, dtype=model.torch_dtype)
+        first = model._encode_input_image_latents_tensor(input_image=input_image, tiled=False)
+        fuse = bool(getattr(self.video, "fuse_vae_embedding_in_latents", False))
+        context, context_mask, num_text = self._encode_prompt(prompt)
+        if proprio is not None:
+            context, context_mask = model._append_proprio_to_context(context=context, context_mask=context_mask, proprio=proprio)
+        t_video, _ = model.infer_video_scheduler.build_inference_schedule(
+            num_inference_steps=steps, device=model.device, dtype=first.dtype,
+            shift_override=sigma_shift if self.cfg.video_sigma_shift is None else self.cfg.video_sigma_shift,
+        )
+        t_action, d_action = model.infer_action_scheduler.build_inference_schedule(
+            num_inference_steps=steps, device=model.device, dtype=latents_action.dtype, shift_override=sigma_shift
+        )
+        pre0 = self.video.pre_dit(
+            x=first, timestep=t_video[0].unsqueeze(0).to(dtype=first.dtype, device=model.device),
+            context=context, context_mask=context_mask, action=None, fuse_vae_embedding_in_latents=fuse,
+        )
+        kv0, _ = self._prefill_frame0(pre0, num_text, set())
+        latents_video = torch.cat([first, future_latents.to(device=model.device, dtype=first.dtype)], dim=2)
+        pre_v = self.video.pre_dit(
+            x=latents_video, timestep=torch.zeros(1, dtype=first.dtype, device=model.device), context=context,
+            context_mask=context_mask, action=None, fuse_vae_embedding_in_latents=fuse,
+        )
+        xv = pre_v["tokens"][:, f0:]
+        freqs_v, tmod_v = pre_v["freqs"][f0:], pre_v["t_mod"][:, f0:]
+        payload_v = {"context": pre_v["context"], "mask": pre_v["context_mask"][:, f0:]}
+        kv_fut = []
+        for layer in range(self.num_layers):
+            bv = self.video.blocks[layer]
+            io_v = self.mot._build_expert_attention_io(expert=self.video, block=bv, x=xv, freqs=freqs_v, t_mod=tmod_v)
+            out_v = flash_attention(q=io_v[0], k=torch.cat([kv0[layer]["k"], io_v[1]], dim=1),
+                                    v=torch.cat([kv0[layer]["v"], io_v[2]], dim=1), num_heads=self.num_heads)
+            kv_fut.append((io_v[1], io_v[2]))
+            xv = self._post(bv, io_v, out_v, payload_v)
+        n_fut = int(xv.shape[1])
+        cost_steps = [[n_fut, f0 + n_fut, 0, 0]]  # the one video pass of the clean future
+        for s in range(steps):
+            ts_a = t_action[s].unsqueeze(0).to(dtype=latents_action.dtype, device=model.device)
+            pre_a = self.action.pre_dit(action_tokens=latents_action, timestep=ts_a, context=context, context_mask=context_mask)
+            xa = pre_a["tokens"]
+            payload_a = {"context": pre_a["context"], "mask": pre_a["context_mask"]}
+            for layer in range(self.num_layers):
+                ba = self.action.blocks[layer]
+                io_a = self.mot._build_expert_attention_io(
+                    expert=self.action, block=ba, x=xa, freqs=pre_a["freqs"], t_mod=pre_a["t_mod"]
+                )
+                k_all = torch.cat([kv0[layer]["k"], kv_fut[layer][0], io_a[1]], dim=1)
+                v_all = torch.cat([kv0[layer]["v"], kv_fut[layer][1], io_a[2]], dim=1)
+                out_a = flash_attention(q=io_a[0], k=k_all, v=v_all, num_heads=self.num_heads)
+                if layer == 0:
+                    cost_steps.append([0, 0, int(io_a[0].shape[1]), int(k_all.shape[1])])
+                xa = self._post(ba, io_a, out_a, payload_a)
+            pred_action = self.action.post_dit(xa, pre_a)
+            latents_action = model.infer_action_scheduler.step(pred_action, d_action[s], latents_action)
+        diag = {"path": "inject_future", "seed": int(seed), "steps": steps, "grid": [int(grid.frames), int(grid.height), int(grid.width)],
+                "cost": {**self._cost_model(), "attn_dim": int(io_a[0].shape[-1]), "ctx": int(context.shape[1]), "f0": int(f0),
+                         "steps": cost_steps, "oracle_pass": False}}
         return latents_action[0].detach().to(device="cpu", dtype=torch.float32), diag
 
 
