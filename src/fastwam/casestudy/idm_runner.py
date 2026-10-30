@@ -17,6 +17,8 @@ Arms (``config.py``):
              stage-1 step-0 video K/V -- CF-Prune's "score on the first, noisiest pass".
 ``teacache`` residual reuse over the video stack on stage-1 steps.
 ``noise``    Gaussian noise on the stage-2 action attention output.
+``prune.reuse_step0_kv`` (V2-k0, keep_ratio 0): future tokens are computed on stage-1 step 0 only (latents keep
+             that velocity) and the action stage reads those step-0 future K/V; there is no stage-2 re-encode.
 Fewer steps is ``dense`` with a smaller ``num_inference_steps`` (both stages).
 ``frame0_cache=false`` (dense only) calls the native ``infer_action`` unchanged; so does
 ``action_infer_mode=first_frame`` (dense only), the release's Fast-WAM mode without future imagination.
@@ -207,6 +209,8 @@ class IDMCaseStudyRunner:
         modes, tea_rel = [], []
         diag: dict[str, Any] = {"path": "casestudy-idm", "seed": int(seed), "steps": steps, "method": cfg.method}
         probe_probs: dict[int, torch.Tensor] = {}
+        v2k0 = prune is not None and prune.reuse_step0_kv
+        kv_step0 = None
         for s in range(steps):
             ts_v = t_video[s].unsqueeze(0).to(dtype=latents_video.dtype, device=model.device)
             xt, tt, tmodt, ctxt, ctxmt, freqst, f, h, w, _tpf = self.video.prepare(
@@ -229,23 +233,28 @@ class IDMCaseStudyRunner:
                 tea_prev = signal
             idx_rel = kept if mode == "pruned" else all_future
             idx_abs = idx_rel + f0
-            xv_in = xt[:, idx_abs]
-            if mode == "skip":
-                xv = xv_in + tea_res
-                tea_cons += 1
-            else:
-                need_kv = s == 0 and probe
-                xv, kv_step = self._video_layers(xv_in, freqst[idx_abs], tmodt[:, idx_abs], ctxt, ctxmt[:, idx_abs], kv0, keep_kv=need_kv)
-                if tea is not None:
-                    tea_res, tea_acc, tea_cons = xv - xv_in, 0.0, 0
-                if need_kv:
-                    # Probe: one action pass at the first action timestep against step-0 video K/V.
-                    ts_a0 = t_action[0].unsqueeze(0).to(dtype=latents_action.dtype, device=model.device)
-                    _pred, probe_probs = self._action_layers(latents_action, ts_a0, context, context_mask, kv_step, act_layers)
-            part = self.video.head(xv, tt[:, idx_abs])
-            if vel is None:
-                vel = torch.zeros((1, f0 + num_future, part.shape[-1]), device=part.device, dtype=part.dtype)
-            vel[:, idx_abs] = part
+            if idx_rel.numel():  # V2-k0: no future token after step 0, the latents keep step 0's velocity
+                xv_in = xt[:, idx_abs]
+                if mode == "skip":
+                    xv = xv_in + tea_res
+                    tea_cons += 1
+                else:
+                    need_kv = s == 0 and (probe or v2k0)
+                    xv, kv_step = self._video_layers(xv_in, freqst[idx_abs], tmodt[:, idx_abs], ctxt, ctxmt[:, idx_abs], kv0,
+                                                     keep_kv=need_kv)
+                    if tea is not None:
+                        tea_res, tea_acc, tea_cons = xv - xv_in, 0.0, 0
+                    if need_kv and probe:
+                        # Probe: one action pass at the first action timestep against step-0 video K/V.
+                        ts_a0 = t_action[0].unsqueeze(0).to(dtype=latents_action.dtype, device=model.device)
+                        _pred, probe_probs = self._action_layers(latents_action, ts_a0, context, context_mask, kv_step,
+                                                                 act_layers)
+                    if need_kv and v2k0:
+                        kv_step0 = kv_step
+                part = self.video.head(xv, tt[:, idx_abs])
+                if vel is None:
+                    vel = torch.zeros((1, f0 + num_future, part.shape[-1]), device=part.device, dtype=part.dtype)
+                vel[:, idx_abs] = part
             latents_video = model.infer_video_scheduler.step(self.video.unpatchify(vel, (f, h, w)), d_video[s], latents_video)
             latents_video[:, :, 0:1] = first.clone()
             modes.append(mode)
@@ -264,8 +273,10 @@ class IDMCaseStudyRunner:
             elif s == 0 and first_call:
                 self._layers = {"act": -1, "inst": -1}
             if prune is not None and s == prune.warmup_steps - 1:
-                k = max(1, int(round(prune.keep_ratio * num_future)))
-                if prune.selection == "random":
+                k = 0 if v2k0 else max(1, int(round(prune.keep_ratio * num_future)))
+                if v2k0:
+                    kept = all_future[:0]
+                elif prune.selection == "random":
                     g = torch.Generator(device="cpu").manual_seed((int(seed) + 1) & 0x7FFFFFFF)
                     kept = sel.random_indices(num_future, k, g, model.device)
                 else:
@@ -301,11 +312,16 @@ class IDMCaseStudyRunner:
 
         # ---- stage 2: clean video cache (frame 0 + kept future tokens), action denoising
         keep2 = kept if (prune is not None and not gated_dense) else all_future
-        idx2 = keep2 + f0
-        xc, _tc, tmodc, ctxc, ctxmc, freqsc, *_ = self.video.prepare(
-            x=latents_video, timestep=zero_t, context=context, context_mask=context_mask, action=None,
-            fuse_vae_embedding_in_latents=fuse)
-        _x, cache = self._video_layers(xc[:, idx2], freqsc[idx2], tmodc[:, idx2], ctxc, ctxmc[:, idx2], kv0, keep_kv=True)
+        if v2k0:
+            # V2-k0: the action stage reads stage-1 step 0's future K/V (frame 0 prepended, as the re-encode would be).
+            cache = kv_step0
+            diag["reuse_step0_kv"] = True
+        else:
+            idx2 = keep2 + f0
+            xc, _tc, tmodc, ctxc, ctxmc, freqsc, *_ = self.video.prepare(
+                x=latents_video, timestep=zero_t, context=context, context_mask=context_mask, action=None,
+                fuse_vae_embedding_in_latents=fuse)
+            _x, cache = self._video_layers(xc[:, idx2], freqsc[idx2], tmodc[:, idx2], ctxc, ctxmc[:, idx2], kv0, keep_kv=True)
         noise_gen = None
         if cfg.method == "noise" and cfg.noise.sigma > 0:
             noise_gen = torch.Generator(device=model.device).manual_seed((int(seed) ^ 0x5EED) & 0x7FFFFFFF)

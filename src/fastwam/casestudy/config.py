@@ -64,6 +64,9 @@ class PruneConfig:
     extra_selection: str = "av"
     #: Patch P3: denoising steps forced to run with all tokens (e.g. late steps only).
     full_steps: tuple[int, ...] = ()
+    #: fovea-w V2-k0: future tokens only on stage-1 step 0 (keep_ratio 0, latents extrapolated afterwards) and the
+    #: action stage reads those step-0 future K/V instead of the clean stage-2 re-encode.
+    reuse_step0_kv: bool = False
 
 
 @dataclass(frozen=True)
@@ -150,9 +153,15 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             extra_keep_ratio=float(block.get("extra_keep_ratio", 0.0)),
             extra_selection=str(block.get("extra_selection", "av")),
             full_steps=tuple(int(x) for x in block.get("full_steps", ())),
+            reuse_step0_kv=bool(block.get("reuse_step0_kv", False)),
         )
         _require(prune.selection in SELECTIONS, f"prune.selection must be one of {SELECTIONS}")
-        _require(0.0 < prune.keep_ratio <= 1.0, "prune.keep_ratio must be in (0, 1]")
+        _require(0.0 < prune.keep_ratio <= 1.0 or (prune.reuse_step0_kv and prune.keep_ratio == 0.0),
+                 "prune.keep_ratio must be in (0, 1] (0 only with reuse_step0_kv)")
+        _require(not prune.reuse_step0_kv or (prune.keep_ratio == 0.0 and prune.warmup_steps == 1 and prune.selection == "av"
+                                              and not prune.extra_keep_ratio and not prune.full_steps and prune.gate is None
+                                              and not prune.reselect_every_step),
+                 "prune.reuse_step0_kv is V2-k0: keep_ratio 0, warmup 1, selection av, nothing else")
         _require(1 <= prune.warmup_steps < steps, "prune.warmup_steps must be in [1, num_inference_steps)")
         _require(prune.layer_rule in LAYER_RULES, f"prune.layer_rule must be one of {LAYER_RULES}")
         _require(prune.layer_rule != "fixed" or prune.layer is not None, "layer_rule=fixed needs prune.layer")
