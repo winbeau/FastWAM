@@ -81,6 +81,16 @@ def test_config():
             parse_config({"method": "dense", **bad})
 
 
+def test_no_future_and_extrapolation_config():
+    s0 = {"selection": "av", "keep_ratio": 0.2, "warmup_steps": 1}
+    assert parse_config({"method": "prune", "prune": {**s0, "action_no_future": True}}).prune.action_no_future
+    assert parse_config({"method": "prune", "prune": {**s0, "extrapolate_w": 0.4}}).prune.extrapolate_w == 0.4
+    for bad in ({"action_no_future": True, "extrapolate_w": 0.4}, {"extrapolate_w": float("nan")},
+                {"extrapolate_w": 0.4, "action_full_kv": True}, {"action_no_future": True, "recon": "r0"}):
+        with pytest.raises(ValueError):
+            parse_config({"method": "prune", "prune": {**s0, **bad}})
+
+
 def test_pilot_is_x0_under_the_scheduler_convention():
     """x_sigma = (1 - sigma) x0 + sigma eps and v = eps - x0, so x - sigma v = x0 (sigma_0 = 1 at shift 5)."""
     sch = WanContinuousFlowMatchScheduler(shift=5.0)

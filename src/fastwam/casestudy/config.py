@@ -62,6 +62,9 @@ below the component's threshold), or ``const`` gives ``g = clip(gain, lo, hi)``.
 translation and rotation are multiplied by their gains and clipped to the environment range; the
 gripper is never touched and a component with ``g = 1`` is left as it is (see ``agc.py``; applied by
 the adapter). ``record_pilot`` logs the pilot without any gain (calibration of ``c``).
+``prune.action_no_future`` (S0-noF) gives the action rows of pruned steps the keys [frame-0 | action] only;
+``prune.extrapolate_w`` (EX) runs the action expert a second time on pruned steps with those keys (its own
+token stream; the video side is shared) and steps with ``v_s + w * (v_s - v_noF)``.
 
 ``dump`` (any method) writes one call's internals to an ``.npz``: the action query's
 attention over the video tokens and the action hidden states after every layer and step,
@@ -157,6 +160,11 @@ class PruneConfig:
     dense_bias: bool = False
     #: Reconstructed K/V of the dropped positions: r0 / r1 / r2 (module docstring); None = off.
     recon: Optional[str] = None
+    #: S0-noF: on pruned steps the action rows' keys are [frame-0 | action] only (no future token).
+    action_no_future: bool = False
+    #: EX: on pruned steps the action expert also runs without future keys (its own token stream,
+    #: keys [frame-0 | action]) and the action velocity becomes v_s + w * (v_s - v_noF).
+    extrapolate_w: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -322,6 +330,8 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             summary_views=int(block.get("summary_views", 2)),
             summary_bias=str(block.get("summary_bias", "count")),
             recon=None if block.get("recon") is None else str(block["recon"]),
+            action_no_future=bool(block.get("action_no_future", False)),
+            extrapolate_w=None if block.get("extrapolate_w") is None else float(block["extrapolate_w"]),
         )
         _require(prune.selection in SELECTIONS, f"prune.selection must be one of {SELECTIONS}")
         _require(0.0 <= prune.keep_ratio <= 1.0, "prune.keep_ratio must be in [0, 1]")
@@ -379,6 +389,14 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
                           or prune.steer_video is not None or prune.full_steps or prune.reselect_every_step
                           or prune.gate is not None or prune.summary_grid),
                      "prune.recon is S0 plus the reconstructed keys (no other option)")
+        if prune.action_no_future or prune.extrapolate_w is not None:
+            _require(not (prune.action_no_future and prune.extrapolate_w is not None),
+                     "prune.action_no_future (S0-noF) and prune.extrapolate_w (EX) are exclusive")
+            _require(prune.extrapolate_w is None or math.isfinite(prune.extrapolate_w), "prune.extrapolate_w must be finite")
+            _require(not (cache or prune.oracle_kv or prune.dense_bias or prune.video_eager or prune.steer is not None
+                          or prune.steer_video is not None or prune.full_steps or prune.reselect_every_step
+                          or prune.gate is not None or prune.summary_grid or prune.recon is not None or prune.keep_ratio == 0.0),
+                     "S0-noF / EX are S0 plus the no-future action keys (no other option)")
         if prune.keep_ratio == 0.0:
             _require(prune.recon == "r0" or (prune.action_full_kv and not prune.video_eager and prune.steer is None),
                      "keep_ratio 0 is V2-k0 (action_full_kv) or R0-k0 (recon r0)")

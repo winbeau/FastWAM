@@ -29,7 +29,9 @@ computes or caches the dropped positions: each pruned step infers their K/V from
 at the same (h, w) and appends them to the keys of both row groups; ``keep_ratio: 0`` drops the
 video rows of pruned steps altogether (V2-k0, R0-k0). ``agc`` / ``record_pilot`` log the pilot, the
 warm-up step's clean action estimate ``x - sigma_0 * v_0`` (``diag["pilot_f32"]``, normalized); the gain
-itself is applied by the adapter in simulator units (``agc.py``).
+itself is applied by the adapter in simulator units (``agc.py``). ``prune.action_no_future`` (S0-noF) drops
+every future key of the action rows on pruned steps; ``prune.extrapolate_w`` (EX) adds a second action-expert
+stream with those keys on pruned steps and steps with ``v_s + w * (v_s - v_noF)``.
 ``frame0_cache=false`` (dense only) calls the model's native
 ``infer_action`` unchanged, as the reference for equivalence checks. ``cfg.dump`` writes
 one call's attention, action hidden states and decoded video to an ``.npz``.
@@ -577,6 +579,11 @@ class JointCaseStudyRunner:
         want_motion_steps = cfg.record_motion_steps
         motion_rows: list[torch.Tensor] = []
         want_pilot = cfg.record_pilot or cfg.agc is not None
+        # S0-noF: action rows of pruned steps without future keys; EX: a second, no-future action stream on
+        # pruned steps and the extrapolated velocity v_s + w * (v_s - v_noF).
+        no_future = prune is not None and prune.action_no_future
+        ex_w = prune.extrapolate_w if prune is not None else None
+        cost_extra: list[list[int]] = []
         # Reconstruction (prune.recon): the per-call layout of the dropped positions (set with the kept
         # set), the quality against dense_kv per [k, v, k step-0, v step-0] x step x layer x view, and
         # the self-checks (worst |diff| and the matching |true| scale per check).
@@ -635,6 +642,8 @@ class JointCaseStudyRunner:
             xv = pre_v["tokens"][:, idx_abs]
             xa = pre_a["tokens"]
             xv_in, xa_in = xv, xa
+            ex_step = ex_w is not None and mode == "pruned"
+            xa_nf = pre_a["tokens"] if ex_step else None
 
             share_layers: list[torch.Tensor] = []
             vf0_layers: list[torch.Tensor] = []
@@ -794,6 +803,11 @@ class JointCaseStudyRunner:
                         k_all = torch.cat([kv0[layer]["k"], k_o[:, idx_rel], io_a[1]], dim=1)
                         v_all = torch.cat([kv0[layer]["v"], v_o[:, idx_rel], io_a[2]], dim=1)
                         kept_cols = slice(f0, f0 + n_q)
+                    elif no_future and mode == "pruned":
+                        # S0-noF: the action rows see frame 0 and themselves, no future token.
+                        k_all = torch.cat([kv0[layer]["k"], io_a[1]], dim=1)
+                        v_all = torch.cat([kv0[layer]["v"], io_a[2]], dim=1)
+                        kept_cols = slice(f0, f0)
                     else:
                         k_all = torch.cat([k_vid, io_a[1]], dim=1)
                         v_all = torch.cat([v_vid, io_a[2]], dim=1)
@@ -801,6 +815,9 @@ class JointCaseStudyRunner:
                     if layer == 0:
                         cost_steps.append([n_q, n_vk, int(io_a[0].shape[1]), int(k_all.shape[1])])
                         cost_dim = int(io_a[0].shape[-1])
+                        if ex_w is not None:  # EX's no-future action pass: [queries, keys]
+                            n_a = int(io_a[0].shape[1])
+                            cost_extra.append([n_a, f0 + n_a] if ex_step else [0, 0])
                     biased = steer is not None and (mode == "pruned" or (dense_bias and s >= prune.warmup_steps))
                     if biased:
                         nf = k_all.shape[1] - f0 - io_a[1].shape[1]
@@ -861,6 +878,14 @@ class JointCaseStudyRunner:
                     if io_v is not None:
                         xv = self._post(bv, io_v, out_v, payload_v)
                     xa = self._post(ba, io_a, out_a, payload_a)
+                    if ex_step:
+                        # EX: the action expert once more on its own stream, keys [frame-0 | action].
+                        io_nf = self.mot._build_expert_attention_io(
+                            expert=self.action, block=ba, x=xa_nf, freqs=pre_a["freqs"], t_mod=pre_a["t_mod"]
+                        )
+                        out_nf = flash_attention(q=io_nf[0], k=torch.cat([kv0[layer]["k"], io_nf[1]], dim=1),
+                                                 v=torch.cat([kv0[layer]["v"], io_nf[2]], dim=1), num_heads=self.num_heads)
+                        xa_nf = self._post(ba, io_nf, out_nf, payload_a)
                     if dump is not None and dump.hidden:
                         if d_hidden is None:
                             d_hidden = torch.zeros((steps, self.num_layers) + tuple(xa.shape[1:]), dtype=torch.float16)
@@ -898,6 +923,10 @@ class JointCaseStudyRunner:
                 z = rearrange(x0[0], "c (f a) (h b) (w e) -> f (h w) (c a b e)", a=pt, b=ph, e=pw)
                 motion_rows.append((z[1] - z[0]).norm(dim=-1))
             pred_action = self.action.post_dit(xa, pre_a)
+            if ex_step:
+                # EX: v = v_s + w * (v_s - v_noF) in fp32, back to the model dtype (w = 0 gives v_s bit for bit).
+                pred_nf = self.action.post_dit(xa_nf, pre_a)
+                pred_action = (pred_action.float() + ex_w * (pred_action.float() - pred_nf.float())).to(pred_action.dtype)
             if want_pilot and s == 0:
                 # Pilot (agc / record_pilot): the dense warm-up step's clean action estimate x - sigma_0 * v_0
                 # in fp32, beside the forward pass.
@@ -1113,7 +1142,8 @@ class JointCaseStudyRunner:
             diag["motion_steps_f32"] = _f32_b64(torch.stack(motion_rows))  # [steps, tokens of frame 1]
         diag["paths"] = {"action_eager": steer is not None, "video_eager": video_eager, "oracle_kv": oracle is not None,
                          "action_full_kv": full_kv, "video_full_kv": video_full_kv, "dense_bias": dense_bias,
-                         "steer_video": steer_v is not None, "recon": recon}
+                         "steer_video": steer_v is not None, "recon": recon, "action_no_future": no_future,
+                         "extrapolate_w": ex_w}
         if want_rq:
             # [k, v, k of dense step 0 (V2's reuse), v of dense step 0] x step x layer x view (agentview, wrist):
             # mean cosine to the dense K / V of the same step over the dropped tokens of the view.
@@ -1126,6 +1156,8 @@ class JointCaseStudyRunner:
                         "steps": cost_steps, "oracle_pass": oracle is not None}
         if recon is not None:  # R2: frame-0 positions through W_k / W_v per layer, per step
             diag["cost"]["recon_proj_tokens"] = cost_recon
+        if ex_w is not None:  # EX: the no-future action pass per computed step
+            diag["cost"]["extra_action_steps"] = cost_extra
         if dump is not None:
             arrays = {"seed": np.int64(seed), "modes": np.asarray(modes), "grid": np.asarray(diag["grid"]),
                       "kept_index": kept.cpu().numpy(), "action_latents": torch.stack(d_latents).numpy()}
