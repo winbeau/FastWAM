@@ -52,6 +52,7 @@ from einops import rearrange
 from fastwam.models.wan22.wan_video_dit import flash_attention, modulate, rope_apply
 
 from .config import CaseStudyConfig
+from . import fovea as fv
 from . import selection as sel
 
 
@@ -586,6 +587,19 @@ class JointCaseStudyRunner:
         fattn_rows: list[torch.Tensor] = []
         # diff selections: the warm-up step's clean-estimate distance of every future token to the current frame
         diff_score: Optional[torch.Tensor] = None
+        # Fovea round: the plan of the pruned steps (fovea.py), the step-0 attention received by every future token, the
+        # step-0 clean estimate of the future tokens (k-means), the synthetic region tokens' members / RoPE rows and the
+        # interlace bookkeeping (how often each future token was computed on a pruned step).
+        fovea_m = prune.fovea if prune is not None else None
+        fplan: Optional[fv.Plan] = None
+        want_recv = cfg.record_sinks or fovea_m is not None
+        recv_acc = torch.zeros(num_future, device=model.device) if want_recv else None
+        x0_fut: Optional[torch.Tensor] = None
+        fv_members: list[torch.Tensor] = []
+        fv_first: Optional[torch.Tensor] = None
+        fv_freqs = None
+        fv_count = torch.zeros(num_future, dtype=torch.long, device=model.device)
+        fv_rows: list[int] = []
         no_future = prune is not None and prune.action_no_future
         ex_w = prune.extrapolate_w if prune is not None else None
         cost_extra: list[list[int]] = []
@@ -642,9 +656,16 @@ class JointCaseStudyRunner:
                             mode = "skip"
                 tea_prev = signal
 
-            idx_rel = kept if mode == "pruned" else all_future
+            fv_step = fplan is not None and mode == "pruned"
+            idx_rel = (fplan.real(s) if fv_step else kept) if mode == "pruned" else all_future
             idx_abs = idx_rel + f0
             xv = pre_v["tokens"][:, idx_abs]
+            n_syn = len(fv_members) if fv_step else 0
+            if n_syn:
+                # Fov: each region token's input is the mean of its members' token embeddings (the patch embedding is
+                # linear, so this is the embedding of the members' mean latent), recomputed from this step's latents.
+                xv_syn = torch.stack([pre_v["tokens"][:, m].float().mean(dim=1) for m in fv_members], dim=1).to(xv.dtype)
+                xv = torch.cat([xv, xv_syn], dim=1)
             xa = pre_a["tokens"]
             xv_in, xa_in = xv, xa
             ex_step = ex_w is not None and mode == "pruned"
@@ -666,10 +687,33 @@ class JointCaseStudyRunner:
                     capture_layers = {self._layers["act"]}
                 freqs_v = pre_v["freqs"][idx_abs]
                 tmod_v = pre_v["t_mod"][:, idx_abs]
-                payload_v = {"context": pre_v["context"], "mask": pre_v["context_mask"][:, idx_abs]}
+                ctx_rows = pre_v["context_mask"][:, idx_abs]
+                if n_syn:
+                    # Region tokens: fractional RoPE position, the members' (shared) time modulation and context mask.
+                    freqs_v = torch.cat([freqs_v, fv_freqs.to(device=freqs_v.device, dtype=freqs_v.dtype)], dim=0)
+                    tmod_v = torch.cat([tmod_v, pre_v["t_mod"][:, fv_first]], dim=1)
+                    ctx_rows = torch.cat([ctx_rows, pre_v["context_mask"][:, fv_first]], dim=1)
+                payload_v = {"context": pre_v["context"], "mask": ctx_rows}
                 payload_a = {"context": pre_a["context"], "mask": pre_a["context_mask"]}
                 step_probs: dict[int, torch.Tensor] = {}
-                n_q = int(idx_rel.numel())  # 0 on the pruned steps of keep 0: no video rows at all
+                n_q = int(idx_rel.numel()) + n_syn  # 0 on the pruned steps of keep 0: no video rows at all
+                fv_mask_v = fv_mask_a = None
+                if fv_step:
+                    # Key logit bias log(n_g) of representatives (rep) and region tokens (fov), for every row; no mask at
+                    # all without a bias, so that the kernel is S0's.
+                    bias = torch.zeros(n_q, device=model.device)
+                    for j, lg in fplan.bias_real.items():
+                        bias[torch.nonzero(idx_rel == j).flatten()] = lg
+                    for g, (_, lg) in enumerate(fplan.regions):
+                        bias[int(idx_rel.numel()) + g] = lg
+                    if bool((bias != 0).any()):
+                        n_act = int(pre_a["tokens"].shape[1])
+                        fv_mask_v = torch.zeros((1, 1, 1, f0 + n_q), device=model.device)
+                        fv_mask_v[..., f0:] = bias
+                        fv_mask_a = torch.zeros((1, 1, 1, f0 + n_q + n_act), device=model.device)
+                        fv_mask_a[..., f0:f0 + n_q] = bias
+                        fv_mask_v, fv_mask_a = fv_mask_v.to(xv.dtype), fv_mask_a.to(xv.dtype)
+                    fv_rows.append(n_q)
                 rc_step = recon is not None and mode == "pruned" and rc is not None and rc["n"] > 0
                 if rc_step and recon == "r2":
                     tmod_src = pre_v["t_mod"][:, f0 + rc["src_u"]]  # this step's future-frame modulation
@@ -773,6 +817,8 @@ class JointCaseStudyRunner:
                             vmask = sum_mask_v[layer]
                         else:
                             kv_k, kv_v = k_vid, v_vid
+                            if fv_step:
+                                vmask = fv_mask_v
                         out_v = flash_attention(q=io_v[0], k=kv_k, v=kv_v, num_heads=self.num_heads, ctx_mask=vmask)
                         n_vk = int(kv_k.shape[1])
                         steer_v_warm = steer_v is not None and s == 0
@@ -809,6 +855,15 @@ class JointCaseStudyRunner:
                         k_all = torch.cat([kv0[layer]["k"], k_o[:, idx_rel], io_a[1]], dim=1)
                         v_all = torch.cat([kv0[layer]["v"], v_o[:, idx_rel], io_a[2]], dim=1)
                         kept_cols = slice(f0, f0 + n_q)
+                    elif fv_step:
+                        # Fovea: the action rows see frame 0, this step's computed future rows (real and region
+                        # tokens, nothing older) and themselves.
+                        k_all = torch.cat([k_vid, io_a[1]], dim=1)
+                        v_all = torch.cat([v_vid, io_a[2]], dim=1)
+                        kept_cols = slice(f0, f0 + n_q)
+                        amask = fv_mask_a
+                        if int(k_all.shape[1]) != f0 + n_q + int(io_a[1].shape[1]):
+                            raise RuntimeError("fovea: the action rows see keys that were not computed on this step")
                     elif no_future and mode == "pruned":
                         # S0-noF: the action rows see frame 0 and themselves, no future token.
                         k_all = torch.cat([kv0[layer]["k"], io_a[1]], dim=1)
@@ -862,6 +917,11 @@ class JointCaseStudyRunner:
                         if d_cur is None:
                             d_cur = torch.zeros((steps, self.num_layers, pa.shape[0], f0), dtype=torch.float16)
                         d_cur[s, layer] = pa[:, :f0].half().cpu()  # per frame-0 key
+                    if recv_acc is not None and s == 0:
+                        # Sinks: the step-0 attention every future key receives from the video rows (all future
+                        # tokens on this full step) and the action rows, head mean, summed over rows.
+                        recv_acc += self._attention_probs(io_v[0], k_vid)[:, f0:].sum(dim=0)
+                        recv_acc += self._attention_probs(io_a[0], k_all)[:, f0:f0 + num_future].sum(dim=0)
                     if fattn_acc is not None:
                         # Beside the forward pass: head- and query-mean attention on [frame-0 | kept future] keys
                         # (the plain key layout, checked in the config), summed over layers.
@@ -931,10 +991,18 @@ class JointCaseStudyRunner:
 
             # ---- heads and scheduler step
             if idx_abs.numel():  # keep 0: no future token is recomputed after warm-up
-                vel_part = self.video.head(xv, pre_v["t"][:, idx_abs])
+                t_rows = pre_v["t"][:, idx_abs]
+                if n_syn:
+                    t_rows = torch.cat([t_rows, pre_v["t"][:, fv_first]], dim=1)
+                vel_part = self.video.head(xv, t_rows)
                 if vel_tokens is None:
                     vel_tokens = torch.zeros((1, f0 + num_future, vel_part.shape[-1]), device=vel_part.device, dtype=vel_part.dtype)
-                vel_tokens[:, idx_abs] = vel_part  # pruned tokens keep their last velocity
+                n_real = int(idx_abs.numel())
+                vel_tokens[:, idx_abs] = vel_part[:, :n_real]  # pruned tokens keep their last velocity
+                for g, members in enumerate(fv_members if n_syn else ()):
+                    vel_tokens[:, members] = vel_part[:, n_real + g:n_real + g + 1]  # a region token's velocity to every member
+                if fv_step:
+                    fv_count[idx_rel] += 1
             pred_video = self.video.unpatchify(vel_tokens, pre_v["meta"]["grid_size"])
             if want_motion_steps:
                 # This step's clean estimate x - sigma * v (sigma_s = -sum of the remaining deltas; the
@@ -943,7 +1011,7 @@ class JointCaseStudyRunner:
                 x0 = latents_video.float() - sigma * pred_video.float()
                 z = rearrange(x0[0], "c (f a) (h b) (w e) -> f (h w) (c a b e)", a=pt, b=ph, e=pw)
                 motion_rows.append((z[1] - z[0]).norm(dim=-1))
-            if s == 0 and prune is not None and prune.selection in ("diff", "diff_global"):
+            if s == 0 and prune is not None and (prune.selection in ("diff", "diff_global") or fovea_m is not None):
                 # diff: x0 = x - sigma_v v of the warm-up (full) step, every future token against the pinned current
                 # frame's latent at the same (h, w), over the token's full latent patch.
                 sigma_v = t_video[0].float() / float(model.infer_video_scheduler.num_train_timesteps)
@@ -953,6 +1021,8 @@ class JointCaseStudyRunner:
                 diff_score = sel.diff_scores(z[1:].reshape(-1, z.shape[-1]), z_cur, grid)
                 diag["diff_scores_f16"] = _f16_b64(diff_score)
                 diag["diff_sigma_v"] = float(sigma_v)
+                if fovea_m == "fov_cluster":
+                    x0_fut = z[1:].reshape(-1, z.shape[-1])  # k-means features of the periphery (step-0 clean estimate)
             pred_action = self.action.post_dit(xa, pre_a)
             if ex_step:
                 # EX: v = v_s + w * (v_s - v_noF) in fp32, back to the model dtype (w = 0 gives v_s bit for bit).
@@ -1052,6 +1122,28 @@ class JointCaseStudyRunner:
                         kept = torch.cat([kept, extra])
                         diag["extra_kept"] = int(m)
                 kept = torch.sort(kept).values
+                if fovea_m is not None and s == prune.warmup_steps - 1:
+                    # Fovea: sinks / core / periphery from this step's A->V (S0's scoring layer), Diff and received
+                    # attention, planned on the CPU (k-means draws from a per-call generator).
+                    av_all = sel.av_scores(act_probs_sel[self._layers["act"]], grid)
+                    recv = recv_acc / self.num_layers
+                    gen = torch.Generator(device="cpu").manual_seed((int(seed) + 3) & 0x7FFFFFFF)
+                    fplan = fv.make_plan(fovea_m, k, grid, av_all.float().cpu(), diff_score.float().cpu(), recv.float().cpu(),
+                                         None if x0_fut is None else x0_fut.cpu(), gen, off=prune.fovea_off).to(kept.device)
+                    kept = fplan.fixed
+                    fv_members = [g + f0 for g, _ in fplan.regions]
+                    if fv_members:
+                        fv_first = torch.stack([m[0] for m in fv_members])
+                        fv_freqs = fv.rope_freqs_at(fplan.region_pos, 2 * int(pre_v["freqs"].shape[-1]))
+                    tot = float(recv.sum())
+                    diag["fovea"] = {
+                        "method": fovea_m, "off": bool(prune.fovea_off), "k": int(k),
+                        "sinks": fplan.sinks.tolist(), "sink_share_step0": float(recv[fplan.sinks].sum()) / tot if tot > 0 else None,
+                        "core": int(fplan.core.numel()), "periphery": int(fplan.periphery.numel()),
+                        "regions": [int(g.numel()) for g, _ in fplan.regions], "reps": len(fplan.bias_real),
+                        "slices": [int(x.numel()) for x in fplan.slices],
+                        "truncated": 0 if fplan.truncated is None else int(fplan.truncated.numel()),
+                    }
                 if cache_kv and not video_eager and s == prune.warmup_steps - 1:
                     keep_mask = torch.ones(num_future, dtype=torch.bool, device=kept.device)
                     keep_mask[kept] = False
@@ -1188,6 +1280,22 @@ class JointCaseStudyRunner:
             diag["recon_quality_f32"] = _f32_b64(rq)
             diag["recon_quality_shape"] = list(rq.shape)
             diag["recon_checks"] = {k: {"max_abs_diff": float(v[0]), "max_abs_true": float(v[1])} for k, v in checks.items()}
+        if want_recv:
+            recv = recv_acc / self.num_layers
+            top = torch.topk(recv, fv.N_SINKS).indices
+            diag["sink_index"] = sorted(int(x) for x in top.tolist())
+            diag["sink_share_step0"] = float(recv[top].sum() / recv.sum())
+            diag["sink_recv_f16"] = _f16_b64(recv)
+        if fplan is not None:
+            diag["fovea"]["rows_per_step"] = fv_rows
+            if fplan.slices:
+                # Interlace: every periphery token not cut by the quota computed exactly once on the pruned steps.
+                cut = set(fplan.truncated.tolist())
+                cnt = fv_count[fplan.periphery].tolist()
+                once = all((c == 0) if int(j) in cut else (c == 1) for j, c in zip(fplan.periphery.tolist(), cnt))
+                diag["fovea"]["interlace_once"] = once
+                if not once and len(fv_rows) == len(fplan.slices):
+                    raise RuntimeError("fovea interlace: a periphery token was not computed exactly once")
         # Relative compute (token passes + attention): per step [video queries, video keys, action
         # queries, action keys] at layer 0, the parameter counts and the context length.
         diag["cost"] = {**self._cost_model(), "attn_dim": cost_dim, "ctx": int(context.shape[1]), "f0": int(f0),

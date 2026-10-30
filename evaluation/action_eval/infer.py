@@ -664,7 +664,8 @@ class FastWAMJointPolicy:
                             "steer_video", "video_frame0_f32", "motion_steps_f32", "paths", "cost", "modes",
                             "summary", "cache_kv_bytes", "recon", "recon_quality_f32", "recon_quality_shape",
                             "recon_checks", "av_scores_f16", "diff_scores_f16", "diff_sigma_v", "future_attn_f32",
-                            "future_attn_shape", "dump_path", "gate_score"):
+                            "future_attn_shape", "dump_path", "gate_score", "fovea", "sink_index", "sink_share_step0",
+                            "sink_recv_f16"):
                     if d.get(key) is not None:
                         entry[key] = d[key]
                 out[f"{name}@{offset}"] = entry

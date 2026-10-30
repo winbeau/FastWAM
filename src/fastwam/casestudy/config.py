@@ -173,6 +173,10 @@ class PruneConfig:
     #: Self-check of the diff selections: score with A->V instead of the clean-estimate distance, through the
     #: same code path (diff_global with it must equal av bit for bit).
     diff_debug_av: bool = False
+    #: Fovea round (``fovea.py``): sink | rep | fov_grid | fov_cluster | interlace on top of S0's A->V scoring;
+    #: ``fovea_off`` keeps the method's code path but selects S0's A->V top-k only (self-check).
+    fovea: Optional[str] = None
+    fovea_off: bool = False
 
 
 @dataclass(frozen=True)
@@ -269,6 +273,8 @@ class CaseStudyConfig:
     #: Log per step the action rows' attention on every video key (frame 0 and future), averaged over layers, heads
     #: and action queries (NaN for keys not in the step's sequence); computed beside the forward pass.
     record_future_attn: bool = False
+    #: Log the step-0 attention each future token receives (video and action rows, layer / head mean) and the top 3.
+    record_sinks: bool = False
 
     def describe(self) -> dict[str, Any]:
         return asdict(self)
@@ -344,7 +350,19 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             action_no_future=bool(block.get("action_no_future", False)),
             extrapolate_w=None if block.get("extrapolate_w") is None else float(block["extrapolate_w"]),
             diff_debug_av=bool(block.get("diff_debug_av", False)),
+            fovea=None if block.get("fovea") is None else str(block["fovea"]),
+            fovea_off=bool(block.get("fovea_off", False)),
         )
+        if prune.fovea is not None or prune.fovea_off:
+            _require(prune.fovea in ("sink", "rep", "fov_grid", "fov_cluster", "interlace"),
+                     "prune.fovea must be sink, rep, fov_grid, fov_cluster or interlace (fovea_off needs a method)")
+            _require(prune.selection == "av" and prune.warmup_steps == 1 and prune.keep_ratio > 0.0 and not (
+                prune.action_full_kv or prune.video_full_kv or prune.summary_grid or prune.oracle_kv or prune.recon is not None
+                or prune.steer is not None or prune.steer_video is not None or prune.dense_bias or prune.video_eager
+                or prune.full_steps or prune.reselect_every_step or prune.gate is not None or prune.extra_keep_ratio
+                or prune.kept_index is not None or prune.score_frames is not None or prune.score_step is not None
+                or prune.action_no_future or prune.extrapolate_w is not None),
+                "prune.fovea is S0 (selection av, warm-up 1, keep > 0) plus the fovea plan only")
         _require(prune.selection in SELECTIONS, f"prune.selection must be one of {SELECTIONS}")
         if prune.selection in ("diff", "diff_global"):
             _require(prune.warmup_steps == 1 and prune.score_step is None and prune.kept_index is None
@@ -497,8 +515,12 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
         record_pilot=bool(raw.get("record_pilot", False)),
         agc=agc,
         record_future_attn=bool(raw.get("record_future_attn", False)),
+        record_sinks=bool(raw.get("record_sinks", False)),
     )
     p = cfg.prune
+    _require(p is None or p.fovea in (None, "sink") or p.fovea_off or not (
+        cfg.record_future_attn or cfg.record_video_frame0 or cfg.record_motion_steps or cfg.record_future_share),
+        "the per-key / per-query records are defined for fovea sink (or fovea_off) only")
     _require(not cfg.record_future_attn or p is None or not (
         p.action_full_kv or p.video_full_kv or p.summary_grid or p.oracle_kv or p.recon is not None or p.steer is not None
         or p.dense_bias or p.action_no_future or p.extrapolate_w is not None),
