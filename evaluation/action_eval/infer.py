@@ -475,7 +475,7 @@ class FastWAMJointPolicy:
                             "future_token_steps_dense", "reuse_step0_kv", "path", "fovea"):
                     if d.get(key) is not None:
                         entry[key] = d[key]
-                out[f"{name}"] = entry
+                out[f"{name}@{offset}"] = entry
         return out
 
     def _continuous(self, action) -> np.ndarray:
