@@ -20,6 +20,9 @@ Methods
 ``noise``     dense compute plus Gaussian noise on the action stream's attention
               output (perturbation control, no speedup).
 Fewer denoising steps is ``dense`` with a smaller ``num_inference_steps``.
+``action_infer_mode`` (FastWAM-IDM only): ``idm`` imagines the future video first (the case-study
+runner); ``first_frame`` is the release's Fast-WAM mode, actions from the observation alone, on the
+model's native path (``method: dense`` only).
 """
 
 from __future__ import annotations
@@ -33,6 +36,7 @@ METHODS = ("dense", "prune", "teacache", "noise")
 SELECTIONS = ("av", "cf", "random")
 LAYER_RULES = ("min_entropy", "fixed")
 SEED_MODES = ("episode_call_hash", "native_fixed")
+ACTION_INFER_MODES = ("idm", "first_frame")
 
 
 @dataclass(frozen=True)
@@ -92,6 +96,8 @@ class CaseStudyConfig:
     #: Capture A->V attention, entropies and gate score at the first step of every call,
     #: also for arms that do not use them, so all arms log the same diagnostics.
     record_attention: bool = True
+    #: Optional-IDM inference mode (see the module docstring).
+    action_infer_mode: str = "idm"
 
     def describe(self) -> dict[str, Any]:
         return asdict(self)
@@ -180,6 +186,10 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
     else:
         _require(raw.get("noise") is None, "noise block given but method != noise")
 
+    mode = str(raw.get("action_infer_mode", "idm"))
+    _require(mode in ACTION_INFER_MODES, f"action_infer_mode must be one of {ACTION_INFER_MODES}, got {mode!r}")
+    _require(mode == "idm" or method == "dense", "action_infer_mode=first_frame runs the native path: method=dense only")
+
     return CaseStudyConfig(
         method=method,
         num_inference_steps=steps,
@@ -191,6 +201,7 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
         teacache=teacache,
         noise=noise,
         record_attention=bool(raw.get("record_attention", True)),
+        action_infer_mode=mode,
     )
 
 

@@ -18,7 +18,8 @@ Arms (``config.py``):
 ``teacache`` residual reuse over the video stack on stage-1 steps.
 ``noise``    Gaussian noise on the stage-2 action attention output.
 Fewer steps is ``dense`` with a smaller ``num_inference_steps`` (both stages).
-``frame0_cache=false`` (dense only) calls the native ``infer_action`` unchanged.
+``frame0_cache=false`` (dense only) calls the native ``infer_action`` unchanged; so does
+``action_infer_mode=first_frame`` (dense only), the release's Fast-WAM mode without future imagination.
 """
 
 from __future__ import annotations
@@ -127,15 +128,18 @@ class IDMCaseStudyRunner:
                      sigma_shift=None, rand_device="cpu") -> tuple[torch.Tensor, dict[str, Any]]:
         cfg, model = self.cfg, self.model
         steps = int(cfg.num_inference_steps)
-        if not cfg.frame0_cache:
+        if not cfg.frame0_cache or cfg.action_infer_mode == "first_frame":
+            # Native path: the dense reference (frame0_cache=false), and the release's Fast-WAM mode
+            # (first_frame: no imagined video, actions denoised against the observation alone).
             text = {"prompt": prompt}
             if self.prompt_store is not None:
                 c, m, _ = self._encode_prompt(prompt)
                 text = {"prompt": None, "context": c, "context_mask": m}
             out = model.infer_action(**text, input_image=input_image, action_horizon=action_horizon,
                                      num_video_frames=num_video_frames, proprio=proprio, num_inference_steps=steps,
-                                     sigma_shift=sigma_shift, seed=seed, rand_device=rand_device, action_infer_mode="idm")
-            return out["action"], {"path": "native", "seed": int(seed), "steps": steps}
+                                     sigma_shift=sigma_shift, seed=seed, rand_device=rand_device,
+                                     action_infer_mode=cfg.action_infer_mode)
+            return out["action"], {"path": "native", "action_infer_mode": cfg.action_infer_mode, "seed": int(seed), "steps": steps}
 
         model.eval()
         if input_image.ndim == 3:
