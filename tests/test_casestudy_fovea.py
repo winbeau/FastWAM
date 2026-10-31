@@ -69,24 +69,102 @@ def test_plans(method):
     if method == "sink":
         assert p.fixed.numel() == 39 and sinks <= set(p.fixed.tolist())
         return
-    assert p.core.numel() == 20 and not (set(p.core.tolist()) & sinks)
-    if method != "interlace_wfar":  # the far-frame core skips near-frame A->V leaders
+    if method == "interlace_ht":
+        assert int(p.freq.sum()) == 9 * 39 and sinks <= set(p.fixed.tolist()) and p.truncated.numel() == 0
+        assert all(p.real(s).numel() == 39 for s in range(1, 10))
+    else:
+        assert p.core.numel() == 20 and not (set(p.core.tolist()) & sinks)
+    if method not in ("interlace_wfar", "interlace_ht"):  # the far-frame core skips near-frame A->V leaders; HT has no core
         assert set(torch.topk(torch.where(torch.tensor([j in sinks for j in range(196)]), -1.0, av), 10).indices.tolist()) <= set(p.core.tolist())
-    assert p.periphery.numel() == 173
-    if method == "rep":
+    if method == "interlace_ht":
+        pass
+    elif method == "rep":
+        assert p.periphery.numel() == 173
         assert len(p.bias_real) <= 16 and p.fixed.numel() == 23 + len(p.bias_real)
-    elif method.startswith("fov"):
+    elif method.startswith("fov") or method == "merge":
+        assert p.periphery.numel() == 173
         members = torch.cat([g for g, _ in p.regions])
         assert sorted(members.tolist()) == p.periphery.tolist() and len(p.regions) <= 16
         assert p.fixed.numel() == 23 and all(abs(lg - math.log(g.numel())) < 1e-12 for g, lg in p.regions)
         frames = p.region_pos[:, 0]
         assert torch.equal(frames, frames.round())  # one future frame per region
     else:
+        assert p.periphery.numel() == 173
         assert p.fixed.numel() == 23 and all(p.real(s).numel() <= 39 for s in range(1, 10))
+        assert not p.slice_bias or method in ("interlace_w", "interlace_wfar")  # cal / fill: no count bias in the plan
     off = fv.make_plan(method, 39, GRID, av, diff, recv, x0, gen, off=True)
     assert torch.equal(off.fixed, torch.sort(sel.topk_indices(av, 39)).values) and not off.regions and not off.bias_real
+    assert off.freq is None and not off.slices
     full = fv.make_plan(method, 196, GRID, av, diff, recv, x0, gen)
     assert torch.equal(full.fixed, torch.arange(196)) and not full.regions and not full.bias_real and not full.slices
+    assert full.bias_at(1) == {}
+
+
+def test_fill_map():
+    computed = torch.tensor([0, 9, 15, 50, 120, 140])  # frame 1: (0,0) agentview, (0,9) wrist, (1,1), (3,8); frame 2: (1,8), (3,0)
+    src, outside = fv.fill_map(computed, GRID)
+    assert src.shape == (196,) and torch.equal(src[computed], torch.arange(6))  # a computed token maps to itself
+    assert int(src[1]) == 0 and int(src[14]) == 0 and int(src[2]) == 2  # (0,1) and (1,0): (0,0) closer; (0,2): (1,1)
+    assert int(src[16]) == 2  # (1,2): (1,1) at distance 1
+    assert int(src[13]) == 1  # (0,13): wrist camera of frame 1, (0,9) only
+    assert int(src[98 + 3]) == 5  # frame 2 agentview (0,3): (3,0) (frame 2, d 18) beats frame 1's (1,1) (other frame)
+    assert int(src[98 + 13]) == 4 and outside == 0  # frame 2 wrist (0,13): (1,8) in its own block
+    tie = fv.fill_map(torch.tensor([1, 15]), GRID)[0]  # (0,1) and (1,1): (0,0) is nearer (0,1), (1,0) nearer (1,1)
+    assert int(tie[0]) == 0 and int(tie[14]) == 1
+    sparse_src, sparse_out = fv.fill_map(torch.tensor([3]), GRID)  # one agentview token of frame 1: everything else outside
+    assert bool((sparse_src == 0).all()) and sparse_out == 147  # 3 blocks of 49
+
+
+def test_ht_frequencies_and_schedule():
+    for seed, k in ((11, 39), (12, 98), (13, 39)):
+        av, diff, recv, _ = _scores(seed)
+        if seed == 13:
+            av = av ** 8  # peaked
+        sinks = torch.sort(torch.topk(recv, 3).indices).values
+        f = fv.ht_frequencies(av, sinks, k)
+        assert int(f.sum()) == 9 * k and int(f.min()) >= 1 and int(f.max()) <= 9 and bool((f[sinks] == 9).all())
+        rest = torch.tensor([j for j in range(196) if j not in set(sinks.tolist())])
+        order = torch.argsort(av[rest], descending=True)
+        assert bool((f[rest][order][1:] <= f[rest][order][:-1] + 1).all())  # monotone in A->V up to the rounding
+        steps = fv.ht_schedule(f, av)
+        assert len(steps) == 9 and all(x.numel() == k for x in steps)
+        cnt = torch.zeros(196, dtype=torch.long)
+        for x in steps:
+            assert x.unique().numel() == x.numel()
+            cnt[x] += 1
+        assert torch.equal(cnt, f)
+        p = fv.make_plan("interlace_ht", k, GRID, av, diff, recv)
+        assert torch.equal(p.freq, f) and all(torch.equal(p.real(s), steps[s - 1]) for s in range(1, 10))
+        for s in range(1, 10):
+            b = p.bias_at(s)
+            assert set(b) == set(p.slices[s - 1].tolist()) and not (set(b) & set(p.fixed.tolist()))
+            assert all(abs(v - math.log(9 / int(f[j]))) < 1e-12 and v > 0 for j, v in b.items())
+    with pytest.raises(ValueError):
+        fv.ht_frequencies(torch.rand(196), torch.tensor([0, 1, 2]), 20)  # 180 slots cannot cover 196 tokens once
+
+
+def test_ht_weight_is_unbiased_over_the_steps():
+    """Horvitz-Thompson: the mean over the 9 steps of sum_j exp(l_j) e^{b_j} over that step's tokens is sum_j exp(l_j)."""
+    av, diff, recv, _ = _scores(14)
+    p = fv.make_plan("interlace_ht", 39, GRID, av, diff, recv)
+    w = torch.rand(196, generator=torch.Generator().manual_seed(15), dtype=torch.float64)
+    est = []
+    for s in range(1, 10):
+        b = p.bias_at(s)
+        est.append(sum(float(w[j]) * math.exp(b.get(int(j), 0.0)) for j in p.real(s).tolist()))
+    assert abs(sum(est) / 9 - float(w.sum())) < 1e-9
+
+
+def test_merge_singleton_plan():
+    av, diff, recv, x0 = _scores(16)
+    p = fv.make_plan("merge", 39, GRID, av, diff, recv, singleton=True)
+    assert p.fixed.numel() == 0 and len(p.regions) == 196 and all(lg == 0.0 for _, lg in p.regions)
+    assert [int(g) for g, _ in p.regions] == list(range(196))
+    ff = precompute_freqs_cis_3d(HEAD_DIM)
+    f, h, w = GRID.frames, GRID.height, GRID.width
+    table = torch.cat([ff[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1), ff[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                       ff[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)], dim=-1).reshape(f * h * w, 1, -1)
+    assert torch.equal(fv.rope_freqs_at(p.region_pos, HEAD_DIM), table[98:])  # the region RoPE rows are the table's
 
 
 def test_grid_regions_and_kmeans():
@@ -162,3 +240,14 @@ def test_fovea_w_config():
     assert parse_config({"method": "dense", "video_freeze": True}).video_freeze
     with pytest.raises(ValueError):
         parse_config({"method": "prune", "video_freeze": True, "prune": {"keep_ratio": 0.2}})
+
+
+def test_n_methods_config():
+    for m in ("interlace_cal", "interlace_fill", "merge", "interlace_ht"):
+        cfg = parse_config({"method": "prune", "record_future_share": True, "record_motion": True,
+                            "prune": {"keep_ratio": 0.2, "fovea": m}})
+        assert cfg.prune.fovea == m and cfg.record_future_share
+    assert parse_config({"method": "prune", "prune": {"keep_ratio": 0.2, "fovea": "merge", "fovea_singleton": True}}).prune.fovea_singleton
+    for bad in ({"fovea": "interlace_ht", "fovea_singleton": True}, {"fovea": "merge", "fovea_singleton": True, "fovea_off": True}):
+        with pytest.raises(ValueError):
+            parse_config({"method": "prune", "prune": {"keep_ratio": 0.2, **bad}})

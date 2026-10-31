@@ -32,6 +32,10 @@ warm-up step's clean action estimate ``x - sigma_0 * v_0`` (``diag["pilot_f32"]`
 itself is applied by the adapter in simulator units (``agc.py``). ``prune.action_no_future`` (S0-noF) drops
 every future key of the action rows on pruned steps; ``prune.extrapolate_w`` (EX) adds a second action-expert
 stream with those keys on pruned steps and steps with ``v_s + w * (v_s - v_noF)``.
+N1-N4 (``prune.fovea``, ``fovea.py``): ``interlace_cal`` biases the slice keys per layer / head / row by the step-0 log-ratio
+of periphery to slice mass (``_cal_bias``); ``interlace_fill`` gives every uncomputed position the K / V of the nearest token
+computed on the same step; ``merge`` keeps a residual stream per periphery member, merges the groups per layer and adds each
+group's increment back to its members; ``interlace_ht`` follows the plan's per-token frequencies.
 ``frame0_cache=false`` (dense only) calls the model's native
 ``infer_action`` unchanged, as the reference for equivalence checks. ``cfg.dump`` writes
 one call's attention, action hidden states and decoded video to an ``.npz``.
@@ -40,6 +44,7 @@ one call's attention, action hidden states and decoded video to an ``.npz``.
 from __future__ import annotations
 
 import base64
+import math
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -264,6 +269,51 @@ class JointCaseStudyRunner:
         mask = torch.where(member > 0, 0.0, float("-inf"))  # [G, Kf]
         lse = torch.logsumexp(full.unsqueeze(-2) + mask, dim=-1)  # [H, Sq, G]
         return lse - self._head_logits(q, k_sum)
+
+    def _cal_bias(self, plan, qk: dict, kv0: list, f0: int, kf: int, clamp: float = 20.0):
+        """N1 (interlace_cal): per layer, the biases (video [slices, H, Kf], action [slices, H, A]) of slice S_k's keys,
+        b = LSE over the periphery - LSE over S_k of each row's step-0 logits (clamped at ``clamp``), and the formula check:
+        on the step-0 rows, [frame-0 | fixed | S_k + b (| action)] gives S_k the periphery's share of the full row."""
+        per, fixed, n_fix = plan.periphery, plan.fixed, int(plan.fixed.numel())
+        out, err, n_clamped, n_el, means = {}, 0.0, 0, 0, {"video": [], "action": []}
+        for layer, (qv, qa, k_fut, k_act) in qk.items():
+            k0 = kv0[layer]["k"]
+            per_rows = []
+            for name, q, extra in (("video", qv, None), ("action", qa, k_act)):
+                parts = [self._head_logits(q, k0), self._head_logits(q, k_fut)]
+                if extra is not None:
+                    parts.append(self._head_logits(q, extra))
+                full = torch.cat(parts, dim=-1)  # [H, rows, f0 + Kf (+ A)]
+                fut = full[..., f0:f0 + kf]
+                lse_p = torch.logsumexp(fut[..., per], dim=-1)
+                share_p = torch.softmax(full, dim=-1)[..., f0 + per].sum(dim=-1)
+                tail = [torch.arange(f0 + kf, full.shape[-1], device=full.device)] if extra is not None else []
+                bs = []
+                for sl in plan.slices:
+                    raw = lse_p - torch.logsumexp(fut[..., sl], dim=-1)  # [H, rows]
+                    b = raw.clamp(max=clamp)
+                    n_clamped += int((raw > clamp).sum())
+                    n_el += int(raw.numel())
+                    cols = torch.cat([torch.arange(f0, device=full.device), f0 + fixed, f0 + sl] + tail)
+                    lg = full[..., cols].clone()
+                    lg[..., f0 + n_fix:f0 + n_fix + sl.numel()] += b.unsqueeze(-1)
+                    share = torch.softmax(lg, dim=-1)[..., f0 + n_fix:f0 + n_fix + sl.numel()].sum(dim=-1)
+                    free = raw <= clamp
+                    if bool(free.any()):
+                        err = max(err, float((share - share_p).abs()[free].max()))
+                    bs.append(b)
+                    means[name].append(float(b.mean()))
+                per_rows.append(torch.stack(bs))
+            out[layer] = (per_rows[0], per_rows[1])
+        n_per = int(per.numel())
+        return out, {"check_max_abs": err, "clamped_fraction": n_clamped / max(n_el, 1),
+                     "b_video_mean": float(np.mean(means["video"])), "b_action_mean": float(np.mean(means["action"])),
+                     "b_count": [round(math.log(n_per / int(x.numel())), 6) for x in plan.slices]}
+
+    @staticmethod
+    def _merge_rows(h: torch.Tensor, mg: dict) -> torch.Tensor:
+        """merge: every group's input, the fp32 mean of its members' streams (contiguous spans of ``h``), in h's dtype."""
+        return torch.stack([h[:, a:b].float().mean(dim=1) for a, b in mg["spans"]], dim=1).to(h.dtype)
 
     def _io_pre_rope(self, expert, block, x: torch.Tensor, freqs: torch.Tensor, t_mod: torch.Tensor):
         """``mot._build_expert_attention_io`` with the same operations in the same order (so the same
@@ -600,6 +650,18 @@ class JointCaseStudyRunner:
         fv_freqs = None
         fv_count = torch.zeros(num_future, dtype=torch.long, device=model.device)
         fv_rows: list[int] = []
+        # N1-N4: interlace_cal's step-0 queries / keys per layer, then its per-layer biases (video [slices, H, Kf], action
+        # [slices, H, A]) and each slice's positions among its step's rows; interlace_fill's nearest-computed map per slice;
+        # merge's grouping of the periphery (absolute indices, group of each member, group sizes, member spans).
+        fv_cal = fovea_m == "interlace_cal"
+        fv_fill = fovea_m == "interlace_fill"
+        fv_merge = fovea_m == "merge"
+        cal_qk: dict[int, tuple] = {}
+        cal_bias: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        cal_pos: list[torch.Tensor] = []
+        fill_src: list[torch.Tensor] = []
+        fill_checked = False
+        mg: Optional[dict] = None
         no_future = prune is not None and prune.action_no_future
         ex_w = prune.extrapolate_w if prune is not None else None
         cost_extra: list[list[int]] = []
@@ -669,7 +731,13 @@ class JointCaseStudyRunner:
             idx_abs = idx_rel + f0
             xv = pre_v["tokens"][:, idx_abs]
             n_syn = len(fv_members) if fv_step else 0
-            if n_syn:
+            merge_step = n_syn > 0 and mg is not None
+            h_mem = None
+            if merge_step:
+                # merge: every periphery member's own residual stream, from its own token embedding of this step.
+                h_mem = pre_v["tokens"][:, mg["abs"]]
+                xv = torch.cat([xv, self._merge_rows(h_mem, mg)], dim=1)
+            elif n_syn:
                 # Fov: each region token's input is the mean of its members' token embeddings (the patch embedding is
                 # linear, so this is the embedding of the members' mean latent), recomputed from this step's latents.
                 xv_syn = torch.stack([pre_v["tokens"][:, m].float().mean(dim=1) for m in fv_members], dim=1).to(xv.dtype)
@@ -731,7 +799,21 @@ class JointCaseStudyRunner:
                     bv = self.video.blocks[layer]
                     ba = self.action.blocks[layer]
                     io_v = k_t = None
-                    if n_q and recon is not None:
+                    fill_now = fv_step and bool(fill_src)
+                    xg_in = xv[:, int(idx_rel.numel()):] if merge_step else None  # merge: the groups' input to this layer
+                    cal_v = cal_a = None
+                    if fv_step and cal_bias:
+                        # N1: this step's slice keys + b of their row (step-0 calibration), per head; video rows by token.
+                        ki = (s - 1) % len(fplan.slices)
+                        b_v, b_a = cal_bias[layer]
+                        cols = f0 + cal_pos[ki]
+                        n_act = int(pre_a["tokens"].shape[1])
+                        cal_v = torch.zeros((1, self.num_heads, n_q, f0 + n_q), device=model.device)
+                        cal_v[0, :, :, cols] = b_v[ki][:, idx_rel].unsqueeze(-1).expand(-1, -1, cols.numel())
+                        cal_a = torch.zeros((1, self.num_heads, n_act, f0 + n_q + n_act), device=model.device)
+                        cal_a[0, :, :, cols] = b_a[ki].unsqueeze(-1).expand(-1, -1, cols.numel())
+                        cal_v, cal_a = cal_v.to(xv.dtype), cal_a.to(xv.dtype)
+                    if n_q and (recon is not None or fill_now):
                         io_v, k_t = self._io_pre_rope(self.video, bv, xv, freqs_v, tmod_v)
                     elif n_q:
                         io_v = self.mot._build_expert_attention_io(expert=self.video, block=bv, x=xv, freqs=freqs_v, t_mod=tmod_v)
@@ -739,6 +821,15 @@ class JointCaseStudyRunner:
                         expert=self.action, block=ba, x=xa, freqs=pre_a["freqs"], t_mod=pre_a["t_mod"]
                     )
                     k_new, v_new = (io_v[1], io_v[2]) if io_v is not None else (kv0[layer]["k"][:, :0], kv0[layer]["v"][:, :0])
+                    if fill_now:
+                        # N2: every future position's key / value from the token computed on this step nearest to it (its
+                        # pre-RoPE key rotated to the position's own RoPE); a computed token keeps its own.
+                        src = fill_src[(s - 1) % len(fill_src)]
+                        k_new = rope_apply(k_t[:, src], pre_v["freqs"][f0:f0 + num_future], self.num_heads)
+                        v_new = io_v[2][:, src]
+                        if not fill_checked:
+                            diag["fovea"]["fill_self_key_bitwise"] = bool(torch.equal(k_new[:, idx_rel], io_v[1]))
+                            fill_checked = True
                     k_vid = torch.cat([kv0[layer]["k"], k_new], dim=1)
                     v_vid = torch.cat([kv0[layer]["v"], v_new], dim=1)
                     if rc_step:
@@ -826,7 +917,7 @@ class JointCaseStudyRunner:
                         else:
                             kv_k, kv_v = k_vid, v_vid
                             if fv_step:
-                                vmask = fv_mask_v
+                                vmask = cal_v if cal_v is not None else fv_mask_v
                         out_v = flash_attention(q=io_v[0], k=kv_k, v=kv_v, num_heads=self.num_heads, ctx_mask=vmask)
                         n_vk = int(kv_k.shape[1])
                         steer_v_warm = steer_v is not None and s == 0
@@ -865,12 +956,13 @@ class JointCaseStudyRunner:
                         kept_cols = slice(f0, f0 + n_q)
                     elif fv_step:
                         # Fovea: the action rows see frame 0, this step's computed future rows (real and region
-                        # tokens, nothing older) and themselves.
+                        # tokens, nothing older; N2: every position filled from them) and themselves.
                         k_all = torch.cat([k_vid, io_a[1]], dim=1)
                         v_all = torch.cat([v_vid, io_a[2]], dim=1)
-                        kept_cols = slice(f0, f0 + n_q)
-                        amask = fv_mask_a
-                        if int(k_all.shape[1]) != f0 + n_q + int(io_a[1].shape[1]):
+                        n_fk = int(k_new.shape[1])
+                        kept_cols = slice(f0, f0 + n_fk)
+                        amask = cal_a if cal_a is not None else fv_mask_a
+                        if n_fk != (num_future if fill_now else n_q) or int(k_all.shape[1]) != f0 + n_fk + int(io_a[1].shape[1]):
                             raise RuntimeError("fovea: the action rows see keys that were not computed on this step")
                     elif no_future and mode == "pruned":
                         # S0-noF: the action rows see frame 0 and themselves, no future token.
@@ -930,6 +1022,8 @@ class JointCaseStudyRunner:
                         # tokens on this full step) and the action rows, head mean, summed over rows.
                         recv_acc += self._attention_probs(io_v[0], k_vid)[:, f0:].sum(dim=0)
                         recv_acc += self._attention_probs(io_a[0], k_all)[:, f0:f0 + num_future].sum(dim=0)
+                    if fv_cal and s == 0:  # N1: the dense step's queries and keys, for the calibration once the plan is known
+                        cal_qk[layer] = (io_v[0], io_a[0], io_v[1], io_a[1])
                     if fattn_acc is not None:
                         # Beside the forward pass: head- and query-mean attention on [frame-0 | kept future] keys
                         # (the plain key layout, checked in the config), summed over layers.
@@ -960,6 +1054,16 @@ class JointCaseStudyRunner:
                         )).to(out_a.dtype)
                     if io_v is not None:
                         xv = self._post(bv, io_v, out_v, payload_v)
+                    if merge_step:
+                        # merge: each group's residual increment of this layer onto its members' own streams (a group of
+                        # one takes the output itself), then the groups re-formed from the streams for the next layer.
+                        n_fix = int(idx_rel.numel())
+                        out_g = xv[:, n_fix:]
+                        h_new = (h_mem.float() + (out_g.float() - xg_in.float())[:, mg["gid"]]).to(h_mem.dtype)
+                        h_new[:, mg["single"]] = out_g[:, mg["gid"][mg["single"]]]
+                        h_mem = h_new
+                        if layer + 1 < self.num_layers:
+                            xv = torch.cat([xv[:, :n_fix], self._merge_rows(h_mem, mg)], dim=1)
                     xa = self._post(ba, io_a, out_a, payload_a)
                     if ex_step:
                         # EX: the action expert once more on its own stream, keys [frame-0 | action].
@@ -998,17 +1102,26 @@ class JointCaseStudyRunner:
                 fattn_rows.append(row)
 
             # ---- heads and scheduler step
-            if idx_abs.numel():  # keep 0: no future token is recomputed after warm-up
-                t_rows = pre_v["t"][:, idx_abs]
-                if n_syn:
-                    t_rows = torch.cat([t_rows, pre_v["t"][:, fv_first]], dim=1)
-                vel_part = self.video.head(xv, t_rows)
+            if idx_abs.numel() or merge_step:  # keep 0: no future token is recomputed after warm-up
+                n_real = int(idx_abs.numel())
+                if merge_step:
+                    # merge: the real rows, then every periphery member's own stream through the head (its own velocity)
+                    vel_part = self.video.head(torch.cat([xv[:, :n_real], h_mem], dim=1),
+                                               torch.cat([pre_v["t"][:, idx_abs], pre_v["t"][:, mg["abs"]]], dim=1))
+                else:
+                    t_rows = pre_v["t"][:, idx_abs]
+                    if n_syn:
+                        t_rows = torch.cat([t_rows, pre_v["t"][:, fv_first]], dim=1)
+                    vel_part = self.video.head(xv, t_rows)
                 if vel_tokens is None:
                     vel_tokens = torch.zeros((1, f0 + num_future, vel_part.shape[-1]), device=vel_part.device, dtype=vel_part.dtype)
-                n_real = int(idx_abs.numel())
                 vel_tokens[:, idx_abs] = vel_part[:, :n_real]  # pruned tokens keep their last velocity
-                for g, members in enumerate(fv_members if n_syn else ()):
-                    vel_tokens[:, members] = vel_part[:, n_real + g:n_real + g + 1]  # a region token's velocity to every member
+                if merge_step:
+                    vel_tokens[:, mg["abs"]] = vel_part[:, n_real:]
+                    fv_count[mg["abs"] - f0] += 1
+                else:
+                    for g, members in enumerate(fv_members if n_syn else ()):
+                        vel_tokens[:, members] = vel_part[:, n_real + g:n_real + g + 1]  # a region token's velocity to every member
                 if fv_step:
                     fv_count[idx_rel] += 1
             pred_video = self.video.unpatchify(vel_tokens, pre_v["meta"]["grid_size"])
@@ -1138,7 +1251,8 @@ class JointCaseStudyRunner:
                     gen = torch.Generator(device="cpu").manual_seed((int(seed) + 3) & 0x7FFFFFFF)
                     fplan = fv.make_plan(fovea_m, k, grid, av_all.float().cpu(), diff_score.float().cpu(), recv.float().cpu(),
                                          None if x0_fut is None else x0_fut.cpu(), gen, off=prune.fovea_off,
-                                         wzero=prune.fovea_wzero, nofar=prune.fovea_nofar).to(kept.device)
+                                         wzero=prune.fovea_wzero, nofar=prune.fovea_nofar,
+                                         singleton=prune.fovea_singleton).to(kept.device)
                     kept = fplan.fixed
                     fv_members = [g + f0 for g, _ in fplan.regions]
                     if fv_members:
@@ -1154,6 +1268,23 @@ class JointCaseStudyRunner:
                         "truncated": 0 if fplan.truncated is None else int(fplan.truncated.numel()),
                         "core_index": fplan.core.tolist(), "slice_bias": [round(x, 6) for x in fplan.slice_bias],
                     }
+                    if fplan.freq is not None:
+                        diag["fovea"]["freq_hist"] = {int(f): int((fplan.freq == f).sum()) for f in torch.unique(fplan.freq).tolist()}
+                        diag["fovea"]["freq_sum"] = int(fplan.freq.sum())
+                    if fv_cal and fplan.slices:
+                        cal_bias, diag["fovea"]["cal"] = self._cal_bias(fplan, cal_qk, kv0, f0, num_future)
+                        cal_pos = [torch.searchsorted(fplan.real(i + 1), x) for i, x in enumerate(fplan.slices)]
+                    cal_qk.clear()
+                    if fv_fill and fplan.slices:
+                        fills = [fv.fill_map(fplan.real(i + 1), grid) for i in range(len(fplan.slices))]
+                        fill_src = [m for m, _ in fills]
+                        diag["fovea"]["fill_out_of_block"] = [n for _, n in fills]
+                    if fv_merge and fv_members:
+                        sizes = [int(m.numel()) for m in fv_members]
+                        mg = {"abs": torch.cat(fv_members), "cnt": sizes,
+                              "gid": torch.cat([torch.full((n,), g, dtype=torch.long, device=kept.device) for g, n in enumerate(sizes)]),
+                              "spans": [(sum(sizes[:g]), sum(sizes[:g + 1])) for g in range(len(sizes))]}
+                        mg["single"] = torch.tensor([n == 1 for n in sizes], device=kept.device)[mg["gid"]]
                 if cache_kv and not video_eager and s == prune.warmup_steps - 1:
                     keep_mask = torch.ones(num_future, dtype=torch.bool, device=kept.device)
                     keep_mask[kept] = False
@@ -1298,7 +1429,13 @@ class JointCaseStudyRunner:
             diag["sink_recv_f16"] = _f16_b64(recv)
         if fplan is not None:
             diag["fovea"]["rows_per_step"] = fv_rows
-            if fplan.slices:
+            if fplan.freq is not None and fplan.slices:
+                # N4: every future token computed exactly f_j times, every pruned step the same number of rows.
+                ok = bool(torch.equal(fv_count, fplan.freq.to(fv_count.device))) and len(set(fv_rows)) == 1
+                diag["fovea"]["ht_counts_ok"] = ok
+                if not ok and len(fv_rows) == len(fplan.slices):
+                    raise RuntimeError("fovea interlace_ht: a token was not computed f_j times, or the rows differ by step")
+            elif fplan.slices:
                 # Interlace: every periphery token not cut by the quota computed exactly once on the pruned steps.
                 cut = set(fplan.truncated.tolist())
                 cnt = fv_count[fplan.periphery].tolist()

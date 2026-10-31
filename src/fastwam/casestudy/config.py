@@ -87,7 +87,8 @@ from typing import Any, Optional
 
 METHODS = ("dense", "prune", "teacache", "noise")
 SELECTIONS = ("av", "vv", "cf", "random", "diff", "diff_global")
-FOVEA_METHODS = ("sink", "rep", "fov_grid", "fov_cluster", "interlace", "interlace_w", "interlace_wfar")
+FOVEA_METHODS = ("sink", "rep", "fov_grid", "fov_cluster", "interlace", "interlace_w", "interlace_wfar",
+                 "interlace_cal", "interlace_fill", "merge", "interlace_ht")
 LAYER_RULES = ("min_entropy", "fixed")
 SEED_MODES = ("episode_call_hash", "native_fixed")
 
@@ -174,7 +175,8 @@ class PruneConfig:
     #: Self-check of the diff selections: score with A->V instead of the clean-estimate distance, through the
     #: same code path (diff_global with it must equal av bit for bit).
     diff_debug_av: bool = False
-    #: Fovea round (``fovea.py``): sink | rep | fov_grid | fov_cluster | interlace on top of S0's A->V scoring;
+    #: Fovea round (``fovea.py``): sink | rep | fov_grid | fov_cluster | interlace on top of S0's A->V scoring (fovea-w:
+    #: interlace_w | interlace_wfar; N1-N4: interlace_cal | interlace_fill | merge | interlace_ht);
     #: ``fovea_off`` keeps the method's code path but selects S0's A->V top-k only (self-check).
     fovea: Optional[str] = None
     fovea_off: bool = False
@@ -182,6 +184,8 @@ class PruneConfig:
     #: interlace_wfar's far-frame core (must equal interlace_w).
     fovea_wzero: bool = False
     fovea_nofar: bool = False
+    #: N1-N4 self-check: merge with every future token in a group of its own and no sinks / core (must equal dense).
+    fovea_singleton: bool = False
 
 
 @dataclass(frozen=True)
@@ -361,12 +365,15 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             fovea_off=bool(block.get("fovea_off", False)),
             fovea_wzero=bool(block.get("fovea_wzero", False)),
             fovea_nofar=bool(block.get("fovea_nofar", False)),
+            fovea_singleton=bool(block.get("fovea_singleton", False)),
         )
         if prune.fovea is not None or prune.fovea_off:
             _require(prune.fovea in FOVEA_METHODS, f"prune.fovea must be one of {FOVEA_METHODS} (fovea_off needs a method)")
             _require(not prune.fovea_wzero or prune.fovea in ("interlace_w", "interlace_wfar"),
                      "prune.fovea_wzero is for interlace_w / interlace_wfar")
             _require(not prune.fovea_nofar or prune.fovea == "interlace_wfar", "prune.fovea_nofar is for interlace_wfar")
+            _require(not prune.fovea_singleton or (prune.fovea == "merge" and not prune.fovea_off),
+                     "prune.fovea_singleton is for merge (without fovea_off)")
             _require(prune.selection == "av" and prune.warmup_steps == 1 and prune.keep_ratio > 0.0 and not (
                 prune.action_full_kv or prune.video_full_kv or prune.summary_grid or prune.oracle_kv or prune.recon is not None
                 or prune.steer is not None or prune.steer_video is not None or prune.dense_bias or prune.video_eager
@@ -532,8 +539,10 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
     p = cfg.prune
     _require(p is None or p.fovea in (None, "sink") or p.fovea_off or not (
         cfg.record_future_attn or cfg.record_video_frame0 or cfg.record_motion_steps
-        or (cfg.record_future_share and p.fovea not in ("interlace", "interlace_w", "interlace_wfar"))),
-        "the per-key / per-query records are defined for fovea sink (or fovea_off) only; future share also for interlace*")
+        or (cfg.record_future_share and p.fovea not in ("interlace", "interlace_w", "interlace_wfar", "interlace_cal",
+                                                         "interlace_fill", "merge", "interlace_ht"))),
+        "the per-key / per-query records are defined for fovea sink (or fovea_off) only; future share also for interlace* "
+        "and merge")
     _require(not cfg.video_freeze or (cfg.method == "dense" and p is None and cfg.frame0_cache),
              "video_freeze is a dense self-check (casestudy path)")
     _require(not cfg.record_future_attn or p is None or not (
