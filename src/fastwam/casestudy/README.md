@@ -12,7 +12,7 @@ tools are in `scripts/casestudy/`. FastWAM-IDM (official Optional-IDM) has its o
 | `config.py` | `CaseStudyConfig` / `PruneConfig` and `parse_config` (strict: unknown keys and invalid combinations are errors). |
 | `joint_runner.py` | `JointCaseStudyRunner`: the denoising loop with frame-0 K/V and prompt reuse, every arm, the diagnostics. |
 | `selection.py` | Token grid, A->V / V->V / CF / Diff scores, top-k selection, the CF phase gate. |
-| `fovea.py` | fovea / fovea-w plans: sinks, core, periphery; Rep, Fov-grid / Fov-cluster, Interlace (M4) and the weighted M4w / M4w-far. |
+| `fovea.py` | fovea / fovea-w / n1-4 plans: sinks, core, periphery; Rep, Fov-grid / Fov-cluster, Interlace (M4), the weighted M4w / M4w-far, and N1-N4 (calibrated weight, fresh fill map, merge groups, HT frequencies and schedule). |
 | `hybrid.py` | component / along-cross hybrid execution (dense chunk with one component of a partner chunk). |
 | `along.py` | along-cross geometry: a chunk endpoint projected on the dense path (pure numpy). |
 | `agc.py` | AGC round: pilot + automatic gain of the output chunk. |
@@ -30,5 +30,6 @@ tools are in `scripts/casestudy/`. FastWAM-IDM (official Optional-IDM) has its o
 | diff-select | `selection diff / diff_global`, `diff_debug_av`, `record_future_attn`, `dump` |
 | fovea | `fovea sink / rep / fov_grid / fov_cluster / interlace`, `fovea_off`, `record_sinks` |
 | fovea-w | `fovea interlace_w / interlace_wfar`, `fovea_wzero`, `fovea_nofar`, `video_freeze` |
+| n1-4 | `fovea interlace_cal / interlace_fill / merge / interlace_ht`, `fovea_singleton` |
 
 Tests: `tests/test_casestudy_*.py` (CPU; run on the server, not locally).
