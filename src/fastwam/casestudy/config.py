@@ -38,7 +38,7 @@ on the bf16 SDPA path unless ``video_eager``); ``oracle_kv``
 gives the action rows of pruned steps the kept tokens' K/V of a dense pass of the same call,
 seed and step; ``dense_bias`` never prunes and adds ``steer.lam * b`` to every future column
 of the action rows after warm-up (``lam = -1`` gives the sparse arm's future share with every
-token present).
+token present). ``steer.const`` sets b = 1 (a constant offset ``lam`` on those columns).
 
 ``recon`` (pure pruning plus reconstruction): on pruned steps the dropped positions are not
 computed or cached; each pruned step infers their K/V from the frame-0 token at the same (h, w)
@@ -106,6 +106,9 @@ class SteerConfig:
     lam: float = 0.0
     #: Upper clamp of b = log(mF / mFk), per layer, head and action row.
     clamp: float = 3.0
+    #: b = 1 on every layer, head and row, so the bias is ``lam`` itself (a constant logit offset; with
+    #: ``dense_bias``: every future column of the action rows after warm-up). share-sparsity round.
+    const: bool = False
 
 
 @dataclass(frozen=True)
@@ -415,6 +418,7 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
                 _require(st.clamp > 0, f"prune.{name}.clamp must be > 0")
                 _require(not prune.reselect_every_step, f"prune.{name} needs a kept set fixed after warm-up")
                 _require(prune.warmup_steps == 1, f"prune.{name} needs warmup_steps == 1")
+                _require(not st.const or (name == "steer" and prune.dense_bias), f"prune.{name}.const needs prune.dense_bias")
         new_path = prune.video_eager or prune.steer_video is not None or prune.oracle_kv or prune.dense_bias
         if new_path:
             _require(prune.steer is not None, "the context probes need prune.steer (the shared action-row path)")
@@ -564,7 +568,8 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
 def _steer(raw: Any, where: str) -> SteerConfig:
     block = dict(raw)
     _known_keys(block, {f for f in SteerConfig.__dataclass_fields__}, where)
-    return SteerConfig(lam=float(block.get("lam", 0.0)), clamp=float(block.get("clamp", 3.0)))
+    return SteerConfig(lam=float(block.get("lam", 0.0)), clamp=float(block.get("clamp", 3.0)),
+                       const=bool(block.get("const", False)))
 
 
 def call_seed(episode_key: str, call_index: int, offset: int = 0) -> int:

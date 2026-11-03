@@ -133,6 +133,24 @@ def test_dense_bias_gives_sparse_share():
     assert torch.allclose(dense, sparse, atol=1e-6)
 
 
+def test_const_dense_bias_is_a_constant_offset():
+    runner = _runner()
+    logits, fut = _warmup(runner, seed=6)
+    bias, diag = runner._steer_bias(SteerConfig(lam=-1.0, const=True), {0: fut}, {0: logits}, torch.tensor([1, 4]), F0, NF,
+                                    dense_bias=True)
+    assert torch.equal(bias[0], torch.ones(HEADS, NA)) and diag["const"] and diag["check_max_abs"] is None
+    assert "dense_bias_check_max_abs" not in diag and diag["clamped_fraction"] == 0.0
+    got = runner._steered_probs(logits, slice(F0, F0 + NF), bias[0], -1.0)
+    ref = logits.clone()
+    ref[..., F0:F0 + NF] -= 1.0
+    assert torch.allclose(got, torch.softmax(ref, dim=-1), atol=1e-7)
+    base = {"selection": "av", "keep_ratio": 0.2, "warmup_steps": 1}
+    cfg = parse_config({"method": "prune", "prune": {**base, "dense_bias": True, "steer": {"lam": 2.0, "const": True}}})
+    assert cfg.prune.steer == SteerConfig(lam=2.0, const=True)
+    with pytest.raises(ValueError):  # const is defined for dense_bias only
+        parse_config({"method": "prune", "prune": {**base, "steer": {"lam": 2.0, "const": True}}})
+
+
 def test_context_probe_config():
     base = {"selection": "av", "keep_ratio": 0.2, "warmup_steps": 1, "steer": {"lam": 0.0}}
     v1 = parse_config({"method": "prune", "record_video_frame0": True, "record_motion_steps": True,

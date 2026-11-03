@@ -171,7 +171,7 @@ class JointCaseStudyRunner:
             m_f = p.sum(dim=-1)
             m_fk = p[..., kept].sum(dim=-1)
             raw = torch.log(m_f.clamp_min(1e-30) / m_fk.clamp_min(1e-30))
-            b = raw.clamp(max=steer.clamp)
+            b = torch.ones_like(raw) if steer.const else raw.clamp(max=steer.clamp)
             bias[layer] = b
             lg = logits[layer]
             cols = torch.cat([
@@ -179,10 +179,10 @@ class JointCaseStudyRunner:
                 torch.arange(f0 + num_future, lg.shape[-1], device=lg.device),
             ])
             share = self._steered_probs(lg[..., cols], slice(f0, f0 + nk), b, 1.0)[..., f0:f0 + nk].sum(dim=-1)
-            for key, value in (("b", b), ("err", (share - m_f).abs()), ("clamped", raw > steer.clamp),
+            for key, value in (("b", b), ("err", (share - m_f).abs()), ("clamped", (raw > steer.clamp) & (not steer.const)),
                                ("m_f", m_f), ("m_fk", m_fk)):
                 rows[key].append(value)
-            if dense_bias and steer.lam == -1.0:
+            if dense_bias and steer.lam == -1.0 and not steer.const:
                 fut = slice(f0, f0 + num_future)
                 d_share = self._steered_probs(lg, fut, b, -1.0)[..., fut].sum(dim=-1)
                 rows["err_dense"].append((d_share - m_fk / (1.0 - m_f + m_fk)).abs())
@@ -200,6 +200,8 @@ class JointCaseStudyRunner:
         }
         if "err_dense" in t:
             out["dense_bias_check_max_abs"] = float(t["err_dense"][free].max()) if bool(free.any()) else None
+        if steer.const:  # b = 1: no restoring formula to check
+            out.update(const=True, check_max_abs=None, check_max_abs_clamped=None)
         return bias, out
 
     def _steer_video_bias(self, steer, fut_probs: dict, logits: dict, kept: torch.Tensor, f0: int):
