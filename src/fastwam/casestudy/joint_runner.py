@@ -343,6 +343,11 @@ class JointCaseStudyRunner:
         elif spec == "patch39":
             out = torch.tensor([f * pf + r * grid.width + cam * half + c for f in range(grid.frames - 1) for cam in (0, 1)
                                 for r in (2, 3, 4) for c in (2, 3, 4)] + [fv.PROBE_SINK, *fv.PROBE_CORNERS])
+        elif spec.startswith("f1s"):  # step0-explore: the near frame only, stratified random over its two camera blocks
+            n = int(spec[3:])
+            out = torch.cat([torch.tensor(b)[torch.randperm(len(b), generator=gen)[:k]] for b, k in zip(blocks[:2], (n - n // 2, n // 2))])
+        elif spec == "f1g32":  # the near frame on rows / columns {0, 2, 4, 6} of both cameras
+            out = torch.tensor([r * grid.width + cam * half + c for cam in (0, 1) for r in (0, 2, 4, 6) for c in (0, 2, 4, 6)])
         elif spec == "agf1":
             out = torch.tensor(blocks[0])
         elif spec == "frame1":
