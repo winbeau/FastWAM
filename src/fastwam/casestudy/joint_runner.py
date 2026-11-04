@@ -971,12 +971,16 @@ class JointCaseStudyRunner:
         s0_mode = prune.step0 if prune is not None else None
         s0_probes: Optional[torch.Tensor] = None
         s0_bias = 0.0
+        # late-anchor-confirm X-early (late_step 0): step 0 computes the late set (key bias) and forms the imagination.
+        early = prune is not None and prune.late is not None and prune.late_step == 0
         if s0_mode is not None:
             s0_probes = all_future if prune.step0_all else (fv.probe_index(grid) if prune.step0_rows is None else
                                                              self._explore_rows(prune.step0_rows, grid, None)).to(model.device)
-            if prune.late is not None:  # step0-explore late anchor: step 0 computes no future token
+            if early:
+                s0_probes = self._explore_rows(prune.late, grid, None).to(model.device)
+            elif prune.late is not None:  # step0-explore late anchor: step 0 computes no future token
                 s0_probes = all_future[:0]
-            if not (prune.step0_all or prune.step0_nobias or prune.late is not None):
+            if not (prune.step0_all or prune.step0_nobias or (prune.late is not None and not early)):
                 s0_bias = math.log(num_future / int(s0_probes.numel()))
         s0_zf: Optional[torch.Tensor] = None
         s0_pilot: Optional[torch.Tensor] = None
@@ -990,7 +994,7 @@ class JointCaseStudyRunner:
         c2f: Optional[dict] = {} if prune is not None and prune.c2f is not None else None
         # step0-explore late anchor: step 0 computes no future token, step 1 computes the set ``prune.late`` and forms the
         # imagination (drafts spread from it), the plan of steps 2-9 comes from step 1.
-        late = prune.late if prune is not None else None
+        late = prune.late if prune is not None and not early else None
         late_st: dict = {"recv": torch.zeros(num_future, device=model.device)} if late is not None else {}
         z_late = rearrange(latents_video[0, :, 0:int(patch[0])].float(), "c (f a) (h b) (w e) -> f (h w) (c a b e)", a=int(patch[0]),
                            b=int(patch[1]), e=int(patch[2]))[0] if late is not None else None
@@ -1954,12 +1958,25 @@ class JointCaseStudyRunner:
                                         bias_real={int(j): lg for j in survey.tolist()}).to(kept.device)
                         c2f.update(av=av0, diff=df0, measured=s0_probes.clone(), sinks=s0_sinks.clone())
                         diag["c2f"] = {"survey": survey.tolist()}
+                    elif early:
+                        # late-anchor-confirm X-early: the plan of steps 1-9 from step 0 by the late anchor's rule (sinks above, core
+                        # from the spread A->V and the Diff of the spread drafts, computed tokens in the last slices, 9 slices, step 9
+                        # + late_extra).
+                        fplan = fv.c2f_plan(s0_probes.cpu(), av_plan.float().cpu(), diff_plan.float().cpu(), s0_sinks.cpu(), grid, k,
+                                            first=1, core_all=True, last_extra=int(prune.late_extra)).to(kept.device)
+                        diag["late"] = {"set": prune.late, "n": int(s0_probes.numel()), "step": 0, "core": fplan.core.tolist(),
+                                        "sinks": fplan.sinks.tolist(), "slices": [int(x.numel()) for x in fplan.slices],
+                                        "truncated": int(fplan.truncated.numel())}
                     else:
                         fplan = fv.make_plan(fovea_m, k, grid, av_plan.float().cpu(), diff_plan.float().cpu(), recv.float().cpu(),
                                              None if x0_fut is None else x0_fut.cpu(), gen, off=prune.fovea_off,
                                              wzero=prune.fovea_wzero, nofar=prune.fovea_nofar,
                                              singleton=prune.fovea_singleton,
                                              sinks=None if s0_sinks is None else s0_sinks.cpu(), probes=plan_probes).to(kept.device)
+                        if prune.late_extra and s0_mode is None:
+                            # late-anchor-confirm (M4w + extra reads): step 9's slice also computes the best never-computed tokens
+                            # by step 0's A->V.
+                            fplan = fv.add_last_extra(fplan, av_plan, int(prune.late_extra))
                     if s0_mode is not None and fplan.slices:
                         # Runner check (DECISIONS C.3): the slices and the truncated tokens partition the periphery.
                         parts = torch.cat(fplan.slices + [fplan.truncated])

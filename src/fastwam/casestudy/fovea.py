@@ -298,6 +298,24 @@ def c2f_plan(measured: torch.Tensor, av: torch.Tensor, diff: torch.Tensor, sinks
     return Plan("interlace_w", sinks.cpu(), core, periphery, fixed, slices=slices, truncated=cut, slice_bias=bias)
 
 
+def add_last_extra(plan: "Plan", av: torch.Tensor, n: int, n_steps: int = 10) -> "Plan":
+    """late-anchor-confirm (M4w + extra reads): the last step's slice (real(n_steps - 1) reads slices[(n_steps - 2) % len]) also
+    computes the ``n`` truncated tokens with the highest ``av`` (ties to the smaller index); they leave the truncated set and that
+    slice's key bias becomes log(N / n_s) of its new size (interlace_w). Every other slice is unchanged."""
+    if not plan.slices or plan.truncated is None or not plan.truncated.numel() or n <= 0:
+        return plan
+    cut = plan.truncated
+    extra = cut[torch.argsort(-av.float().to(cut.device)[cut], stable=True)][:n]
+    i9 = (n_steps - 2) % len(plan.slices)
+    slices = list(plan.slices)
+    slices[i9] = torch.sort(torch.cat([slices[i9], extra.to(slices[i9].device)])).values
+    bias = list(plan.slice_bias)
+    if bias:
+        bias[i9] = math.log(int(plan.periphery.numel()) / int(slices[i9].numel()))
+    return Plan(plan.method, plan.sinks, plan.core, plan.periphery, plan.fixed, slices=slices, truncated=cut[~torch.isin(cut, extra)],
+                bias_real=dict(plan.bias_real), regions=list(plan.regions), region_pos=plan.region_pos, slice_bias=bias, freq=plan.freq)
+
+
 def tube_mask(cells: dict, grid: sel.Grid, wrist_rows: bool = False, dilate: int = 1) -> torch.Tensor:
     """Plan D: [Kf] bool, the agentview cells (row, column) of every future frame (``cells[f]``, f = 1..F-1) dilated by
     ``dilate`` within the block; ``wrist_rows`` adds the two bottom rows of every wrist block."""
@@ -581,7 +599,7 @@ def make_plan(method: str, k: int, grid: sel.Grid, av: torch.Tensor, diff: torch
                 region_pos=pos)
 
 
-__all__ = ["INTERLACE", "METHODS", "PROBE_CORNERS", "PROBE_SINK", "Plan", "STEP0", "fill_map", "grid_regions",
+__all__ = ["INTERLACE", "METHODS", "PROBE_CORNERS", "PROBE_SINK", "Plan", "STEP0", "add_last_extra", "fill_map", "grid_regions",
            "ht_frequencies", "ht_schedule", "interlace_slices", "interp_tokens", "kmeans", "make_plan", "probe_index",
            "rope_freqs_at", "step0_slices", "tube_mask", "nearest_sources", "idw_fill", "align_frames", "memory_map",
            "select_core", "reselect"]
