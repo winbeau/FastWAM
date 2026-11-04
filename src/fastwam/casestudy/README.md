@@ -35,5 +35,6 @@ tools are in `scripts/casestudy/`. FastWAM-IDM (official Optional-IDM) has its o
 | step0-sparse | `prune.step0 b / d`, `step0_nobias`, `step0_all`, `e9`, `record_step0_x0`; adapter `step0_tube` |
 | step0-sparse-r2 | `prune.side0_m / side0_use`, `draft_from`, `mem / mem_route / mem_direct / reselect_step`; dense `record_r2_steps / record_r2_all / record_r3_ms`; adapter `_memory_key` |
 | step0-explore | `explore` / `explore_track` (dense), `draft_mod`, `step0_gain`, `c2f`, `step0_rows`, `step0_draft` (grid / idw / near), `step0_far_lambda`, `late`, `late_extra` (the late anchor) |
+| late-anchor-confirm | `late_step` (0 = X-early: the late set computed on step 0), `late_extra` on plain interlace_w (`fovea.add_last_extra`, M4w + step-9 extra reads); IDM-L on the `optional-idm` branch (`idm_runner.py`, `prune.late`) |
 
 Tests: `tests/test_casestudy_*.py` (CPU; run on the server, not locally).
