@@ -200,6 +200,22 @@ class PruneConfig:
     #: step0-sparse E9 (interlace_w, dense step 0): the drafts of slices 1-6 (``early``) or 8-9 (``late``) replaced by the
     #: probe interpolation of step 0's clean estimate, from step 0's update on.
     e9: Optional[str] = None
+    #: step0-sparse-r2 (interlace_w, dense main step 0): a side forward of the 39 probes on step 0's latents (the first
+    #: ``side0_m`` blocks with every future token) gives B's plan (``plan``: R1-plan), step 0's outputs (``draft``: R1-draft)
+    #: or both (``both``: = B for m 0; R3b, whose step-0 FLOPs are the side forward's).
+    side0_m: Optional[int] = None
+    side0_use: Optional[str] = None
+    #: R5 / R7: after step s >= draft_from, every periphery token still to be computed takes the inverse-distance mean of the
+    #: step's computed tokens' x^0 in its block as its draft, v = (x - d) / sigma_s.
+    draft_from: Optional[int] = None
+    #: R6 / R7: keep the call's imagination per memory key (terminal latents, last-step tokens, last A->V, step-9 recv) and log
+    #: the plan it gives the next call; ``mem_route`` (R7) uses it from the second call on: plan, drafts (``mem_direct``:
+    #: every terminal aligned, else interpolated from the last step's tokens), step 0 pruned, 10 slices;
+    #: ``reselect_step`` (R7b) recomposes the core before that step.
+    mem: bool = False
+    mem_route: bool = False
+    mem_direct: bool = False
+    reselect_step: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -300,8 +316,15 @@ class CaseStudyConfig:
     record_sinks: bool = False
     #: fovea-w G4 (dense only): every denoising step recomputes the video stream from step 0's latents and sigma.
     video_freeze: bool = False
-    #: step0-sparse E8: log the step-0 clean estimate x - sigma_0 v at the 39 probes (``fovea.probe_index``).
+    #: step0-sparse E8: log the step-0 clean estimate x - sigma_0 v at the 39 probes (``fovea.probe_index``); r2: also the
+    #: terminal latents there.
     record_step0_x0: bool = False
+    #: step0-sparse-r2 R2: on these steps a side forward of the 39 probes (key bias) on the step's latents, its x^0 error at the
+    #: probes against the main pass and the main pass's x^0 there; ``record_r2_all``: every future token, no bias (self-check).
+    record_r2_steps: tuple[int, ...] = ()
+    record_r2_all: bool = False
+    #: R3: on step 0 side forwards with every future token on the first m blocks, the 39 probes after (one per m).
+    record_r3_ms: tuple[int, ...] = ()
 
     def describe(self) -> dict[str, Any]:
         return asdict(self)
@@ -386,6 +409,13 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             step0_nobias=bool(block.get("step0_nobias", False)),
             step0_all=bool(block.get("step0_all", False)),
             e9=None if block.get("e9") is None else str(block["e9"]),
+            side0_m=None if block.get("side0_m") is None else int(block["side0_m"]),
+            side0_use=None if block.get("side0_use") is None else str(block["side0_use"]),
+            draft_from=None if block.get("draft_from") is None else int(block["draft_from"]),
+            mem=bool(block.get("mem", False)),
+            mem_route=bool(block.get("mem_route", False)),
+            mem_direct=bool(block.get("mem_direct", False)),
+            reselect_step=None if block.get("reselect_step") is None else int(block["reselect_step"]),
         )
         if prune.fovea is not None or prune.fovea_off:
             _require(prune.fovea in FOVEA_METHODS, f"prune.fovea must be one of {FOVEA_METHODS} (fovea_off needs a method)")
@@ -411,6 +441,19 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
         _require(not prune.step0_all or prune.step0 == "b", "prune.step0_all is the plan-b self-check")
         _require((prune.e9 is None and prune.step0 is None) or prune.fovea is not None,
                  "prune.step0 / prune.e9 need prune.fovea interlace_w")
+        r2 = (prune.side0_m is not None or prune.side0_use is not None or prune.draft_from is not None or prune.mem
+              or prune.mem_route or prune.mem_direct or prune.reselect_step is not None)
+        _require(not r2 or (prune.fovea == "interlace_w" and not prune.fovea_off and not prune.fovea_wzero
+                            and prune.step0 is None and prune.e9 is None),
+                 "the step0-sparse-r2 options are for interlace_w (no step0 / e9)")
+        _require((prune.side0_m is None) == (prune.side0_use is None)
+                 and (prune.side0_use is None or (prune.side0_use in ("plan", "draft", "both") and prune.side0_m >= 0)),
+                 "prune.side0_m (>= 0) and side0_use (plan / draft / both) go together")
+        _require(prune.draft_from is None or 0 <= prune.draft_from <= 10, "prune.draft_from must be in [0, 10]")
+        _require(not (prune.mem_route or prune.mem_direct) or prune.mem, "prune.mem_route / mem_direct need prune.mem")
+        _require(prune.reselect_step is None or (prune.mem_route and 1 <= prune.reselect_step < 10),
+                 "prune.reselect_step (1..9) needs prune.mem_route")
+        _require(not (prune.mem and prune.side0_use is not None), "prune.mem and prune.side0 are exclusive")
         _require(prune.selection in SELECTIONS, f"prune.selection must be one of {SELECTIONS}")
         if prune.selection in ("diff", "diff_global"):
             _require(prune.warmup_steps == 1 and prune.score_step is None and prune.kept_index is None
@@ -567,6 +610,9 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
         record_sinks=bool(raw.get("record_sinks", False)),
         video_freeze=bool(raw.get("video_freeze", False)),
         record_step0_x0=bool(raw.get("record_step0_x0", False)),
+        record_r2_steps=tuple(int(x) for x in raw.get("record_r2_steps") or ()),
+        record_r2_all=bool(raw.get("record_r2_all", False)),
+        record_r3_ms=tuple(int(x) for x in raw.get("record_r3_ms") or ()),
     )
     p = cfg.prune
     _require(p is None or p.fovea in (None, "sink") or p.fovea_off or not (
@@ -591,6 +637,12 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
     _require(p is None or p.step0 is None or cfg.score_layer is not None,
              "prune.step0 scores on a fixed layer (casestudy.score_layer)")
     _require(not cfg.record_step0_x0 or cfg.frame0_cache, "record_step0_x0 is logged on the frame-0-cache path only")
+    _require(p is None or not (p.side0_use is not None or p.mem) or cfg.score_layer is not None,
+             "prune.side0 / mem score on a fixed layer (casestudy.score_layer)")
+    _require(not (cfg.record_r2_steps or cfg.record_r3_ms) or (cfg.method == "dense" and p is None and cfg.frame0_cache),
+             "record_r2_steps / record_r3_ms are dense diagnostics")
+    _require(all(0 <= s < steps for s in cfg.record_r2_steps) and all(m >= 0 for m in cfg.record_r3_ms),
+             "record_r2_steps in [0, steps), record_r3_ms >= 0")
     _require(cfg.prune is None or not cfg.record_vv or cfg.prune.warmup_steps == 1,
              "record_vv needs prune.warmup_steps == 1 (V→V is captured at step 0)")
     return cfg

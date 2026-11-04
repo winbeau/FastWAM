@@ -23,6 +23,9 @@ step0-sparse round: step 0 sparse too (``prune.step0``). It computes only the 39
 {1, 3, 5} of every (future frame, camera) 7 x 7 block, the sink 182 and the corners 7 / 105), the rest drafted from the
 probes by in-block bilinear interpolation (``interp_tokens``); the plan's leftover probes go to the last slices
 (``step0_slices``); plan D marks the end-effector path on the agentview blocks (``tube_mask``).
+step0-sparse-r2: block-local inverse-distance neighbours (``nearest_sources``, ``idw_fill``) for the step-by-step drafts and the
+previous call's imagination (``memory_map``, ``align_frames``); 10 slices from step 0 (``make_plan(n_slices, from_step0)``);
+the step-5 core reselection (``reselect``, ``select_core``).
 Pure functions; the runner applies the plan.
 """
 
@@ -117,6 +120,101 @@ def step0_slices(periphery: torch.Tensor, probes: torch.Tensor, av: torch.Tensor
         slices.append(torch.sort(part).values)
     slices += [torch.sort(prev).values, torch.sort(last).values]
     return slices, (torch.cat(cut) if cut else periphery[:0])
+
+
+def nearest_sources(sources: torch.Tensor, grid: sel.Grid, k: int = 4):
+    """step0-sparse-r2 block-local neighbours -> (nbr [Kf, k] positions in ``sources``, w [Kf, k] float64, has [Kf] bool): the k
+    sources nearest to every future token in its own (future frame, camera) block by (row, camera column) Euclidean
+    distance (ties to the smaller future index), weights 1 / d^2 summing to 1 (0 on padding); a source maps to itself."""
+    half = grid.width // 2
+    src = sources.cpu().tolist()
+    pos = {}
+    for p, j in enumerate(src):
+        rem = j % grid.per_frame
+        pos.setdefault((j // grid.per_frame, (rem % grid.width) >= half), []).append((p, j, rem // grid.width, (rem % grid.width) % half))
+    nbr = torch.zeros(grid.num_future, k, dtype=torch.long)
+    w = torch.zeros(grid.num_future, k, dtype=torch.float64)
+    has = torch.zeros(grid.num_future, dtype=torch.bool)
+    where = {j: p for p, j in enumerate(src)}
+    for j in range(grid.num_future):
+        rem = j % grid.per_frame
+        r, c = rem // grid.width, (rem % grid.width) % half
+        if j in where:
+            nbr[j, 0], w[j, 0], has[j] = where[j], 1.0, True
+            continue
+        cand = sorted(((rr - r) ** 2 + (cc - c) ** 2, jj, p) for p, jj, rr, cc in pos.get((j // grid.per_frame, (rem % grid.width) >= half), []))
+        cand = cand[:k]
+        if not cand:
+            continue
+        inv = [1.0 / d for d, _, _ in cand]
+        tot = sum(inv)
+        for i, ((_, _, p), x) in enumerate(zip(cand, inv)):
+            nbr[j, i], w[j, i] = p, x / tot
+        has[j] = True
+    return nbr, w, has
+
+
+def idw_fill(values: torch.Tensor, sources: torch.Tensor, grid: sel.Grid, targets: torch.Tensor | None = None,
+             k: int = 4) -> tuple[torch.Tensor, torch.Tensor]:
+    """values [Kf, D] -> (float32 copy with every target (default: every non-source) that has a source in its block replaced
+    by the inverse-distance-squared mean of its ``k`` nearest sources' values, the replaced targets). Sources and targets
+    without a source in their block keep their values."""
+    nbr, w, has = nearest_sources(sources, grid, k)
+    dev = values.device
+    out = values.float().clone()
+    src = sources.to(dev)
+    if targets is None:
+        mask = torch.ones(grid.num_future, dtype=torch.bool)
+        mask[sources.cpu()] = False
+        targets = torch.nonzero(mask).flatten()
+    tg = targets.cpu()
+    tg = tg[has[tg]]
+    if tg.numel():
+        vals = values.float()[src[nbr[tg].to(dev)]]  # [T, k, D]
+        out[tg.to(dev)] = (w[tg].float().to(dev)[..., None] * vals).sum(dim=1)
+    return out, tg.to(dev)
+
+
+def align_frames(z: torch.Tensor, grid: sel.Grid) -> torch.Tensor:
+    """A previous call's future [Kf, D] moved one call on: new frame 1 = old frame 2, new frame 2 = old 2 + (old 2 - old 1)."""
+    if grid.frames != 3:
+        raise ValueError("align_frames is defined for two future latent frames")
+    f1, f2 = z[:grid.per_frame], z[grid.per_frame:]
+    return torch.cat([f2, f2 + (f2 - f1)])
+
+
+def memory_map(terminal: torch.Tensor, computed: torch.Tensor, grid: sel.Grid, direct: bool = False) -> torch.Tensor:
+    """step0-sparse-r2 R6: the previous call's imagination for this call [Kf, D] (float32): the terminal latents of the tokens
+    computed on the last step, the others interpolated from them in their block (own terminal without a source there;
+    ``direct``: every terminal as it is), then time-aligned."""
+    m = terminal.float() if direct else idw_fill(terminal, computed, grid)[0]
+    return align_frames(m, grid)
+
+
+def select_core(av: torch.Tensor, diff: torch.Tensor, sinks: torch.Tensor, c: int) -> torch.Tensor:
+    """``make_plan``'s core rule: A->V top 10 united with Diff top 10 (without the sinks), filled to c by A->V (sorted)."""
+    core_set: list[int] = []
+    for score, n in ((av, N_AV), (diff, N_DIFF)):
+        for j in sel.topk_indices(score, min(n, c), exclude=sinks).tolist():
+            if j not in core_set:
+                core_set.append(j)
+    for j in sel.topk_indices(av, av.numel(), exclude=sinks).tolist():
+        if len(core_set) >= c:
+            break
+        if j not in core_set:
+            core_set.append(j)
+    return torch.sort(torch.tensor(core_set[:c], dtype=torch.long, device=av.device)).values
+
+
+def reselect(plan: "Plan", av: torch.Tensor, diff: torch.Tensor) -> "Plan":
+    """step0-sparse-r2 R7b: the core recomposed from (av, diff) with the plan's sinks; the slices without the new core, each
+    slice's bias log(N / its remaining size) with N the original periphery size."""
+    core = select_core(av, diff, plan.sinks.cpu(), int(plan.core.numel())).to(plan.core.device)
+    fixed = torch.sort(torch.cat([plan.sinks, core])).values
+    slices = [x[~torch.isin(x, core)] for x in plan.slices]
+    n = int(plan.periphery.numel())
+    bias = [math.log(n / int(x.numel())) if x.numel() else 0.0 for x in slices] if plan.slice_bias else []
+    return Plan(plan.method, plan.sinks, core, plan.periphery, fixed, slices=slices, truncated=plan.truncated, slice_bias=bias)
 
 
 def tube_mask(cells: dict, grid: sel.Grid, wrist_rows: bool = False, dilate: int = 1) -> torch.Tensor:
@@ -306,7 +404,7 @@ class Plan:
 def make_plan(method: str, k: int, grid: sel.Grid, av: torch.Tensor, diff: torch.Tensor, recv: torch.Tensor,
               x0_future: torch.Tensor | None = None, gen: torch.Generator | None = None, off: bool = False,
               wzero: bool = False, nofar: bool = False, singleton: bool = False, sinks: torch.Tensor | None = None,
-              probes: torch.Tensor | None = None) -> Plan:
+              probes: torch.Tensor | None = None, n_slices: int = N_SLICES, from_step0: bool = False) -> Plan:
     """The plan of ``method`` for budget k from the step-0 scores (A->V, Diff, received attention) [Kf]; ``off`` gives S0
     (A->V top-k, nothing else). Self-checks: ``wzero`` drops interlace_w's slice bias (= interlace), ``nofar`` lifts
     interlace_wfar's far-frame core (= interlace_w), ``singleton`` gives merge one group per future token, nothing else
@@ -370,7 +468,9 @@ def make_plan(method: str, k: int, grid: sel.Grid, av: torch.Tensor, diff: torch
     if periphery.numel() <= R_SLOTS:  # the periphery fits its slots: computed token by token
         return Plan(method, sinks, core, periphery, torch.sort(torch.cat([fixed, periphery])).values)
     if method in INTERLACE:
-        slices, cut = interlace_slices(periphery, av) if probes is None else step0_slices(periphery, probes, av)
+        slices, cut = interlace_slices(periphery, av, n=n_slices) if probes is None else step0_slices(periphery, probes, av)
+        if from_step0:  # step0-sparse-r2: step s computes raster slice s (s = 0..n-1); real(s) reads slices[(s - 1) % n]
+            slices = slices[1:] + slices[:1]
         weighted = method in ("interlace_w", "interlace_wfar") and not wzero  # interlace_cal's bias is the runner's
         bias = ([math.log(int(periphery.numel()) / int(x.numel())) if x.numel() else 0.0 for x in slices]
                 if weighted else [])
@@ -402,4 +502,5 @@ def make_plan(method: str, k: int, grid: sel.Grid, av: torch.Tensor, diff: torch
 
 __all__ = ["INTERLACE", "METHODS", "PROBE_CORNERS", "PROBE_SINK", "Plan", "STEP0", "fill_map", "grid_regions",
            "ht_frequencies", "ht_schedule", "interlace_slices", "interp_tokens", "kmeans", "make_plan", "probe_index",
-           "rope_freqs_at", "step0_slices", "tube_mask"]
+           "rope_freqs_at", "step0_slices", "tube_mask", "nearest_sources", "idw_fill", "align_frames", "memory_map",
+           "select_core", "reselect"]

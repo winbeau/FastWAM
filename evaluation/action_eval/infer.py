@@ -490,6 +490,7 @@ class FastWAMJointPolicy:
             action_horizon=self.action_horizon, num_video_frames=self.num_video_frames,
             seed=seed, sigma_shift=self.sigma_shift, rand_device=self.rand_device,
             **({"_capture_video": video_cap} if video_cap is not None else {}), **self._tube_kwargs(runner),
+            **self._mem_kwargs(runner, "exec"),
         )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -679,6 +680,8 @@ class FastWAMJointPolicy:
 
     def _probe_metrics(self, prompt, image, proprio, call_index: int) -> dict:
         """Every probe arm at every probe seed offset on this observation: chunks and diagnostics."""
+        import base64
+
         layers = getattr(self.runner, "_layers", None)
         out = {}
         for offset in self.probe_seed_offsets:
@@ -690,6 +693,7 @@ class FastWAMJointPolicy:
                     prompt=prompt, input_image=image, proprio=proprio,
                     action_horizon=self.action_horizon, num_video_frames=self.num_video_frames,
                     seed=seed, sigma_shift=self.sigma_shift, rand_device=self.rand_device, **self._tube_kwargs(runner),
+                    **self._mem_kwargs(runner, offset),
                 )
                 cont, _, agc_log = self._agc(runner.cfg, d, self._continuous(action))
                 entry = {"seed": int(seed), **self._chunk_logs(action, cont), **agc_log}
@@ -698,11 +702,21 @@ class FastWAMJointPolicy:
                             "summary", "cache_kv_bytes", "recon", "recon_quality_f32", "recon_quality_shape",
                             "recon_checks", "av_scores_f16", "diff_scores_f16", "diff_sigma_v", "future_attn_f32",
                             "future_attn_shape", "dump_path", "gate_score", "fovea", "sink_index", "sink_share_step0",
-                            "sink_recv_f16", "step0", "step0_x0_f32", "e9"):
+                            "sink_recv_f16", "step0", "step0_x0_f32", "e9", "r2", "r3", "mem", "mem_rec", "side0",
+                            "terminal_x0_f32", "draft", "reselect"):
                     if d.get(key) is not None:
                         entry[key] = d[key]
+                for row in (entry.get("r3") or {}).values():  # step0-sparse-r2 R3: the side forwards' pilots, simulator units
+                    p = np.frombuffer(base64.b64decode(row["pilot_f32"]), dtype=np.float32).reshape(-1, 7)
+                    row["pilot_cont_f32"] = base64.b64encode(
+                        self._continuous(self._torch.from_numpy(p.copy())).astype(np.float32).tobytes()).decode()
                 out[f"{name}@{offset}"] = entry
         return out
+
+    def _mem_kwargs(self, runner, key) -> dict:
+        """``_memory_key`` for a runner with ``prune.mem`` (step0-sparse-r2): the probe seed offset, or the executed arm."""
+        prune = runner.cfg.prune
+        return {"_memory_key": key} if prune is not None and prune.mem else {}
 
     def _tube_kwargs(self, runner) -> dict:
         """``_step0_tube`` for a runner with ``prune.step0: d`` (step0-sparse plan D), else nothing."""
