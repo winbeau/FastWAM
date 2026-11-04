@@ -402,6 +402,129 @@ def apply_step_delta(plan: "Plan", deltas, av: torch.Tensor, grid: sel.Grid, see
                 freq=plan.freq, drop=drop)
 
 
+ROLE_VARIANTS = ("rs", "notip", "wdiff", "aav", "nofar")
+ROLE_ARM, ROLE_AGENT, ROLE_FAR = 12, 8, 4
+
+
+def role_strata(tokens: torch.Tensor, grid: sel.Grid) -> torch.Tensor:
+    """role-select: the stratum of each future token, (frame, camera, quadrant) with quadrants rows 0-3 / 4-6 x columns 0-3 / 4-6
+    of its 7 x 7 camera block."""
+    pf, half = grid.per_frame, grid.width // 2
+    rem = tokens % pf
+    r, col = rem // grid.width, rem % grid.width
+    q = (r >= 4).long() * 2 + ((col % half) >= 4).long()
+    return (tokens // pf) * 8 + (col // half) * 4 + q
+
+
+def spread_order(pool: torch.Tensor, grid: sel.Grid, seed: int) -> torch.Tensor:
+    """role-select: the order a rotating group walks its pool in. The pool is split by ``role_strata``, each stratum shuffled and
+    the strata visited in a shuffled order, round robin (torch generator ``seed``; not the index order), so that n consecutive
+    tokens spread over the strata and the whole pool comes before any token repeats."""
+    pool = pool.cpu()
+    key = role_strata(pool, grid)
+    g = torch.Generator().manual_seed(int(seed))
+    strata = [pool[key == k] for k in torch.unique(key).tolist()]
+    strata = [x[torch.randperm(int(x.numel()), generator=g)] for x in strata]
+    visit = torch.randperm(len(strata), generator=g).tolist()
+    out = [int(strata[k][i]) for i in range(max((int(x.numel()) for x in strata), default=0)) for k in visit if i < strata[k].numel()]
+    return torch.tensor(out, dtype=torch.long)
+
+
+def _take(seq: torch.Tensor, start: int, n: int, taken: set) -> list:
+    """The next ``n`` tokens of the cyclic ``seq`` from ``start`` that the step does not compute yet (they join ``taken``)."""
+    out: list = []
+    for t in range(int(seq.numel())):
+        if len(out) == n:
+            break
+        j = int(seq[(start + t) % int(seq.numel())])
+        if j not in taken:
+            out.append(j)
+            taken.add(j)
+    return out
+
+
+def role_plan(measured: torch.Tensor, av: torch.Tensor, diff: torch.Tensor, sinks: torch.Tensor, grid: sel.Grid, tips, k: int,
+              variant: str = "rs", extra: int = 10, seed: int = 0, first: int = 2, n_steps: int = 10) -> "Plan":
+    """role-select plan of steps ``first``..n_steps-1 (the late anchor's steps 2-9), from step 1's measured scores (``av`` / ``diff``:
+    0 where not measured) and no A->V except in variant aav. Per step k tokens:
+      sinks   as given, every step;
+      arm     the 12 measured agentview near-frame tokens with the largest Diff (aav: A->V), sinks excepted, every step;
+      tips    the 2 fixed wrist near-frame tokens ``tips`` (notip: none), sinks excepted, every step;
+      wrist   the other wrist near-frame tokens, rotating (``spread_order``), as many as the rest of the budget leaves (10; notip 12,
+              nofar 14); wdiff: the measured ones with the largest Diff, every step, no rotation;
+      agent   the other agentview near-frame tokens (not sinks, not arm), 8 rotating;
+      far     the far-frame tokens of both cameras (not sinks), 4 rotating (nofar: none).
+    A rotating group starts step i (0, 1, ...) at position i x its size in its order and skips tokens the step already computes; its
+    keys get log(N_group / n_group) (pool size over the tokens it computes on that step), the every-step groups nothing. The last
+    step also computes ``extra`` more: arm ranks 13.. (extra // 2, no bias) and the rest as more wrist tokens (wdiff: Diff ranks
+    11..; rotating: the wrist group grows, its bias with it)."""
+    if variant not in ROLE_VARIANTS:
+        raise ValueError(f"role_plan: variant must be one of {ROLE_VARIANTS}")
+    kf, pf, half = grid.num_future, grid.per_frame, grid.width // 2
+    j = torch.arange(kf)
+    col = (j % pf) % grid.width
+    near = j < pf
+    a_near, w_near = near & (col < half), near & (col >= half)
+    meas = torch.zeros(kf, dtype=torch.bool)
+    meas[measured.cpu()] = True
+    sinks = sinks.cpu()
+    not_sink = ~torch.isin(j, sinks)
+    tip = torch.tensor([] if variant == "notip" else [int(x) for x in tips], dtype=torch.long)
+    if variant != "notip" and (tip.numel() != 2 or not bool(w_near[tip].all())):
+        raise ValueError("role_plan: tips must be 2 wrist near-frame tokens")
+    tip = tip[~torch.isin(tip, sinks)]
+    score = (av if variant == "aav" else diff).float().cpu()
+    cand = j[a_near & meas & not_sink]
+    ranked = cand[torch.argsort(-score[cand], stable=True)]
+    arm, arm_extra = ranked[:ROLE_ARM], ranked[ROLE_ARM:ROLE_ARM + extra // 2]
+    n_far = 0 if variant == "nofar" else ROLE_FAR
+    base = torch.cat([sinks, arm, tip])
+    n_w = k - int(base.numel()) - ROLE_AGENT - n_far  # the wrist group takes what the budget leaves (10 with 3 sinks, 2 tips)
+    w_extra = extra - extra // 2
+    w_pool = j[w_near & not_sink & ~torch.isin(j, tip)]
+    wrist_fixed, wrist_extra = j[:0], j[:0]
+    if variant == "wdiff":
+        wm = w_pool[meas[w_pool]]
+        wr = wm[torch.argsort(-diff.float().cpu()[wm], stable=True)]
+        wrist_fixed, wrist_extra = wr[:n_w], wr[n_w:n_w + w_extra]
+    fixed = torch.sort(torch.cat([base, wrist_fixed])).values
+    seqs = {"agent": spread_order(j[a_near & not_sink & ~torch.isin(j, arm)], grid, seed + 1),
+            "far": spread_order(j[~near & not_sink], grid, seed + 2)}
+    sizes = {"agent": ROLE_AGENT, "far": n_far}
+    if variant != "wdiff":
+        seqs["wrist"], sizes["wrist"] = spread_order(w_pool, grid, seed), n_w
+    n = n_steps - first
+    slices, step_bias, seen = [None] * n, {}, set()
+    for i, s in enumerate(range(first, n_steps)):
+        taken = set(fixed.tolist())
+        rows, bias = [], {}
+        last = s == n_steps - 1
+        if last:
+            for x in torch.cat([arm_extra, wrist_extra]).tolist():
+                if x not in taken:
+                    taken.add(x)
+                    rows.append(x)
+        for name in ("wrist", "agent", "far"):
+            if name not in seqs or not sizes[name] or not seqs[name].numel():
+                continue
+            want = sizes[name] + (w_extra if last and name == "wrist" else 0)
+            got = _take(seqs[name], i * sizes[name], want, taken)
+            lg = math.log(int(seqs[name].numel()) / len(got)) if got else 0.0
+            rows += got
+            if lg != 0.0:
+                bias.update({x: lg for x in got})
+        slices[(s - 1) % n] = torch.sort(torch.tensor(rows, dtype=torch.long)).values
+        step_bias[s] = bias
+        seen |= set(rows)
+        want_rows = k + (extra if last else 0)
+        if int(fixed.numel()) + len(rows) != want_rows:
+            raise RuntimeError(f"role_plan: step {s} computes {int(fixed.numel()) + len(rows)} tokens, not {want_rows}")
+    periphery = torch.sort(torch.cat([v for v in seqs.values()] + [arm_extra, wrist_extra]).unique()).values
+    truncated = periphery[~torch.isin(periphery, torch.tensor(sorted(seen), dtype=torch.long))]
+    return Plan("role", sinks, torch.sort(torch.cat([arm, tip, wrist_fixed])).values, periphery, fixed, slices=slices,
+                truncated=truncated, step_bias=step_bias)
+
+
 def tube_mask(cells: dict, grid: sel.Grid, wrist_rows: bool = False, dilate: int = 1) -> torch.Tensor:
     """Plan D: [Kf] bool, the agentview cells (row, column) of every future frame (``cells[f]``, f = 1..F-1) dilated by
     ``dilate`` within the block; ``wrist_rows`` adds the two bottom rows of every wrist block."""
@@ -563,13 +686,14 @@ class Plan:
     slice_bias: list = field(default_factory=list)  # interlace_w: log(N / n_k) per slice
     freq: torch.Tensor | None = None  # interlace_ht: computations f_j of every future token over the pruned steps
     drop: dict = field(default_factory=dict)  # step-marginal: step -> fixed tokens that step does not compute
+    step_bias: dict = field(default_factory=dict)  # role-select: step -> {token: key bias} (the rotating groups' log(N / n))
 
     def to(self, dev) -> "Plan":
         mv = lambda t: None if t is None else t.to(dev)  # noqa: E731
         return Plan(self.method, mv(self.sinks), mv(self.core), mv(self.periphery), mv(self.fixed),
                     [x.to(dev) for x in self.slices], mv(self.truncated), dict(self.bias_real),
                     [(g.to(dev), lg) for g, lg in self.regions], self.region_pos, list(self.slice_bias), mv(self.freq),
-                    {s: t.to(dev) for s, t in self.drop.items()})
+                    {s: t.to(dev) for s, t in self.drop.items()}, {s: dict(b) for s, b in self.step_bias.items()})
 
     def real(self, s: int) -> torch.Tensor:
         out = self.fixed
@@ -582,6 +706,8 @@ class Plan:
     def bias_at(self, s: int) -> dict:
         """Future index -> key logit bias on pruned step s: the representatives' log n (rep), this step's slice
         log(N / n_k) (interlace_w) or log(n / f_j) of this step's tokens computed fewer than n times (interlace_ht)."""
+        if self.step_bias:
+            return dict(self.step_bias.get(s, {}))
         if self.freq is not None and self.slices:
             k = (s - 1) % len(self.slices)
             return {int(j): math.log(len(self.slices) / int(self.freq[j])) for j in self.slices[k].tolist()}
@@ -693,5 +819,5 @@ def make_plan(method: str, k: int, grid: sel.Grid, av: torch.Tensor, diff: torch
 __all__ = ["INTERLACE", "METHODS", "PROBE_CORNERS", "PROBE_SINK", "Plan", "STEP0", "add_last_extra", "fill_map", "grid_regions",
            "ht_frequencies", "ht_schedule", "interlace_slices", "interp_tokens", "kmeans", "make_plan", "probe_index",
            "roll_blocks", "rope_freqs_at", "step0_slices", "token_latent_mask", "token_norms", "tube_mask", "stratified_pick",
-           "lowest_av", "apply_step_delta", "nearest_sources", "idw_fill", "align_frames", "memory_map",
+           "lowest_av", "apply_step_delta", "ROLE_VARIANTS", "role_strata", "spread_order", "role_plan", "nearest_sources", "idw_fill", "align_frames", "memory_map",
            "select_core", "reselect"]

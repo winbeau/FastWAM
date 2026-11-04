@@ -91,6 +91,7 @@ STEP0 = ("b", "d")
 DRAFT_MODS = ("prior", "atten", "white", "low", "high", "wrist", "agent", "far", "near", "shift", "real")
 MECH_KEYS = {"steps", "calls", "sets", "noise", "patch_set", "patch_ranges", "selfkey", "lens_fit", "lens_apply"}
 LATE_ORACLES = ("far", "near", "wrist", "agent", "plan", "all")
+ROLE_VARIANTS = ("rs", "notip", "wdiff", "aav", "nofar")  # role-select (fovea.role_plan)
 FOVEA_METHODS = ("sink", "rep", "fov_grid", "fov_cluster", "interlace", "interlace_w", "interlace_wfar",
                  "interlace_cal", "interlace_fill", "merge", "interlace_ht")
 LAYER_RULES = ("min_entropy", "fixed")
@@ -265,6 +266,11 @@ class PruneConfig:
     #: steps 2-9 the step's slice (slice bias log(N / n_s) of its new size; dropped core tokens leave that step only). n = 0: no-op.
     step_delta: tuple = ()
     step_delta_seed: int = 0
+    #: role-select: the late anchor's plan of steps 2-9 by region roles instead of A->V / Diff (``fovea.role_plan``): rs, notip, wdiff,
+    #: aav, nofar; ``role_tips`` the 2 fixed wrist near-frame fingertip tokens, ``role_seed`` the rotating groups' order.
+    role_select: Optional[str] = None
+    role_tips: tuple = ()
+    role_seed: int = 0
 
 
 @dataclass(frozen=True)
@@ -495,6 +501,9 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             late_plan_core=None if block.get("late_plan_core") is None else str(block["late_plan_core"]),
             step_delta=tuple(sorted((int(s_), int(n_)) for s_, n_ in (block.get("step_delta") or {}).items())),
             step_delta_seed=int(block.get("step_delta_seed", 0)),
+            role_select=None if block.get("role_select") is None else str(block["role_select"]),
+            role_tips=tuple(int(x) for x in (block.get("role_tips") or ())),
+            role_seed=int(block.get("role_seed", 0)),
         )
         if prune.fovea is not None or prune.fovea_off:
             _require(prune.fovea in FOVEA_METHODS, f"prune.fovea must be one of {FOVEA_METHODS} (fovea_off needs a method)")
@@ -546,6 +555,10 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             prune.late is not None and prune.late_step == 1 and prune.late_oracle != "plan" and (prune.late_plan_core in (None, "measured"))
             and all(x is None or x >= 0 for x in (prune.late_plan_far_av, prune.late_plan_far_diff))),
                  "prune.late_plan_far_av / far_diff (>= 0) / late_plan_core (measured) are options of the late anchor's plan")
+        _require(prune.role_select is None or (prune.role_select in ROLE_VARIANTS and prune.late is not None and prune.late_step == 1
+                 and prune.late_oracle is None and not prune.step_delta and prune.late_plan_far_av is None and prune.late_plan_far_diff is None
+                 and (prune.role_select == "notip" or len(prune.role_tips) == 2)), f"prune.role_select ({ROLE_VARIANTS}, 2 role_tips but for notip) "
+                 "replaces the late anchor's plan of steps 2-9 (late_step 1, no oracle, no step_delta, no far scaling)")
         _require(not prune.step_delta or (prune.late is not None and prune.late_step == 1 and prune.late_oracle is None
                                           and all(1 <= s_ <= 9 for s_, _ in prune.step_delta)
                                           and len({s_ for s_, _ in prune.step_delta}) == len(prune.step_delta)),

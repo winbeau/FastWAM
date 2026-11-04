@@ -2177,9 +2177,21 @@ class JointCaseStudyRunner:
                 if prune.late_plan_far_av is not None:
                     # late-anchor-c4: the uncomputed far tokens' spread A->V (copies of the near frame) scaled for the plan
                     av_full = torch.where(far_unm, av_full * float(prune.late_plan_far_av), av_full)
-                fplan = fv.c2f_plan(rows1.cpu(), av_full.cpu(), df_full.cpu(), sinks_l.cpu(), grid,
-                                    max(1, int(round(prune.keep_ratio * num_future))), core_all=prune.late_plan_core != "measured",
-                                    last_extra=int(prune.late_extra))
+                if prune.role_select is not None:
+                    # role-select: the plan of steps 2-9 by region roles from step 1's measured scores (A->V only for aav).
+                    r1 = rows1.cpu()
+                    av_m = torch.zeros(num_future).index_copy(0, r1, late_st["av"].float().cpu())
+                    df_m = torch.zeros(num_future).index_copy(0, r1, df_full.float().cpu()[r1])
+                    fplan = fv.role_plan(r1, av_m, df_m, sinks_l.cpu(), grid, prune.role_tips,
+                                         max(1, int(round(prune.keep_ratio * num_future))), variant=prune.role_select,
+                                         extra=int(prune.late_extra), seed=int(prune.role_seed))
+                    diag["late"]["role"] = {"variant": prune.role_select, "core": fplan.core.tolist(),
+                                            "rows": {int(s_): fplan.real(s_).tolist() for s_ in range(2, steps)},
+                                            "bias": {int(s_): sorted({round(v, 6) for v in b.values()}) for s_, b in fplan.step_bias.items()}}
+                else:
+                    fplan = fv.c2f_plan(rows1.cpu(), av_full.cpu(), df_full.cpu(), sinks_l.cpu(), grid,
+                                        max(1, int(round(prune.keep_ratio * num_future))), core_all=prune.late_plan_core != "measured",
+                                        last_extra=int(prune.late_extra))
                 if any(s_ >= 2 and n_ for s_, n_ in prune.step_delta):
                     # step-marginal: steps 2-9 compute more (stratified random) or fewer (lowest plan A->V) tokens per step_delta.
                     fplan = fv.apply_step_delta(fplan, prune.step_delta, av_full.cpu(), grid, prune.step_delta_seed)
