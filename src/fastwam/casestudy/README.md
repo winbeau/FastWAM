@@ -33,5 +33,6 @@ tools are in `scripts/casestudy/`. FastWAM-IDM (official Optional-IDM) has its o
 | n1-4 | `fovea interlace_cal / interlace_fill / merge / interlace_ht`, `fovea_singleton` |
 | share-sparsity | `steer.const` |
 | step0-sparse | `prune.step0 b / d`, `step0_nobias`, `step0_all`, `e9`, `record_step0_x0`; adapter `step0_tube` |
+| step0-sparse-r2 | `prune.side0_m / side0_use`, `draft_from`, `mem / mem_route / mem_direct / reselect_step`; dense `record_r2_steps / record_r2_all / record_r3_ms`; adapter `_memory_key` |
 
 Tests: `tests/test_casestudy_*.py` (CPU; run on the server, not locally).
