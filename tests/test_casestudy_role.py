@@ -13,7 +13,7 @@ GRID = sel.Grid(frames=3, height=7, width=14)
 MEAS = {"method": "prune", "score_layer": 18,
         "prune": {"selection": "av", "warmup_steps": 1, "keep_ratio": 0.2, "fovea": "interlace_w", "step0": "b", "step0_draft": "near",
                   "late": "f1s84", "step0_gain": 1.25, "late_extra": 10, "late_plan_core": "measured"}}
-TIPS = (89, 93)  # wrist near frame, row 6 (any two wrist near-frame tokens for the test)
+TIPS = (92, 96)  # wrist near frame, row 6 (any two wrist near-frame tokens for the test)
 
 
 def _near(cam):
@@ -32,14 +32,14 @@ def _inputs(seed=0):
 
 
 def test_role_config():
-    cfg = parse_config({**MEAS, "prune": {**MEAS["prune"], "role_select": "rs", "role_tips": [89, 93], "role_seed": 2}})
-    assert cfg.prune.role_select == "rs" and cfg.prune.role_tips == (89, 93) and cfg.prune.role_seed == 2
+    cfg = parse_config({**MEAS, "prune": {**MEAS["prune"], "role_select": "rs", "role_tips": [92, 96], "role_seed": 2}})
+    assert cfg.prune.role_select == "rs" and cfg.prune.role_tips == (92, 96) and cfg.prune.role_seed == 2
     assert parse_config({**MEAS, "prune": {**MEAS["prune"], "role_select": "notip"}}).prune.role_tips == ()
     assert parse_config(MEAS).prune.role_select is None
-    m4w = {"method": "prune", "prune": {"keep_ratio": 0.2, "warmup_steps": 1, "fovea": "interlace_w", "role_select": "rs", "role_tips": [89, 93]}}
+    m4w = {"method": "prune", "prune": {"keep_ratio": 0.2, "warmup_steps": 1, "fovea": "interlace_w", "role_select": "rs", "role_tips": [92, 96]}}
     for bad in (m4w, {**MEAS, "prune": {**MEAS["prune"], "role_select": "rs"}},
-                {**MEAS, "prune": {**MEAS["prune"], "role_select": "xx", "role_tips": [89, 93]}},
-                {**MEAS, "prune": {**MEAS["prune"], "role_select": "rs", "role_tips": [89, 93], "step_delta": {5: 20}}}):
+                {**MEAS, "prune": {**MEAS["prune"], "role_select": "xx", "role_tips": [92, 96]}},
+                {**MEAS, "prune": {**MEAS["prune"], "role_select": "rs", "role_tips": [92, 96], "step_delta": {5: 20}}}):
         with pytest.raises(ValueError):
             parse_config(bad)
 
@@ -64,7 +64,7 @@ def test_role_plan_groups(variant):
         r = set(p.real(s).tolist())
         assert len(r) == (49 if s == 9 else 39)
         assert set(sinks.tolist()) <= r and set(ranked[:12]) <= r
-        assert (set(TIPS) <= r) == (variant != "notip")
+        assert set(TIPS) <= r if variant != "notip" else not (set(TIPS) & set(p.fixed.tolist()))
         far = [j for j in r if j >= 98 and j not in sinks.tolist()]
         assert len(far) == (0 if variant == "nofar" else 4)
         b = p.bias_at(s)
