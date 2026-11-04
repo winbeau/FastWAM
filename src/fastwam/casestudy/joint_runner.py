@@ -230,6 +230,151 @@ class JointCaseStudyRunner:
         return {"rows": rows, "vel": vel, "pred_action": self.action.post_dit(xa, pre_a), "probs": probs,
                 "recv": recv / self.num_layers, "layers": layers}
 
+    def _explore_forward(self, pre_v: dict, pre_a: dict, kv0: list, rows: torch.Tensor, f0: int, num_future: int,
+                         score_layer: int, grid: sel.Grid, row_bias: float = 0.0, vscale: float = 1.0,
+                         layers: Optional[set] = None, kv_rows: Optional[torch.Tensor] = None, groups: Optional[list] = None,
+                         track: Optional[list] = None) -> dict:
+        """step0-explore forward beside the main pass (nothing of it is used by the arm).
+        ``rows``: future tokens computed in full on the blocks in ``layers`` (every block if None; a skipped block leaves the
+        video and action hidden states as they are); their keys + ``row_bias`` (video rows: x ``vscale``). ``kv_rows``: tokens
+        that only give keys / values, projected on every run block from their own input embedding of this step (never
+        updated). ``groups``: proxy tokens, fully computed: input = the members' mean embedding, RoPE at the members' centroid,
+        key + log(members). -> {rows, vel [1, rows, D], proxy_vel [1, G, D], pred_action, probs / probs_layer (the run block
+        nearest the score layer; full layout, rows only), recv [Kf] (rows), layers (per block [rows + proxies, video keys,
+        action rows, action keys, kv-only tokens] or None if skipped), track (per run block |h - h_track| / |h_track| on rows)}."""
+        dev = pre_v["tokens"].device
+        rows = rows.to(dev)
+        n_act = int(pre_a["tokens"].shape[1])
+        n = int(rows.numel())
+        idx_abs = rows + f0
+        xv = pre_v["tokens"][:, idx_abs]
+        freqs, tmod, ctxm, t_rows = pre_v["freqs"][idx_abs], pre_v["t_mod"][:, idx_abs], pre_v["context_mask"][:, idx_abs], pre_v["t"][:, idx_abs]
+        sizes: list[int] = []
+        if groups:
+            sizes = [int(g.numel()) for g in groups]
+            xg = torch.stack([pre_v["tokens"][:, g.to(dev) + f0].float().mean(dim=1) for g in groups], dim=1).to(xv.dtype)
+            pos = torch.stack([torch.stack([(g // grid.per_frame + 1).double().mean(), ((g % grid.per_frame) // grid.width).double().mean(),
+                                            ((g % grid.per_frame) % grid.width).double().mean()]) for g in [x.cpu() for x in groups]])
+            gfreq = fv.rope_freqs_at(pos, 2 * int(pre_v["freqs"].shape[-1])).to(device=freqs.device, dtype=freqs.dtype)
+            first = torch.stack([g[0] for g in groups]).to(dev) + f0
+            xv = torch.cat([xv, xg], dim=1)
+            freqs, tmod = torch.cat([freqs, gfreq], dim=0), torch.cat([tmod, pre_v["t_mod"][:, first]], dim=1)
+            ctxm, t_rows = torch.cat([ctxm, pre_v["context_mask"][:, first]], dim=1), torch.cat([t_rows, pre_v["t"][:, first]], dim=1)
+        nq = n + len(sizes)
+        kvn = 0 if kv_rows is None else int(kv_rows.numel())
+        if kvn:
+            kv_abs = kv_rows.to(dev) + f0
+            x_kv, f_kv, t_kv = pre_v["tokens"][:, kv_abs], pre_v["freqs"][kv_abs], pre_v["t_mod"][:, kv_abs]
+        kb = torch.zeros(nq + kvn, device=dev)
+        kb[:n] = row_bias
+        if sizes:
+            kb[n:nq] = torch.log(torch.tensor(sizes, dtype=torch.float32, device=dev))
+        mask_v = mask_a = None
+        if bool((kb != 0).any()):
+            kbv = kb.clone()
+            kbv[:n] = row_bias * vscale
+            mask_v = torch.zeros((1, 1, 1, f0 + nq + kvn), device=dev)
+            mask_v[..., f0:] = kbv
+            mask_a = torch.zeros((1, 1, 1, f0 + nq + kvn + n_act), device=dev)
+            mask_a[..., f0:f0 + nq + kvn] = kb
+            mask_v, mask_a = mask_v.to(xv.dtype), mask_a.to(xv.dtype)
+        xa = pre_a["tokens"]
+        recv = torch.zeros(num_future, device=dev)
+        run = set(range(self.num_layers)) if layers is None else set(layers)
+        p_layer = max((l for l in run if l <= score_layer), default=min(run))
+        probs, counts, trk = None, [], []
+        for layer in range(self.num_layers):
+            if layer not in run:
+                counts.append(None)
+                continue
+            bv, ba = self.video.blocks[layer], self.action.blocks[layer]
+            io_v = self.mot._build_expert_attention_io(expert=self.video, block=bv, x=xv, freqs=freqs, t_mod=tmod)
+            io_a = self.mot._build_expert_attention_io(expert=self.action, block=ba, x=xa, freqs=pre_a["freqs"], t_mod=pre_a["t_mod"])
+            k_f, v_f = io_v[1], io_v[2]
+            if kvn:
+                io_kv = self.mot._build_expert_attention_io(expert=self.video, block=bv, x=x_kv, freqs=f_kv, t_mod=t_kv)
+                k_f, v_f = torch.cat([k_f, io_kv[1]], dim=1), torch.cat([v_f, io_kv[2]], dim=1)
+            k_vid = torch.cat([kv0[layer]["k"], k_f], dim=1)
+            v_vid = torch.cat([kv0[layer]["v"], v_f], dim=1)
+            out_v = flash_attention(q=io_v[0], k=k_vid, v=v_vid, num_heads=self.num_heads, ctx_mask=mask_v)
+            k_all, v_all = torch.cat([k_vid, io_a[1]], dim=1), torch.cat([v_vid, io_a[2]], dim=1)
+            out_a = flash_attention(q=io_a[0], k=k_all, v=v_all, num_heads=self.num_heads, ctx_mask=mask_a)
+            recv[rows] += self._masked_probs(io_v[0][:, :n], k_vid, mask_v)[:, f0:f0 + n].sum(dim=0)
+            recv[rows] += self._masked_probs(io_a[0], k_all, mask_a)[:, f0:f0 + n].sum(dim=0)
+            if layer == p_layer:
+                pm = self._masked_probs(io_a[0], k_all, mask_a)
+                probs = torch.zeros((n_act, f0 + num_future + n_act), dtype=pm.dtype, device=dev)
+                probs[:, :f0] = pm[:, :f0]
+                probs[:, f0 + rows] = pm[:, f0:f0 + n]
+                probs[:, f0 + num_future:] = pm[:, f0 + nq + kvn:]
+            counts.append([nq, int(k_vid.shape[1]), int(io_a[0].shape[1]), int(k_all.shape[1]), kvn])
+            xv = self._post(bv, io_v, out_v, {"context": pre_v["context"], "mask": ctxm})
+            xa = self._post(ba, io_a, out_a, {"context": pre_a["context"], "mask": pre_a["context_mask"]})
+            if track is not None:
+                ref = track[layer][:, rows].float()
+                trk.append(float((xv[:, :n].float() - ref).norm() / ref.norm()))
+        vel = self.video.head(xv, t_rows)
+        return {"rows": rows, "vel": vel[:, :n], "proxy_vel": vel[:, n:], "pred_action": self.action.post_dit(xa, pre_a),
+                "probs": probs, "probs_layer": p_layer, "recv": recv / max(1, len(run)), "layers": counts, "track": trk,
+                "sizes": sizes}
+
+    def _explore_rows(self, spec: str, grid: sel.Grid, plan) -> torch.Tensor:
+        """step0-explore visible sets (sorted future indices): grid39 (B's probes), rand<n> / strat<n> (random, per block
+        stratified; fixed generator), patch39 (each block's central 3 x 3 + 182, 7, 105), agf1 (agentview, frame 1), frame1,
+        cam_ag, m4w39 / core23 (the dense plan's sinks + core + step-9 slice / sinks + core), all."""
+        kf, pf, half = grid.num_future, grid.per_frame, grid.width // 2
+        gen = torch.Generator(device="cpu").manual_seed(1234)
+        blocks = [[f * pf + r * grid.width + cam * half + c for r in range(grid.height) for c in range(half)]
+                  for f in range(grid.frames - 1) for cam in (0, 1)]
+        if spec == "grid39":
+            out = fv.probe_index(grid)
+        elif spec.startswith("rand"):
+            out = torch.randperm(kf, generator=gen)[:int(spec[4:])]
+        elif spec.startswith("strat"):
+            n = int(spec[5:])
+            per = [n // len(blocks) + (1 if i < n % len(blocks) else 0) for i in range(len(blocks))]
+            out = torch.cat([torch.tensor(b)[torch.randperm(len(b), generator=gen)[:k]] for b, k in zip(blocks, per)])
+        elif spec == "patch39":
+            out = torch.tensor([f * pf + r * grid.width + cam * half + c for f in range(grid.frames - 1) for cam in (0, 1)
+                                for r in (2, 3, 4) for c in (2, 3, 4)] + [fv.PROBE_SINK, *fv.PROBE_CORNERS])
+        elif spec == "agf1":
+            out = torch.tensor(blocks[0])
+        elif spec == "frame1":
+            out = torch.arange(pf)
+        elif spec == "cam_ag":
+            out = torch.tensor(blocks[0] + blocks[2])
+        elif spec == "m4w39":
+            out = plan.real(len(plan.slices)).cpu()
+        elif spec == "core23":
+            out = plan.fixed.cpu()
+        elif spec == "all":
+            out = torch.arange(kf)
+        else:
+            raise ValueError(f"explore rows {spec!r}")
+        return torch.sort(torch.unique(out.long())).values
+
+    def _explore_layers(self, spec: str) -> Optional[set]:
+        """step0-explore blocks to run: all, first<k>, last<k>, f<a>l<b> (first a + last b), every<k> (0, k, 2k, ...)."""
+        L = self.num_layers
+        if spec == "all":
+            return None
+        if spec.startswith("first"):
+            return set(range(int(spec[5:])))
+        if spec.startswith("last"):
+            return set(range(L - int(spec[4:]), L))
+        if spec.startswith("every"):
+            return set(range(0, L, int(spec[5:])))
+        if spec.startswith("f") and "l" in spec:
+            a, b = (int(x) for x in spec[1:].split("l"))
+            return set(range(a)) | set(range(L - b, L))
+        raise ValueError(f"explore layers {spec!r}")
+
+    def _tok_to_diff(self, v: torch.Tensor) -> torch.Tensor:
+        """Token layout (x y z c) of the video head -> the Diff layout (c a b e), on the last axis."""
+        pt, ph, pw = (int(x) for x in self.video.patch_size)
+        c = v.shape[-1] // (pt * ph * pw)
+        return v.reshape(*v.shape[:-1], pt, ph, pw, c).movedim(-1, -4).reshape(*v.shape[:-1], -1)
+
     def _head_logits(self, q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
         """Per-head q k^T / sqrt(d) for batch 1 -> [H, Sq, Sk] (fp32)."""
         qh = rearrange(q, "b s (n d) -> b n s d", n=self.num_heads)[0].float()
@@ -790,6 +935,9 @@ class JointCaseStudyRunner:
         s0_info: dict[str, Any] = {}
         e9 = prune.e9 if prune is not None else None
         e9_prev: Optional[torch.Tensor] = None
+        # step0-explore: the dense step-0 hidden states (explore_track), D1's draft modification of M4w (step 0's update redone).
+        explore_h: Optional[list] = [] if cfg.explore_track else None
+        dmod = prune.draft_mod if prune is not None else None
         # step0-sparse-r2: R1 / R3b side forward on step 0 (its plan inputs / outputs), R5 / R7 step-by-step drafts, the call's
         # imagination (prune.mem: A->V of every token's last computed step, step-9 recv), R7's plan / drafts from the previous
         # call (plan known before step 0, step 0 pruned), R7b's latest clean estimates; R2 / R3 side records (dense).
@@ -1271,6 +1419,8 @@ class JointCaseStudyRunner:
                         )).to(out_a.dtype)
                     if io_v is not None:
                         xv = self._post(bv, io_v, out_v, payload_v)
+                        if explore_h is not None and s == 0:  # step0-explore: the dense step-0 hidden states per block
+                            explore_h.append(xv.detach())
                     if merge_step:
                         # merge: each group's residual increment of this layer onto its members' own streams (a group of
                         # one takes the output itself), then the groups re-formed from the streams for the next layer.
@@ -1363,12 +1513,13 @@ class JointCaseStudyRunner:
                 tmp = vel_tokens.clone()
                 tmp[:, f0 + probes] = side["vel"]
                 v_draft, zf_side = self._probe_draft(latents_video, tmp, gsz, grid, probes, sig_s, (pt, ph, pw))
-                if side0 in ("draft", "both"):
+                if side0 in ("draft", "both", "video"):  # step0-explore D2: video only / action only
                     rest = torch.ones(num_future, dtype=torch.bool, device=probes.device)
                     rest[probes] = False
                     rest_abs = torch.nonzero(rest).flatten() + f0
                     vel_tokens[:, f0 + probes] = side["vel"]
                     vel_tokens[:, rest_abs] = v_draft[:, rest_abs].to(vel_tokens.dtype)
+                if side0 in ("draft", "both", "action"):
                     side_pred = side["pred_action"]
                 if side0 in ("plan", "both"):
                     r = side["recv"].float().clone()
@@ -1380,6 +1531,52 @@ class JointCaseStudyRunner:
                                     "diff": sel.diff_scores(zf_side, z_cur0, grid), "recv": side["recv"], "probes": probes,
                                     "sinks": torch.cat([torch.tensor([fv.PROBE_SINK], device=r.device), torch.topk(r, fv.N_SINKS - 1).indices])}
                 diag["side0"] = {"use": side0, "m": int(prune.side0_m), "layers": side["layers"]}
+            if cfg.explore and s == 0:
+                # step0-explore (dense): the dense step-0 clean estimate of every future token and the current frame (Diff
+                # layout), then one forward per spec beside the main pass, logged for offline analysis.
+                x_tok = rearrange(latents_video, "b c (f x) (h y) (w z) -> b (f h w) (x y z c)", x=pt, y=ph, z=pw)[0, f0:].float()
+                x0d = self._tok_to_diff(x_tok - sig_s * vel_tokens[0, f0:].float())
+                zc = rearrange(latents_video[0, :, 0:pt].float(), "c (f a) (h b) (w e) -> f (h w) (c a b e)", a=pt, b=ph, e=pw)[0]
+                diag["x0d_f16"], diag["zcur_f16"] = _f16_b64(x0d), _f16_b64(zc)
+                lay = self._layers["act"]
+                av_d = sel.av_scores(step_probs[lay], grid) if lay in step_probs else torch.zeros(num_future, device=model.device)
+                plan_d = fv.make_plan("interlace_w", max(1, int(round(0.2 * num_future))), grid, av_d.float().cpu(),
+                                      sel.diff_scores(x0d, zc, grid).float().cpu(), (recv_acc / self.num_layers).float().cpu()
+                                      if recv_acc is not None else av_d.float().cpu())
+                sig_a = t_action[0].float() / float(model.infer_action_scheduler.num_train_timesteps)
+                ex_rows: dict = {}
+                for spec in cfg.explore:
+                    name, rspec, lspec, kv, nprox, vscale, bias = spec
+                    rows_e = self._explore_rows(rspec, grid, plan_d).to(model.device)
+                    rest_e = torch.ones(num_future, dtype=torch.bool, device=model.device)
+                    rest_e[rows_e] = False
+                    rest_idx = torch.nonzero(rest_e).flatten()
+                    groups = None
+                    if nprox:
+                        rid = fv.grid_regions(grid).to(model.device)[rest_idx]
+                        groups = [rest_idx[rid == g] for g in torch.unique(rid).tolist()]
+                    rb = (math.log(num_future / int(rows_e.numel())) if bias is None and not kv and not nprox
+                          and rows_e.numel() < num_future else (bias or 0.0))
+                    out_e = self._explore_forward(pre_v, pre_a, kv0, rows_e, f0, num_future, lay, grid, row_bias=rb,
+                                                  vscale=vscale, layers=self._explore_layers(lspec),
+                                                  kv_rows=rest_idx if kv and rest_idx.numel() else None, groups=groups,
+                                                  track=explore_h if cfg.explore_track else None)
+                    x0r = self._tok_to_diff(x_tok[rows_e] - sig_s * out_e["vel"][0].float())
+                    row = {"rows": rows_e.tolist(), "x0_f16": _f16_b64(x0r), "bias": rb, "layers": out_e["layers"],
+                           "probs_layer": out_e["probs_layer"], "track": out_e["track"],
+                           "pilot_f32": _f32_b64(latents_action[0].float() - sig_a * out_e["pred_action"][0].float()),
+                           "e_x": float((x0r - x0d[rows_e]).double().norm() / x0d[rows_e].double().norm())}
+                    if out_e["probs"] is not None:
+                        row["av_f16"] = _f16_b64(sel.av_scores(out_e["probs"], grid))
+                    row["recv_f16"] = _f16_b64(out_e["recv"])
+                    if groups:
+                        xg = torch.stack([x_tok[g].mean(dim=0) for g in groups])
+                        row["proxy_x0_f16"] = _f16_b64(self._tok_to_diff(xg - sig_s * out_e["proxy_vel"][0].float()))
+                        row["groups"] = [g.tolist() for g in groups]
+                    ex_rows[name] = row
+                diag["explore"] = ex_rows
+                diag["explore_plan"] = {"sinks": plan_d.sinks.tolist(), "core": plan_d.core.tolist(),
+                                        "slices": [x.tolist() for x in plan_d.slices]}
             if s in cfg.record_r2_steps or (s == 0 and cfg.record_r3_ms):
                 # step0-sparse-r2 R2 / R3 (dense): side forwards on this step's latents; x^0 at the probes against the main pass.
                 probes = fv.probe_index(grid).to(model.device)
@@ -1435,7 +1632,7 @@ class JointCaseStudyRunner:
                     if upd.numel():
                         x0_est[upd] = zf[upd]
             pred_video = self.video.unpatchify(vel_tokens, pre_v["meta"]["grid_size"])
-            if s == 0 and (cfg.record_step0_x0 or e9 is not None):
+            if s == 0 and (cfg.record_step0_x0 or e9 is not None or dmod is not None):
                 # step0-sparse E8: the step-0 clean estimate at the 39 probes (exact there on every arm); E9: step 0's
                 # latents, to redo its update once the plan is known.
                 sigma0_v = t_video[0].float() / float(model.infer_video_scheduler.num_train_timesteps)
@@ -1443,7 +1640,7 @@ class JointCaseStudyRunner:
                 z = rearrange(x0[0], "c (f a) (h b) (w e) -> f (h w) (c a b e)", a=pt, b=ph, e=pw)
                 if cfg.record_step0_x0:
                     diag["step0_x0_f32"] = _f32_b64(z[1:].reshape(-1, z.shape[-1])[fv.probe_index(grid).to(z.device)])
-                if e9 is not None:
+                if e9 is not None or dmod is not None:
                     e9_prev = latents_video.clone()
             if want_motion_steps:
                 # This step's clean estimate x - sigma * v (sigma_s = -sum of the remaining deltas; the
@@ -1630,6 +1827,36 @@ class JointCaseStudyRunner:
                             self.video.unpatchify(vel_tokens, pre_v["meta"]["grid_size"]), d_video[0], e9_prev)
                         latents_video[:, :, 0:1] = first.clone()
                         diag["e9"] = {"mode": e9, "tokens": int(toks.numel())}
+                    if dmod is not None:
+                        # step0-explore D1 (exploratory): every future token's step-0 draft y (the dense x^0) replaced by
+                        # y + e (white / low / high frequency, or white on one region) with |e| = scale |y|, or by the current
+                        # frame (prior); step 0's update redone.
+                        sigma0_v = t_video[0].float() / float(model.infer_video_scheduler.num_train_timesteps)
+                        gsz = pre_v["meta"]["grid_size"]
+                        y = self._clean_future(e9_prev, vel_tokens, gsz, sigma0_v, (pt, ph, pw))
+                        zc = rearrange(e9_prev[0, :, 0:pt].float(), "c (f a) (h b) (w e) -> f (h w) (c a b e)", a=pt, b=ph, e=pw)[0]
+                        g_ = torch.Generator(device="cpu").manual_seed((int(seed) + 7) & 0x7FFFFFFF)
+                        if dmod == "prior":
+                            d = zc[grid.future_obs_index(zc.device)]
+                        else:
+                            e = torch.randn(y.shape, generator=g_).to(y.device)
+                            if dmod == "low":
+                                e = fv.interp_tokens(e, grid, fv.probe_index(grid, extras=False))
+                            elif dmod == "high":
+                                e = e - fv.block_smooth(e, grid)
+                            elif dmod in ("wrist", "agent", "far", "near"):
+                                j_ = torch.arange(num_future, device=y.device)
+                                col = (j_ % grid.per_frame) % grid.width
+                                keep = {"wrist": col >= grid.width // 2, "agent": col < grid.width // 2,
+                                        "far": j_ >= grid.per_frame, "near": j_ < grid.per_frame}[dmod]
+                                e = e * keep[:, None]
+                            d = y + e * (float(prune.draft_mod_scale) * y.norm() / e.norm())
+                        v_new = self._map_draft(e9_prev, d, grid, sigma0_v, (pt, ph, pw))
+                        vel_tokens[:, f0:] = v_new[:, f0:].to(vel_tokens.dtype)
+                        latents_video = model.infer_video_scheduler.step(self.video.unpatchify(vel_tokens, gsz), d_video[0], e9_prev)
+                        latents_video[:, :, 0:1] = first.clone()
+                        diag["draft_mod"] = {"mode": dmod, "scale": float(prune.draft_mod_scale),
+                                             "rel_err": float((d - y).norm() / y.norm())}
                     kept = fplan.fixed
                     fv_members = [g + f0 for g, _ in fplan.regions]
                     if fv_members:

@@ -703,10 +703,11 @@ class FastWAMJointPolicy:
                             "recon_checks", "av_scores_f16", "diff_scores_f16", "diff_sigma_v", "future_attn_f32",
                             "future_attn_shape", "dump_path", "gate_score", "fovea", "sink_index", "sink_share_step0",
                             "sink_recv_f16", "step0", "step0_x0_f32", "e9", "r2", "r3", "mem", "mem_rec", "side0",
-                            "terminal_x0_f32", "draft", "reselect"):
+                            "terminal_x0_f32", "draft", "reselect", "explore", "explore_plan", "x0d_f16", "zcur_f16",
+                            "draft_mod"):
                     if d.get(key) is not None:
                         entry[key] = d[key]
-                for row in (entry.get("r3") or {}).values():  # step0-sparse-r2 R3: the side forwards' pilots, simulator units
+                for row in list((entry.get("r3") or {}).values()) + list((entry.get("explore") or {}).values()):  # R3 / explore pilots, simulator units
                     p = np.frombuffer(base64.b64decode(row["pilot_f32"]), dtype=np.float32).reshape(-1, 7)
                     row["pilot_cont_f32"] = base64.b64encode(
                         self._continuous(self._torch.from_numpy(p.copy())).astype(np.float32).tobytes()).decode()

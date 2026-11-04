@@ -48,13 +48,14 @@ PROBE_RC, PROBE_SINK, PROBE_CORNERS = (1, 3, 5), 182, (7, 105)
 STEP0 = ("b", "d")
 
 
-def probe_index(grid: sel.Grid) -> torch.Tensor:
+def probe_index(grid: sel.Grid, extras: bool = True) -> torch.Tensor:
     """step0-sparse: the 39 probes (ascending future indices): rows and camera columns in ``PROBE_RC`` of every (future
-    frame, camera) block, the sink and the corners."""
+    frame, camera) block, the sink and the corners (``extras``; without them the 36 grid points)."""
     half = grid.width // 2
     idx = [f * grid.per_frame + r * grid.width + cam * half + c
            for f in range(grid.frames - 1) for cam in (0, 1) for r in PROBE_RC for c in PROBE_RC]
-    idx += [PROBE_SINK, *PROBE_CORNERS]
+    if extras:
+        idx += [PROBE_SINK, *PROBE_CORNERS]
     if len(set(idx)) != len(idx) or max(idx) >= grid.num_future:
         raise ValueError("step0: the probes are not distinct future tokens")
     return torch.tensor(sorted(idx), dtype=torch.long)
@@ -120,6 +121,21 @@ def step0_slices(periphery: torch.Tensor, probes: torch.Tensor, av: torch.Tensor
         slices.append(torch.sort(part).values)
     slices += [torch.sort(prev).values, torch.sort(last).values]
     return slices, (torch.cat(cut) if cut else periphery[:0])
+
+
+def block_smooth(values: torch.Tensor, grid: sel.Grid) -> torch.Tensor:
+    """step0-explore: values [Kf, D] smoothed by a 3 x 3 box mean inside every (future frame, camera) 7 x 7 block (edges:
+    the mean of the cells present)."""
+    half = grid.width // 2
+    out = torch.empty_like(values, dtype=torch.float32)
+    for f in range(grid.frames - 1):
+        for cam in (0, 1):
+            idx = torch.tensor([f * grid.per_frame + r * grid.width + cam * half + c for r in range(grid.height) for c in range(half)],
+                               device=values.device)
+            blk = values.float()[idx].T.reshape(1, -1, grid.height, half)  # [1, D, 7, 7]
+            sm = torch.nn.functional.avg_pool2d(blk, 3, stride=1, padding=1, count_include_pad=False)
+            out[idx] = sm.reshape(-1, grid.height * half).T
+    return out
 
 
 def nearest_sources(sources: torch.Tensor, grid: sel.Grid, k: int = 4):

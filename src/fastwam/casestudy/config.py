@@ -88,6 +88,7 @@ from typing import Any, Optional
 METHODS = ("dense", "prune", "teacache", "noise")
 SELECTIONS = ("av", "vv", "cf", "random", "diff", "diff_global")
 STEP0 = ("b", "d")
+DRAFT_MODS = ("prior", "white", "low", "high", "wrist", "agent", "far", "near")
 FOVEA_METHODS = ("sink", "rep", "fov_grid", "fov_cluster", "interlace", "interlace_w", "interlace_wfar",
                  "interlace_cal", "interlace_fill", "merge", "interlace_ht")
 LAYER_RULES = ("min_entropy", "fixed")
@@ -216,6 +217,11 @@ class PruneConfig:
     mem_route: bool = False
     mem_direct: bool = False
     reselect_step: Optional[int] = None
+    #: step0-explore D1 (exploratory, interlace_w): the step-0 drafts of every future token replaced by the dense x^0 + an error
+    #: (white / low / high frequency, or white on wrist / agent / far / near tokens) with |e| = draft_mod_scale |x^0|, or by
+    #: the current frame (prior); step 0's update redone.
+    draft_mod: Optional[str] = None
+    draft_mod_scale: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -325,6 +331,11 @@ class CaseStudyConfig:
     record_r2_all: bool = False
     #: R3: on step 0 side forwards with every future token on the first m blocks, the 39 probes after (one per m).
     record_r3_ms: tuple[int, ...] = ()
+    #: step0-explore (dense, exploratory): one forward beside the main pass per spec on step 0 (name, rows, blocks, kv-only
+    #: participants, proxies, video-row bias scale, row bias), logged with the dense step-0 x^0 and the current frame;
+    #: ``explore_track`` adds the per-block hidden-state difference to the dense pass.
+    explore: tuple = ()
+    explore_track: bool = False
 
     def describe(self) -> dict[str, Any]:
         return asdict(self)
@@ -416,6 +427,8 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             mem_route=bool(block.get("mem_route", False)),
             mem_direct=bool(block.get("mem_direct", False)),
             reselect_step=None if block.get("reselect_step") is None else int(block["reselect_step"]),
+            draft_mod=None if block.get("draft_mod") is None else str(block["draft_mod"]),
+            draft_mod_scale=float(block.get("draft_mod_scale", 0.5)),
         )
         if prune.fovea is not None or prune.fovea_off:
             _require(prune.fovea in FOVEA_METHODS, f"prune.fovea must be one of {FOVEA_METHODS} (fovea_off needs a method)")
@@ -447,8 +460,11 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
                             and prune.step0 is None and prune.e9 is None),
                  "the step0-sparse-r2 options are for interlace_w (no step0 / e9)")
         _require((prune.side0_m is None) == (prune.side0_use is None)
-                 and (prune.side0_use is None or (prune.side0_use in ("plan", "draft", "both") and prune.side0_m >= 0)),
-                 "prune.side0_m (>= 0) and side0_use (plan / draft / both) go together")
+                 and (prune.side0_use is None or (prune.side0_use in ("plan", "draft", "both", "video", "action") and prune.side0_m >= 0)),
+                 "prune.side0_m (>= 0) and side0_use (plan / draft / both / video / action) go together")
+        _require(prune.draft_mod is None or (prune.draft_mod in DRAFT_MODS and prune.fovea == "interlace_w" and not r2
+                                              and prune.step0 is None and prune.e9 is None and prune.draft_mod_scale >= 0),
+                 f"prune.draft_mod must be one of {DRAFT_MODS} on plain interlace_w")
         _require(prune.draft_from is None or 0 <= prune.draft_from <= 10, "prune.draft_from must be in [0, 10]")
         _require(not (prune.mem_route or prune.mem_direct) or prune.mem, "prune.mem_route / mem_direct need prune.mem")
         _require(prune.reselect_step is None or (prune.mem_route and 1 <= prune.reselect_step < 10),
@@ -613,6 +629,10 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
         record_r2_steps=tuple(int(x) for x in raw.get("record_r2_steps") or ()),
         record_r2_all=bool(raw.get("record_r2_all", False)),
         record_r3_ms=tuple(int(x) for x in raw.get("record_r3_ms") or ()),
+        explore=tuple((str(e["name"]), str(e.get("rows", "grid39")), str(e.get("layers", "all")), bool(e.get("kv", False)),
+                       int(e.get("proxies", 0)), float(e.get("vscale", 1.0)), None if e.get("bias") is None else float(e["bias"]))
+                      for e in raw.get("explore") or ()),
+        explore_track=bool(raw.get("explore_track", False)),
     )
     p = cfg.prune
     _require(p is None or p.fovea in (None, "sink") or p.fovea_off or not (
@@ -643,6 +663,8 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
              "record_r2_steps / record_r3_ms are dense diagnostics")
     _require(all(0 <= s < steps for s in cfg.record_r2_steps) and all(m >= 0 for m in cfg.record_r3_ms),
              "record_r2_steps in [0, steps), record_r3_ms >= 0")
+    _require(not (cfg.explore or cfg.explore_track) or (cfg.method == "dense" and p is None and cfg.frame0_cache and cfg.record_sinks),
+             "explore is a dense diagnostic with record_sinks")
     _require(cfg.prune is None or not cfg.record_vv or cfg.prune.warmup_steps == 1,
              "record_vv needs prune.warmup_steps == 1 (V→V is captured at step 0)")
     return cfg
