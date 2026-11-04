@@ -228,6 +228,12 @@ class PruneConfig:
     #: step0-explore C2F (step0 b): step 1 computes the sinks + the neighbourhoods of the c2f hottest probes by A->V and by Diff;
     #: the plan of steps 2-9 comes from the scores measured at steps 0 and 1.
     c2f: Optional[int] = None
+    #: step0-explore: step 0's computed set by name (``_explore_rows``; None = the 39 probes) and how the other tokens are
+    #: drafted from it: grid (bilinear from the 3 x 3 probe grid), idw (block-local inverse distance), near (idw inside the near
+    #: frame, far frame = near + step0_far_lambda (near - current frame)).
+    step0_rows: Optional[str] = None
+    step0_draft: str = "grid"
+    step0_far_lambda: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -437,6 +443,9 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             draft_mod_scale=float(block.get("draft_mod_scale", 0.5)),
             step0_gain=float(block.get("step0_gain", 1.0)),
             c2f=None if block.get("c2f") is None else int(block["c2f"]),
+            step0_rows=None if block.get("step0_rows") is None else str(block["step0_rows"]),
+            step0_draft=str(block.get("step0_draft", "grid")),
+            step0_far_lambda=float(block.get("step0_far_lambda", 0.5)),
         )
         if prune.fovea is not None or prune.fovea_off:
             _require(prune.fovea in FOVEA_METHODS, f"prune.fovea must be one of {FOVEA_METHODS} (fovea_off needs a method)")
@@ -475,6 +484,9 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
                  f"prune.draft_mod must be one of {DRAFT_MODS} on plain interlace_w")
         _require(prune.step0_gain == 1.0 or (prune.step0_gain > 0 and (prune.step0 is not None or prune.side0_use in ("draft", "both", "video"))),
                  "prune.step0_gain (> 0) is for step0 or the side0 video / draft / both outputs")
+        _require(prune.step0_draft in ("grid", "idw", "near") and (prune.step0 is not None or (prune.step0_rows is None
+                 and prune.step0_draft == "grid")) and (prune.step0_draft != "grid" or prune.step0_rows in (None, "grid39")),
+                 "prune.step0_rows / step0_draft (grid needs the probe grid; idw / near any set) are step0 options")
         _require(prune.c2f is None or (prune.step0 == "b" and not prune.step0_all and prune.c2f >= 1), "prune.c2f (>= 1) needs prune.step0 b")
         _require(prune.draft_from is None or 0 <= prune.draft_from <= 10, "prune.draft_from must be in [0, 10]")
         _require(not (prune.mem_route or prune.mem_direct) or prune.mem, "prune.mem_route / mem_direct need prune.mem")

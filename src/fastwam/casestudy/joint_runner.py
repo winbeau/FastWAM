@@ -162,6 +162,40 @@ class JointCaseStudyRunner:
         v = (latents.float() - x0_int) / sigma
         return rearrange(v, "b c (f x) (h y) (w z) -> b (f h w) (x y z c)", x=pt, y=ph, z=pw), zf
 
+    def _spread(self, values: torch.Tensor, rows: torch.Tensor, grid: sel.Grid, mode: str, fallback: torch.Tensor,
+                lam: float = 0.0) -> torch.Tensor:
+        """step0-explore: values [Kf, D] known on ``rows`` spread to every future token (float32): ``idw`` block-local
+        inverse-distance mean (a block without a row takes ``fallback``); ``near`` the same inside the near frame, the far frame
+        = near + lam (near - fallback) at the same (h, w) unless computed itself."""
+        rows = rows.to(values.device)
+        kf, pf = grid.num_future, grid.per_frame
+        src = rows if mode == "idw" else rows[rows < pf]
+        filled, upd = fv.idw_fill(values, src, grid)
+        out = fallback.float().clone()
+        out[src] = values[src].float()
+        out[upd] = filled[upd]
+        if mode == "near":
+            near = out[:pf]
+            far = near + lam * (near - fallback[:pf].float())
+            own = rows[rows >= pf]
+            out[pf:] = far
+            out[own] = values[own].float()
+        return out
+
+    def _set_draft(self, latents: torch.Tensor, vel_tokens: torch.Tensor, grid_size, grid: sel.Grid, rows: torch.Tensor,
+                   sigma: torch.Tensor, patch: tuple[int, int, int], gain: float, mode: str, lam: float):
+        """step0-explore drafts from any computed set (``_spread``): the rows' clean estimate (their change from the current frame
+        x ``gain``) spread over every future token -> (draft velocity, token layout [1, f0 + Kf, D] fp32; spread estimate [Kf, D'])."""
+        pt, ph, pw = patch
+        x0 = latents.float() - sigma * self.video.unpatchify(vel_tokens, grid_size).float()
+        z = rearrange(x0[0], "c (f a) (h b) (w e) -> f (h w) (c a b e)", a=pt, b=ph, e=pw)
+        zfut = z[1:].reshape(-1, z.shape[-1]).clone()
+        zc = z[0][grid.future_obs_index(z.device)]
+        rows = rows.to(z.device)
+        zfut[rows] = zc[rows] + gain * (zfut[rows] - zc[rows])
+        zf = self._spread(zfut, rows, grid, mode, zc, lam)
+        return self._map_draft(latents, zf, grid, sigma, patch), zf
+
     def _map_draft(self, latents: torch.Tensor, zf: torch.Tensor, grid: sel.Grid, sigma: torch.Tensor,
                    patch: tuple[int, int, int]) -> torch.Tensor:
         """step0-sparse-r2: the velocity (x - x0) / sigma [1, f0 + Kf, D] (fp32, the token layout of the video head) that moves
@@ -938,7 +972,8 @@ class JointCaseStudyRunner:
         s0_probes: Optional[torch.Tensor] = None
         s0_bias = 0.0
         if s0_mode is not None:
-            s0_probes = all_future if prune.step0_all else fv.probe_index(grid).to(model.device)
+            s0_probes = all_future if prune.step0_all else (fv.probe_index(grid) if prune.step0_rows is None else
+                                                             self._explore_rows(prune.step0_rows, grid, None)).to(model.device)
             if not (prune.step0_all or prune.step0_nobias):
                 s0_bias = math.log(num_future / int(s0_probes.numel()))
         s0_zf: Optional[torch.Tensor] = None
@@ -1517,8 +1552,13 @@ class JointCaseStudyRunner:
                     sigma0_v = t_video[0].float() / float(model.infer_video_scheduler.num_train_timesteps)
                     if c2f is not None:  # C2F: the probes' raw x^0 (before the gain), for their Diff
                         c2f["x0_raw"] = self._clean_future(latents_video, vel_tokens, pre_v["meta"]["grid_size"], sigma0_v, (pt, ph, pw))
-                    v_draft, s0_zf = self._probe_draft(latents_video, vel_tokens, pre_v["meta"]["grid_size"], grid,
-                                                       idx_rel, sigma0_v, (pt, ph, pw), gain=float(prune.step0_gain))
+                    if prune.step0_draft == "grid":
+                        v_draft, s0_zf = self._probe_draft(latents_video, vel_tokens, pre_v["meta"]["grid_size"], grid,
+                                                           idx_rel, sigma0_v, (pt, ph, pw), gain=float(prune.step0_gain))
+                    else:  # step0-explore: any computed set, drafts spread by idw / near
+                        v_draft, s0_zf = self._set_draft(latents_video, vel_tokens, pre_v["meta"]["grid_size"], grid, idx_rel, sigma0_v,
+                                                         (pt, ph, pw), float(prune.step0_gain), prune.step0_draft,
+                                                         float(prune.step0_far_lambda))
                     rest = torch.ones(num_future, dtype=torch.bool, device=idx_rel.device)
                     rest[idx_rel] = False
                     rest_abs = torch.nonzero(rest).flatten() + f0
@@ -1825,7 +1865,10 @@ class JointCaseStudyRunner:
                         r[out] = float("-inf")
                         s0_sinks = torch.cat([torch.tensor([fv.PROBE_SINK], device=r.device), torch.topk(r, fv.N_SINKS - 1).indices])
                         s0_info.update(sinks_eq_top3=sorted(s0_sinks.tolist()) == sorted(torch.topk(recv.float(), fv.N_SINKS).indices.tolist()))
-                        if s0_mode == "b":
+                        if s0_mode == "b" and prune.step0_draft != "grid":  # step0-explore: A->V spread like the drafts
+                            av_plan = self._spread(av_all.float()[:, None], s0_probes, grid, prune.step0_draft,
+                                                   torch.zeros_like(av_all.float())[:, None], 0.0)[:, 0]
+                        elif s0_mode == "b":
                             av_plan = fv.interp_tokens(av_all.float()[:, None], grid, s0_probes)[:, 0]
                         else:
                             obs = act_probs_sel[self._layers["act"]][:, :f0].float().sum(dim=0)
