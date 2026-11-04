@@ -86,3 +86,48 @@ def test_late_oracle_config():
                 {**M4W["prune"], "late_oracle": "far"}):
         with pytest.raises(ValueError):
             parse_config({**LATE, "prune": bad})
+
+
+def _rows(spec):
+    from types import SimpleNamespace
+    from fastwam.casestudy.joint_runner import JointCaseStudyRunner as J
+    fake = SimpleNamespace()
+    fake._explore_rows = lambda s, g, p: J._explore_rows(fake, s, g, p)
+    return fake._explore_rows(spec, GRID, None)
+
+
+def test_far_and_union_rows():
+    f2w = _rows("f2w14")
+    assert f2w.numel() == 14 and bool((f2w >= 98).all()) and bool(((f2w % 14) >= 7).all())
+    f2s = _rows("f2s20")
+    assert f2s.numel() == 20 and bool((f2s >= 98).all()) and int(((f2s % 14) >= 7).sum()) == 10
+    u = _rows("f1s70+f2w14")
+    assert torch.equal(u, torch.sort(torch.unique(torch.cat([_rows("f1s70"), f2w]))).values) and u.numel() == 84
+    assert torch.equal(_rows("f1s84"), _rows("f1s84"))  # each part keeps its own fixed generator
+
+
+def test_spread_nearres_and_wrist_lambda():
+    from fastwam.casestudy.joint_runner import JointCaseStudyRunner as J
+    g = torch.Generator().manual_seed(21)
+    vals, fb = torch.randn(196, 3, generator=g), torch.randn(196, 3, generator=g)
+    rows = _rows("f1s70+f2w14")
+    near_only = rows[rows < 98]
+    base = J._spread(None, vals, near_only, GRID, "near", fb, 0.5)
+    own = rows[rows >= 98]
+    v2 = vals.clone()
+    v2[own] = base[own] + 0.7  # every computed far token sits 0.7 above the extrapolation
+    out = J._spread(None, v2, rows, GRID, "nearres", fb, 0.5)
+    j = torch.arange(196)
+    far_wrist = (j >= 98) & ((j % 14) >= 7)
+    far_agent = (j >= 98) & ((j % 14) < 7)
+    assert torch.allclose(out[far_wrist], base[far_wrist] + 0.7, atol=1e-5)  # the residual spread over the far wrist block
+    assert torch.equal(out[far_agent], base[far_agent]) and torch.equal(out[:98], base[:98])
+    assert torch.equal(J._spread(None, vals, near_only, GRID, "near", fb, 0.5), J._spread(None, vals, near_only, GRID, "near", fb, 0.5, None))
+    lw = J._spread(None, vals, near_only, GRID, "near", fb, 0.5, 0.1)
+    near = base[:98]
+    col = (torch.arange(98) % 14) >= 7
+    assert torch.allclose(lw[98:][col], (near + 0.1 * (near - fb[:98]))[col]) and torch.equal(lw[98:][~col], base[98:][~col])
+    cfg = parse_config({**LATE, "prune": {**LATE["prune"], "late": "f1s70+f2w14", "step0_draft": "nearres", "step0_far_lambda_wrist": 0.25}})
+    assert cfg.prune.step0_draft == "nearres" and cfg.prune.step0_far_lambda_wrist == 0.25
+    with pytest.raises(ValueError):
+        parse_config({**LATE, "prune": {**LATE["prune"], "step0_draft": "idw", "step0_far_lambda_wrist": 0.25}})

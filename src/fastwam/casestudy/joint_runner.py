@@ -163,10 +163,12 @@ class JointCaseStudyRunner:
         return rearrange(v, "b c (f x) (h y) (w z) -> b (f h w) (x y z c)", x=pt, y=ph, z=pw), zf
 
     def _spread(self, values: torch.Tensor, rows: torch.Tensor, grid: sel.Grid, mode: str, fallback: torch.Tensor,
-                lam: float = 0.0) -> torch.Tensor:
+                lam: float = 0.0, lam_wrist: Optional[float] = None) -> torch.Tensor:
         """step0-explore: values [Kf, D] known on ``rows`` spread to every future token (float32): ``idw`` block-local
         inverse-distance mean (a block without a row takes ``fallback``); ``near`` the same inside the near frame, the far frame
-        = near + lam (near - fallback) at the same (h, w) unless computed itself."""
+        = near + lam (near - fallback) at the same (h, w) unless computed itself. late-anchor-c4: ``nearres`` = near, then the
+        computed far tokens' residual to that extrapolation spread over their far block (inverse distance); ``lam_wrist`` the
+        extrapolation of the wrist camera's far tokens (None: lam)."""
         rows = rows.to(values.device)
         kf, pf = grid.num_future, grid.per_frame
         src = rows if mode == "idw" else rows[rows < pf]
@@ -174,16 +176,27 @@ class JointCaseStudyRunner:
         out = fallback.float().clone()
         out[src] = values[src].float()
         out[upd] = filled[upd]
-        if mode == "near":
+        if mode in ("near", "nearres"):
             near = out[:pf]
-            far = near + lam * (near - fallback[:pf].float())
+            if lam_wrist is None:
+                far = near + lam * (near - fallback[:pf].float())
+            else:
+                col = (torch.arange(pf, device=near.device) % grid.width) >= grid.width // 2
+                lv = torch.where(col, torch.tensor(float(lam_wrist), device=near.device), torch.tensor(float(lam), device=near.device))
+                far = near + lv[:, None] * (near - fallback[:pf].float())
             own = rows[rows >= pf]
             out[pf:] = far
+            if mode == "nearres" and own.numel():
+                res = torch.zeros_like(out)
+                res[own] = values[own].float() - out[own]
+                rfill, rupd = fv.idw_fill(res, own, grid)
+                rupd = rupd[rupd >= pf]
+                out[rupd] = out[rupd] + rfill[rupd]
             out[own] = values[own].float()
         return out
 
     def _set_draft(self, latents: torch.Tensor, vel_tokens: torch.Tensor, grid_size, grid: sel.Grid, rows: torch.Tensor,
-                   sigma: torch.Tensor, patch: tuple[int, int, int], gain: float, mode: str, lam: float):
+                   sigma: torch.Tensor, patch: tuple[int, int, int], gain: float, mode: str, lam: float, lam_wrist: Optional[float] = None):
         """step0-explore drafts from any computed set (``_spread``): the rows' clean estimate (their change from the current frame
         x ``gain``) spread over every future token -> (draft velocity, token layout [1, f0 + Kf, D] fp32; spread estimate [Kf, D'])."""
         pt, ph, pw = patch
@@ -193,7 +206,7 @@ class JointCaseStudyRunner:
         zc = z[0][grid.future_obs_index(z.device)]
         rows = rows.to(z.device)
         zfut[rows] = zc[rows] + gain * (zfut[rows] - zc[rows])
-        zf = self._spread(zfut, rows, grid, mode, zc, lam)
+        zf = self._spread(zfut, rows, grid, mode, zc, lam, lam_wrist)
         return self._map_draft(latents, zf, grid, sigma, patch), zf
 
     def _map_draft(self, latents: torch.Tensor, zf: torch.Tensor, grid: sel.Grid, sigma: torch.Tensor,
@@ -360,8 +373,11 @@ class JointCaseStudyRunner:
 
     def _explore_rows(self, spec: str, grid: sel.Grid, plan) -> torch.Tensor:
         """step0-explore visible sets (sorted future indices): grid39 (B's probes), rand<n> / strat<n> (random, per block
-        stratified; fixed generator), patch39 (each block's central 3 x 3 + 182, 7, 105), agf1 (agentview, frame 1), frame1,
+        stratified; fixed generator), f2w<n> / f2a<n> / f2s<n> (the far frame: wrist, agentview, both; late-anchor-c4), a+b (union),
+        patch39 (each block's central 3 x 3 + 182, 7, 105), agf1 (agentview, frame 1), frame1,
         cam_ag, m4w39 / core23 (the dense plan's sinks + core + step-9 slice / sinks + core), all."""
+        if "+" in spec:  # late-anchor-c4: a union of sets, each drawn as on its own
+            return torch.sort(torch.unique(torch.cat([self._explore_rows(p, grid, plan) for p in spec.split("+")]))).values
         kf, pf, half = grid.num_future, grid.per_frame, grid.width // 2
         gen = torch.Generator(device="cpu").manual_seed(1234)
         blocks = [[f * pf + r * grid.width + cam * half + c for r in range(grid.height) for c in range(half)]
@@ -380,6 +396,10 @@ class JointCaseStudyRunner:
         elif spec.startswith("f1s"):  # step0-explore: the near frame only, stratified random over its two camera blocks
             n = int(spec[3:])
             out = torch.cat([torch.tensor(b)[torch.randperm(len(b), generator=gen)[:k]] for b, k in zip(blocks[:2], (n - n // 2, n // 2))])
+        elif spec.startswith(("f2w", "f2a", "f2s")):  # late-anchor-c4: the far frame only (wrist, agentview, or both halves)
+            n = int(spec[3:])
+            parts = {"f2w": ((blocks[3], n),), "f2a": ((blocks[2], n),), "f2s": ((blocks[2], n - n // 2), (blocks[3], n // 2))}[spec[:3]]
+            out = torch.cat([torch.tensor(b)[torch.randperm(len(b), generator=gen)[:k]] for b, k in parts])
         elif spec == "f1g32":  # the near frame on rows / columns {0, 2, 4, 6} of both cameras
             out = torch.tensor([r * grid.width + cam * half + c for cam in (0, 1) for r in (0, 2, 4, 6) for c in (0, 2, 4, 6)])
         elif spec == "agf1":
@@ -1582,7 +1602,7 @@ class JointCaseStudyRunner:
                     else:  # step0-explore: any computed set, drafts spread by idw / near
                         v_draft, s0_zf = self._set_draft(latents_video, vel_tokens, pre_v["meta"]["grid_size"], grid, idx_rel, sigma0_v,
                                                          (pt, ph, pw), float(prune.step0_gain), prune.step0_draft,
-                                                         float(prune.step0_far_lambda))
+                                                         float(prune.step0_far_lambda), prune.step0_far_lambda_wrist)
                     rest = torch.ones(num_future, dtype=torch.bool, device=idx_rel.device)
                     rest[idx_rel] = False
                     rest_abs = torch.nonzero(rest).flatten() + f0
@@ -1608,7 +1628,8 @@ class JointCaseStudyRunner:
                 # late anchor: step 1 forms the imagination; every other future token is drafted from it (spread, gain), and
                 # the computed ones move along their corrected change.
                 v_draft, late_st["zf"] = self._set_draft(latents_video, vel_tokens, gsz, grid, idx_rel, sig_s, (pt, ph, pw),
-                                                         float(prune.step0_gain), prune.step0_draft, float(prune.step0_far_lambda))
+                                                         float(prune.step0_gain), prune.step0_draft, float(prune.step0_far_lambda),
+                                                         prune.step0_far_lambda_wrist)
                 if prune.late_oracle is not None and prune.late_oracle != "plan":
                     # late-anchor-c4 attribution: one part of the drafts replaced by the dense step-0 clean estimate (change from
                     # the current frame x the same gain); near: the far frame extrapolated from the replaced near frame. The plan

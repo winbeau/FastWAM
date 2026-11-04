@@ -235,6 +235,9 @@ class PruneConfig:
     step0_rows: Optional[str] = None
     step0_draft: str = "grid"
     step0_far_lambda: float = 0.5
+    #: late-anchor-c4: the far-frame extrapolation of the wrist camera (None: step0_far_lambda); step0_draft ``nearres`` adds the
+    #: computed far tokens' residual to the extrapolation, spread over their far block.
+    step0_far_lambda_wrist: Optional[float] = None
     #: step0-explore late anchor (step0 b): step 0 computes no future token (they stay on pure noise); step 1 computes this set
     #: (``_explore_rows``), drafts every other token from it (step0_draft, step0_gain) and gives the plan of steps 2-9.
     late: Optional[str] = None
@@ -462,6 +465,7 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             step0_rows=None if block.get("step0_rows") is None else str(block["step0_rows"]),
             step0_draft=str(block.get("step0_draft", "grid")),
             step0_far_lambda=float(block.get("step0_far_lambda", 0.5)),
+            step0_far_lambda_wrist=None if block.get("step0_far_lambda_wrist") is None else float(block["step0_far_lambda_wrist"]),
             late=None if block.get("late") is None else str(block["late"]),
             late_extra=int(block.get("late_extra", 0)),
             late_step=int(block.get("late_step", 1)),
@@ -504,16 +508,18 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
                  f"prune.draft_mod must be one of {DRAFT_MODS} on plain interlace_w")
         _require(prune.step0_gain == 1.0 or (prune.step0_gain > 0 and (prune.step0 is not None or prune.side0_use in ("draft", "both", "video"))),
                  "prune.step0_gain (> 0) is for step0 or the side0 video / draft / both outputs")
-        _require(prune.step0_draft in ("grid", "idw", "near") and (prune.step0 is not None or (prune.step0_rows is None
+        _require(prune.step0_draft in ("grid", "idw", "near", "nearres") and (prune.step0 is not None or (prune.step0_rows is None
                  and prune.step0_draft == "grid")) and (prune.step0_draft != "grid" or prune.step0_rows in (None, "grid39")),
                  "prune.step0_rows / step0_draft (grid needs the probe grid; idw / near any set) are step0 options")
         _require(prune.late_extra >= 0 and (prune.late_extra == 0 or prune.late is not None or (
             prune.fovea == "interlace_w" and not prune.fovea_off and not prune.fovea_wzero and prune.step0 is None and prune.e9 is None
             and not r2)), "prune.late_extra (>= 0) needs prune.late or plain interlace_w")
         _require(prune.late_step in (0, 1) and (prune.late_step == 1 or prune.late is not None), "prune.late_step (0 or 1) needs prune.late")
+        _require(prune.step0_far_lambda_wrist is None or prune.step0_draft in ("near", "nearres"),
+                 "prune.step0_far_lambda_wrist needs near / nearres drafts")
         _require(prune.late_oracle is None or (prune.late_oracle in LATE_ORACLES and prune.late is not None and prune.late_step == 1),
                  f"prune.late_oracle must be one of {LATE_ORACLES} on the late anchor (late_step 1)")
-        _require(prune.late is None or (prune.step0 == "b" and prune.step0_draft in ("idw", "near") and prune.c2f is None
+        _require(prune.late is None or (prune.step0 == "b" and prune.step0_draft in ("idw", "near", "nearres") and prune.c2f is None
                                         and not prune.step0_all and prune.step0_rows is None), "prune.late needs step0 b with idw / near drafts")
         _require(prune.c2f is None or (prune.step0 == "b" and not prune.step0_all and prune.c2f >= 1), "prune.c2f (>= 1) needs prune.step0 b")
         _require(prune.draft_from is None or 0 <= prune.draft_from <= 10, "prune.draft_from must be in [0, 10]")
