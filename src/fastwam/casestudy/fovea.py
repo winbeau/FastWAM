@@ -105,8 +105,9 @@ def step0_slices(periphery: torch.Tensor, probes: torch.Tensor, av: torch.Tensor
     pp, rest = periphery[is_probe], periphery[~is_probe]
     pp = pp[torch.argsort(-av[pp].float(), stable=True)]
     last, prev, third = pp[:quota], pp[quota:2 * quota], pp[2 * quota:]
-    if third.numel() > quota:
-        raise ValueError("step0: too many probes left for slice n - 2")
+    if third.numel() > quota:  # step0-explore: more computed tokens than three slices hold; the rest join the raster
+        rest = torch.sort(torch.cat([rest, third[quota:]])).values
+        third = third[:quota]
     m = n - 2
     slices, cut = [], []
     for i in range(m):

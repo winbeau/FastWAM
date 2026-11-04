@@ -82,3 +82,17 @@ def test_c2f_survey_and_plan():
                                                                          "c2f": 3}}).prune.c2f == 3
     with pytest.raises(ValueError):
         parse_config({"method": "prune", "prune": {"keep_ratio": 0.2, "fovea": "interlace_w", "c2f": 3}})
+
+
+def test_step0_slices_overflow_and_spread():
+    av = torch.rand(196, generator=torch.Generator().manual_seed(3))
+    many = torch.arange(0, 98)  # the whole near frame computed
+    sinks = torch.tensor([182, 20, 60])
+    p = fv.make_plan("interlace_w", 39, GRID, av, av, av, sinks=sinks, probes=many)
+    assert torch.equal(torch.sort(torch.cat(p.slices + [p.truncated])).values, p.periphery)
+    assert all(x.numel() <= 16 for x in p.slices) and set(p.slices[8].tolist()) <= set(many.tolist())
+    assert parse_config({"method": "prune", "score_layer": 18, "prune": {"keep_ratio": 0.2, "fovea": "interlace_w", "step0": "b",
+                                                                         "step0_rows": "f1s39", "step0_draft": "near"}}).prune.step0_rows == "f1s39"
+    with pytest.raises(ValueError):
+        parse_config({"method": "prune", "score_layer": 18, "prune": {"keep_ratio": 0.2, "fovea": "interlace_w", "step0": "b",
+                                                                      "step0_rows": "f1s39"}})  # grid drafts need the probe grid
