@@ -27,6 +27,7 @@ Fewer steps is ``dense`` with a smaller ``num_inference_steps`` (both stages).
 from __future__ import annotations
 
 import base64
+import math
 from typing import Any, Optional
 
 import numpy as np
@@ -79,10 +80,13 @@ class IDMCaseStudyRunner:
             self._prompt_cache[prompt] = entry
         return entry
 
-    def _probs(self, q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+    def _probs(self, q: torch.Tensor, k: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Head-mean attention probabilities [Sq, Sk]; ``mask`` [1, 1, 1, Sk]: the forward pass's additive key bias (IDM-L)."""
         qh = rearrange(q, "b s (n d) -> b n s d", n=self.num_heads)
         kh = rearrange(k, "b s (n d) -> b n s d", n=self.num_heads)
         logits = (qh.float() @ kh.float().transpose(-1, -2)) * (qh.shape[-1] ** -0.5)
+        if mask is not None:
+            logits = logits + mask.float()
         return torch.softmax(logits, dim=-1).mean(dim=1)[0]
 
     def _post(self, block, io, mixed, context, context_mask):
@@ -103,7 +107,7 @@ class IDMCaseStudyRunner:
             v = torch.cat([kv0[layer][1], io[2]], dim=1)
             out = flash_attention(q=io[0], k=k, v=v, num_heads=self.num_heads, ctx_mask=mask)
             if recv is not None:
-                recv += self._probs(io[0], k)[:, f0:].sum(dim=0)
+                recv += self._probs(io[0], k, mask)[:, f0:].sum(dim=0)
             if keep_kv:
                 kv.append((k, v))
             x = self._post(block, io, out, ctx, ctx_mask)
@@ -122,13 +126,80 @@ class IDMCaseStudyRunner:
             v = torch.cat([cache[layer][1], io[2]], dim=1)
             out = flash_attention(q=io[0], k=k, v=v, num_heads=self.num_heads, ctx_mask=mask)
             if layer in capture:
-                probs[layer] = self._probs(io[0], k)
+                probs[layer] = self._probs(io[0], k, mask)
             if noise_gen is not None:
                 rms = out.float().pow(2).mean().sqrt()
                 out = out + (self.cfg.noise.sigma * rms * torch.randn(
                     out.shape, generator=noise_gen, device=out.device, dtype=torch.float32)).to(out.dtype)
             x = self._post(block, io, out, a_ctx, a_ctx_mask)
         return self.action.post(x), probs
+
+    # ---- IDM-L (late-anchor-confirm): the late anchor's computed set and drafts, as main's joint_runner (step0-explore)
+    @staticmethod
+    def _late_rows(spec: str, grid: sel.Grid) -> torch.Tensor:
+        """Sorted future indices of ``spec`` with main's ``_explore_rows`` generator: f1s<n> (the near frame, stratified random over
+        its two camera blocks, n - n // 2 agentview + n // 2 wrist) or strat<n> (per (frame, camera) block stratified)."""
+        pf, half = grid.per_frame, grid.width // 2
+        gen = torch.Generator(device="cpu").manual_seed(1234)
+        blocks = [[f * pf + r * grid.width + cam * half + c for r in range(grid.height) for c in range(half)]
+                  for f in range(grid.frames - 1) for cam in (0, 1)]
+        if spec.startswith("f1s"):
+            n = int(spec[3:])
+            out = torch.cat([torch.tensor(b)[torch.randperm(len(b), generator=gen)[:k]] for b, k in zip(blocks[:2], (n - n // 2, n // 2))])
+        elif spec.startswith("strat"):
+            n = int(spec[5:])
+            per = [n // len(blocks) + (1 if i < n % len(blocks) else 0) for i in range(len(blocks))]
+            out = torch.cat([torch.tensor(b)[torch.randperm(len(b), generator=gen)[:k]] for b, k in zip(blocks, per)])
+        else:
+            raise ValueError(f"late rows {spec!r}")
+        return torch.sort(torch.unique(out.long())).values
+
+    @staticmethod
+    def _spread(values: torch.Tensor, rows: torch.Tensor, grid: sel.Grid, mode: str, fallback: torch.Tensor,
+                lam: float = 0.0) -> torch.Tensor:
+        """main's ``_spread``: values [Kf, D] known on ``rows`` spread to every future token (float32): ``idw`` block-local
+        inverse-distance mean (a block without a row takes ``fallback``); ``near`` the same inside the near frame, the far frame
+        = near + lam (near - fallback) at the same (h, w) unless computed itself."""
+        rows = rows.to(values.device)
+        pf = grid.per_frame
+        src = rows if mode == "idw" else rows[rows < pf]
+        filled, upd = fv.idw_fill(values, src, grid)
+        out = fallback.float().clone()
+        out[src] = values[src].float()
+        out[upd] = filled[upd]
+        if mode == "near":
+            near = out[:pf]
+            far = near + lam * (near - fallback[:pf].float())
+            own = rows[rows >= pf]
+            out[pf:] = far
+            out[own] = values[own].float()
+        return out
+
+    def _set_draft(self, latents: torch.Tensor, vel: torch.Tensor, grid_size, grid: sel.Grid, rows: torch.Tensor,
+                   sigma: torch.Tensor, patch: tuple[int, int, int], gain: float, mode: str, lam: float):
+        """main's ``_set_draft``: the rows' clean estimate (their change from the current frame x ``gain``) spread over every future
+        token -> (draft velocity, token layout [1, f0 + Kf, D] fp32; spread estimate [Kf, D'])."""
+        pt, ph, pw = patch
+        x0 = latents.float() - sigma * self.video.unpatchify(vel, grid_size).float()
+        z = rearrange(x0[0], "c (f a) (h b) (w e) -> f (h w) (c a b e)", a=pt, b=ph, e=pw)
+        zfut = z[1:].reshape(-1, z.shape[-1]).clone()
+        zc = z[0][grid.future_obs_index(z.device)]
+        rows = rows.to(z.device)
+        zfut[rows] = zc[rows] + gain * (zfut[rows] - zc[rows])
+        zf = self._spread(zfut, rows, grid, mode, zc, lam)
+        return self._map_draft(latents, zf, grid, sigma, patch), zf
+
+    @staticmethod
+    def _map_draft(latents: torch.Tensor, zf: torch.Tensor, grid: sel.Grid, sigma: torch.Tensor,
+                   patch: tuple[int, int, int]) -> torch.Tensor:
+        """main's ``_map_draft``: the velocity (x - x0) / sigma [1, f0 + Kf, D] (fp32, token layout) that moves every future token
+        towards the clean estimate ``zf`` [Kf, D'] (the Diff layout)."""
+        pt, ph, pw = patch
+        z = rearrange(latents[0].float(), "c (f a) (h b) (w e) -> f (h w) (c a b e)", a=pt, b=ph, e=pw)
+        z_int = torch.cat([z[:1], zf.float().reshape(z.shape[0] - 1, z.shape[1], -1)], dim=0)
+        x0 = rearrange(z_int, "f (h w) (c a b e) -> c (f a) (h b) (w e)", h=grid.height, a=pt, b=ph, e=pw)[None]
+        v = (latents.float() - x0) / sigma
+        return rearrange(v, "b c (f x) (h y) (w z) -> b (f h w) (x y z c)", x=pt, y=ph, z=pw)
 
     @torch.no_grad()
     def infer_action(self, prompt, input_image, proprio, action_horizon, num_video_frames, seed,
@@ -225,6 +296,15 @@ class IDMCaseStudyRunner:
         fv_count = torch.zeros(num_future, dtype=torch.long, device=model.device) if fovea_m is not None else None
         fv_rows: list[int] = []
         pt, ph, pw = (int(x) for x in patch)
+        # late-anchor-confirm IDM-L: stage-1 step 0 computes no future token; step 1 computes the late set (key bias), runs the
+        # scoring probe on it and drafts every other token; the plan of steps 2-9 from step 1. Per stage-1 step: the computed
+        # set and its key bias, which the action stage reads step by step.
+        late = prune.late if prune is not None else None
+        late_rows = self._late_rows(late, grid).to(model.device) if late is not None else None
+        late_st: dict = {"recv": torch.zeros(num_future, device=model.device)} if late is not None else {}
+        late_sched: dict[int, tuple] = {}
+        z_late = rearrange(latents_video[0, :, 0:pt].float(), "c (f a) (h b) (w e) -> f (h w) (c a b e)", a=pt, b=ph,
+                           e=pw)[0] if late is not None else None
         for s in range(steps):
             ts_v = t_video[s].unsqueeze(0).to(dtype=latents_video.dtype, device=model.device)
             xt, tt, tmodt, ctxt, ctxmt, freqst, f, h, w, _tpf = self.video.prepare(
@@ -246,6 +326,10 @@ class IDMCaseStudyRunner:
                             mode = "skip"
                 tea_prev = signal
             idx_rel = (fplan.real(s) if fplan is not None else kept) if mode == "pruned" else all_future
+            if late is not None and s == 0:
+                idx_rel = all_future[:0]  # IDM-L: stage-1 step 0 computes no future token
+            if late is not None and s == 1 and not torch.equal(idx_rel, late_rows):
+                raise RuntimeError("IDM-L: stage-1 step 1 does not compute exactly the late set")
             idx_abs = idx_rel + f0
             vmask = None
             if fplan is not None and mode == "pruned":
@@ -258,19 +342,44 @@ class IDMCaseStudyRunner:
                     vmask = vmask.to(latents_video.dtype)
                 fv_rows.append(int(idx_rel.numel()))
                 fv_count[idx_rel] += 1
+            if late is not None:
+                late_sched[s] = (idx_rel.clone(), dict(fplan.bias_at(s)) if (fplan is not None and mode == "pruned") else {})
             if idx_rel.numel():  # V2-k0: no future token after step 0, the latents keep step 0's velocity
                 xv_in = xt[:, idx_abs]
                 if mode == "skip":
                     xv = xv_in + tea_res
                     tea_cons += 1
                 else:
-                    need_kv = s == 0 and (probe or v2k0)
+                    late1 = late is not None and s == 1
+                    need_kv = (s == 0 and (probe or v2k0)) or late1
+                    rec1 = torch.zeros(int(idx_rel.numel()), device=model.device) if late1 else None
                     xv, kv_step = self._video_layers(xv_in, freqst[idx_abs], tmodt[:, idx_abs], ctxt, ctxmt[:, idx_abs], kv0,
                                                      keep_kv=need_kv, mask=vmask,
-                                                     recv=recv_acc if (s == 0 and recv_acc is not None) else None)
+                                                     recv=rec1 if late1 else (recv_acc if (s == 0 and recv_acc is not None) else None))
                     if tea is not None:
                         tea_res, tea_acc, tea_cons = xv - xv_in, 0.0, 0
-                    if need_kv and probe:
+                    if late1:
+                        # IDM-L: the scoring probe (initial action noise, first action timestep) on step 1's video K/V (frame 0 +
+                        # the late set, the same key bias), embedded in the [frame-0 | Kf | action] layout (0 on the tokens not
+                        # computed); the attention the late set receives from the video rows and the probe, every layer.
+                        ts_a0 = t_action[0].unsqueeze(0).to(dtype=latents_action.dtype, device=model.device)
+                        n_q, n_act = int(idx_rel.numel()), int(latents_action.shape[1])
+                        amask_p = None
+                        if vmask is not None:
+                            amask_p = torch.zeros((1, 1, 1, f0 + n_q + n_act), device=model.device, dtype=vmask.dtype)
+                            amask_p[..., :f0 + n_q] = vmask[..., :f0 + n_q]
+                        _pred, pm_all = self._action_layers(latents_action, ts_a0, context, context_mask, kv_step,
+                                                            set(range(self.num_layers)), mask=amask_p)
+                        probe_probs = {}
+                        for l_, pm in pm_all.items():
+                            full = torch.zeros((pm.shape[0], f0 + num_future + n_act), dtype=pm.dtype, device=pm.device)
+                            full[:, :f0] = pm[:, :f0]
+                            full[:, f0 + idx_rel] = pm[:, f0:f0 + n_q]
+                            full[:, f0 + num_future:] = pm[:, f0 + n_q:]
+                            probe_probs[l_] = full
+                            late_st["recv"][idx_rel] += pm[:, f0:f0 + n_q].sum(dim=0)
+                        late_st["recv"][idx_rel] += rec1
+                    elif need_kv and probe:
                         # Probe: one action pass at the first action timestep against step-0 video K/V.
                         ts_a0 = t_action[0].unsqueeze(0).to(dtype=latents_action.dtype, device=model.device)
                         cap = set(range(self.num_layers)) if fovea_m is not None else act_layers
@@ -284,7 +393,23 @@ class IDMCaseStudyRunner:
                 if vel is None:
                     vel = torch.zeros((1, f0 + num_future, part.shape[-1]), device=part.device, dtype=part.dtype)
                 vel[:, idx_abs] = part
-            if s == 0 and fovea_m is not None:
+            if late is not None and s == 0:
+                # IDM-L: every future token stays on pure noise (x^0 = 0); frame 0 is pinned.
+                sig0 = t_video[0].float() / float(model.infer_video_scheduler.num_train_timesteps)
+                x_tok0 = rearrange(latents_video, "b c (f x) (h y) (w z) -> b (f h w) (x y z c)", x=pt, y=ph, z=pw)
+                vel = torch.zeros((1, f0 + num_future, int(x_tok0.shape[-1])), device=latents_video.device, dtype=latents_video.dtype)
+                vel[:, f0:] = (x_tok0[:, f0:].float() / sig0).to(vel.dtype)
+            if late is not None and s == 1:
+                # IDM-L: step 1 forms the imagination; every other future token is drafted from it (spread, gain), and the
+                # computed ones move along their corrected change.
+                sig1 = t_video[1].float() / float(model.infer_video_scheduler.num_train_timesteps)
+                v_draft, late_st["zf"] = self._set_draft(latents_video, vel, (f, h, w), grid, idx_rel, sig1, (pt, ph, pw),
+                                                         float(prune.step0_gain), prune.step0_draft, float(prune.step0_far_lambda))
+                rest = torch.ones(num_future, dtype=torch.bool, device=idx_rel.device)
+                rest[idx_rel] = False
+                upd_abs = torch.nonzero(rest).flatten() + f0 if float(prune.step0_gain) == 1.0 else all_future + f0
+                vel[:, upd_abs] = v_draft[:, upd_abs].to(vel.dtype)
+            if s == 0 and fovea_m is not None and late is None:
                 # Diff (as on main): step 0's clean estimate x - sigma_0 v of every future token against the current frame.
                 sigma_v = t_video[0].float() / float(model.infer_video_scheduler.num_train_timesteps)
                 x0 = latents_video.float() - sigma_v * self.video.unpatchify(vel, (f, h, w)).float()
@@ -294,7 +419,7 @@ class IDMCaseStudyRunner:
             latents_video = model.infer_video_scheduler.step(self.video.unpatchify(vel, (f, h, w)), d_video[s], latents_video)
             latents_video[:, :, 0:1] = first.clone()
             modes.append(mode)
-            if s == 0 and probe_probs:
+            if ((s == 0 and late is None) or (late is not None and s == 1)) and probe_probs:  # IDM-L: the probe is on step 1
                 if first_call:
                     act = min(probe_probs, key=lambda l: sel.entropy(sel.future_mass(probe_probs[l], grid)))
                     inst = min(inst_mass, key=lambda l: sel.entropy(inst_mass[l])) if inst_mass else act
@@ -306,9 +431,44 @@ class IDMCaseStudyRunner:
                 diag.update({"layer_act": self._layers["act"], "gate_score": sel.gate_score(p_act, grid),
                              "av_mass_future": float(av.sum()), "av_mass_obs": float(p_act[:, :f0].float().sum()),
                              "av_scores_f16": _f16_b64(av)})
-            elif s == 0 and first_call:
+            elif s == 0 and first_call and late is None:
                 self._layers = {"act": -1, "inst": -1}
-            if prune is not None and s == prune.warmup_steps - 1:
+            if late is not None and s == 0:
+                # IDM-L: step 1 computes the late set, every key + log(Kf / n).
+                lg = math.log(num_future / int(late_rows.numel()))
+                empty_ = late_rows[:0]
+                fplan = fv.Plan(fovea_m, empty_, empty_, empty_, late_rows, bias_real={int(j): lg for j in late_rows.tolist()})
+                kept = late_rows
+                diag["late"] = {"set": late, "n": int(late_rows.numel()), "bias": round(lg, 6)}
+            if late is not None and s == 1:
+                # IDM-L: the plan of steps 2-9 from step 1 (main's late anchor): sinks 182 + the 2 computed tokens receiving the
+                # most; core from the spread A->V and the Diff of the spread drafts; computed tokens in the last slices; step 9
+                # + late_extra never-computed tokens by A->V.
+                rows1 = idx_rel
+                av1 = sel.av_scores(probe_probs[self._layers["act"]], grid).float()
+                av1 = av1[rows1] / av1[rows1].sum()
+                zeros1 = torch.zeros(num_future, 1, device=rows1.device)
+                av_full = self._spread(zeros1.index_copy(0, rows1, av1[:, None]), rows1, grid, prune.step0_draft, zeros1, 0.0)[:, 0]
+                zo = z_late[grid.future_obs_index(z_late.device)]
+                df_full = (late_st["zf"] - zo).norm(dim=-1)
+                r_ = (late_st["recv"] / self.num_layers).float().clone()
+                out_ = torch.ones(num_future, dtype=torch.bool, device=r_.device)
+                out_[rows1] = False
+                out_[fv.PROBE_SINK] = True
+                r_[out_] = float("-inf")
+                sinks_l = torch.cat([torch.tensor([fv.PROBE_SINK], device=r_.device), torch.topk(r_, fv.N_SINKS - 1).indices])
+                k = max(1, int(round(prune.keep_ratio * num_future)))
+                fplan = fv.c2f_plan(rows1.cpu(), av_full.cpu(), df_full.cpu(), sinks_l.cpu(), grid, k, core_all=True,
+                                    last_extra=int(prune.late_extra)).to(model.device)
+                kept = fplan.fixed
+                diag["late"].update(core=fplan.core.tolist(), sinks=fplan.sinks.tolist(), slices=[int(x.numel()) for x in fplan.slices],
+                                    truncated=int(fplan.truncated.numel()))
+                diag["fovea"] = {"method": fovea_m, "k": int(k), "sinks": fplan.sinks.tolist(), "core_index": fplan.core.tolist(),
+                                 "periphery": int(fplan.periphery.numel()), "slices": [int(x.numel()) for x in fplan.slices],
+                                 "truncated": int(fplan.truncated.numel()), "slice_bias": [round(x, 6) for x in fplan.slice_bias]}
+                diag["kept_count"] = int(kept.numel())
+                diag["kept_index"] = kept.tolist()
+            if prune is not None and s == prune.warmup_steps - 1 and late is None:
                 k = 0 if v2k0 else max(1, int(round(prune.keep_ratio * num_future)))
                 if v2k0:
                     kept = all_future[:0]
@@ -366,7 +526,9 @@ class IDMCaseStudyRunner:
             diag["reuse_step0_kv"] = True
         else:
             idx2_rel = keep2
-            if fplan is not None and fplan.slices:  # M4 / M4w: every token stage 1 computed after step 0
+            if late is not None:  # IDM-L: every token stage 1 computed (steps 1-9), sorted
+                idx2_rel = torch.unique(torch.cat([late_sched[s_][0] for s_ in range(1, steps)]))
+            elif fplan is not None and fplan.slices:  # M4 / M4w: every token stage 1 computed after step 0
                 idx2_rel = torch.sort(torch.cat([fplan.fixed] + [x.to(fplan.fixed.device) for x in fplan.slices])).values
             keep2 = idx2_rel
             idx2 = idx2_rel + f0
@@ -374,13 +536,30 @@ class IDMCaseStudyRunner:
                 x=latents_video, timestep=zero_t, context=context, context_mask=context_mask, action=None,
                 fuse_vae_embedding_in_latents=fuse)
             _x, cache = self._video_layers(xc[:, idx2], freqsc[idx2], tmodc[:, idx2], ctxc, ctxmc[:, idx2], kv0, keep_kv=True)
+        late_vis: list[int] = []
         noise_gen = None
         if cfg.method == "noise" and cfg.noise.sigma > 0:
             noise_gen = torch.Generator(device=model.device).manual_seed((int(seed) ^ 0x5EED) & 0x7FFFFFFF)
         for s in range(steps):
             ts_a = t_action[s].unsqueeze(0).to(dtype=latents_action.dtype, device=model.device)
             cache_s, amask = cache, None
-            if fplan is not None and fplan.slices:
+            if late is not None:
+                # IDM-L: action step s sees frame 0 + the tokens stage-1 step s computed, with that step's key bias (step 0:
+                # frame 0 only). Runner check: every visible future key is in the re-encode and was computed on stage-1 step s.
+                vis, bias_s = late_sched[s]
+                pos = torch.searchsorted(idx2_rel, vis)
+                if vis.numel() and (int(pos.max()) >= int(idx2_rel.numel()) or not torch.equal(idx2_rel[pos], vis)):
+                    raise RuntimeError("IDM-L: the action stage would see keys stage-1 step s did not compute")
+                cols = torch.cat([torch.arange(f0, device=vis.device), f0 + pos])
+                cache_s = [(kk[:, cols], vv[:, cols]) for kk, vv in cache]
+                if bias_s:
+                    n_act = int(latents_action.shape[1])
+                    amask = torch.zeros((1, 1, 1, f0 + int(vis.numel()) + n_act), device=model.device)
+                    for j, lg in bias_s.items():
+                        amask[..., f0 + torch.nonzero(vis == j).flatten()] = lg
+                    amask = amask.to(latents_action.dtype)
+                late_vis.append(int(vis.numel()))
+            elif fplan is not None and fplan.slices:
                 # M4 / M4w: action step s sees frame 0 + sinks + core + slice (s - 1) mod 9 of the clean re-encode.
                 vis = fplan.real(s)
                 cols = torch.cat([torch.arange(f0, device=vis.device), f0 + torch.searchsorted(idx2_rel, vis)])
@@ -401,10 +580,13 @@ class IDMCaseStudyRunner:
             pruned = sum(1 for m in modes if m == "pruned")
             rows = sum(fv_rows) if fplan is not None else pruned * int(kept.numel())
             diag["future_token_steps"] = (steps - pruned) * num_future + rows + int(keep2.numel())
+            if late is not None:  # IDM-L: stage-1 step 0 computes no future token
+                diag["future_token_steps"] = rows + int(keep2.numel())
+                diag["late"]["action_visible"] = late_vis
         if fplan is not None:
             diag["fovea"]["rows_per_step"] = fv_rows
             diag["fovea"]["stage2_reencoded"] = int(keep2.numel())
-            if fplan.slices:
+            if fplan.slices and late is None:  # IDM-L: the step-1 tokens are computed again in their slices
                 cut = set(fplan.truncated.tolist())
                 cnt = fv_count[fplan.periphery].tolist()
                 once = all((c == 0) if int(j) in cut else (c == 1) for j, c in zip(fplan.periphery.tolist(), cnt))

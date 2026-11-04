@@ -72,6 +72,15 @@ class PruneConfig:
     #: ``fovea_off`` keeps the code path with S0's A->V top-k only (self-check).
     fovea: Optional[str] = None
     fovea_off: bool = False
+    #: late-anchor-confirm (IDM-L, the late anchor of main's step0-explore on IDM): stage-1 step 0 computes no future token
+    #: (pure noise); step 1 computes this set (f1s<n> / strat<n>, key bias log(Kf / n)) and runs the scoring probe on it, drafts
+    #: every other token from it (step0_draft idw / near, step0_gain, step0_far_lambda) and gives the plan of steps 2-9
+    #: (``fv.c2f_plan``, step 9 + late_extra). The action stage step s sees frame 0 + the tokens stage-1 step s computed.
+    late: Optional[str] = None
+    step0_draft: str = "near"
+    step0_gain: float = 1.0
+    step0_far_lambda: float = 0.5
+    late_extra: int = 0
 
 
 @dataclass(frozen=True)
@@ -161,12 +170,22 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             reuse_step0_kv=bool(block.get("reuse_step0_kv", False)),
             fovea=None if block.get("fovea") is None else str(block["fovea"]),
             fovea_off=bool(block.get("fovea_off", False)),
+            late=None if block.get("late") is None else str(block["late"]),
+            step0_draft=str(block.get("step0_draft", "near")),
+            step0_gain=float(block.get("step0_gain", 1.0)),
+            step0_far_lambda=float(block.get("step0_far_lambda", 0.5)),
+            late_extra=int(block.get("late_extra", 0)),
         )
         if prune.fovea is not None or prune.fovea_off:
             _require(prune.fovea in ("interlace", "interlace_w"), "prune.fovea on IDM is interlace or interlace_w")
             _require(prune.selection == "av" and prune.warmup_steps == 1 and prune.keep_ratio > 0.0 and not (
                 prune.reuse_step0_kv or prune.extra_keep_ratio or prune.full_steps or prune.gate is not None
                 or prune.reselect_every_step), "prune.fovea is S0 (selection av, warm-up 1, keep > 0) plus the fovea plan only")
+        _require(prune.late is None or (prune.fovea in ("interlace", "interlace_w") and not prune.fovea_off
+                                        and (prune.late.startswith("f1s") or prune.late.startswith("strat"))
+                                        and prune.step0_draft in ("idw", "near") and prune.step0_gain > 0),
+                 "prune.late (f1s<n> / strat<n>) needs fovea interlace / interlace_w with idw / near drafts and a gain > 0")
+        _require(prune.late_extra >= 0 and (prune.late_extra == 0 or prune.late is not None), "prune.late_extra (>= 0) needs prune.late")
         _require(prune.selection in SELECTIONS, f"prune.selection must be one of {SELECTIONS}")
         _require(0.0 < prune.keep_ratio <= 1.0 or (prune.reuse_step0_kv and prune.keep_ratio == 0.0),
                  "prune.keep_ratio must be in (0, 1] (0 only with reuse_step0_kv)")
