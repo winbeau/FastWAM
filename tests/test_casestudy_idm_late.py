@@ -67,7 +67,7 @@ def _fake_video():
         f, h, w = gs
         return rearrange(tok, "b (f h w) (x y z c) -> b c (f x) (h y) (w z)", f=f, h=h, w=w, x=pt, y=ph, z=pw)
 
-    return SimpleNamespace(video=SimpleNamespace(unpatchify=unpatchify))
+    return SimpleNamespace(video=SimpleNamespace(unpatchify=unpatchify), _spread=R._spread, _map_draft=R._map_draft)
 
 
 def test_set_draft_gain_and_map():
