@@ -264,7 +264,7 @@ def c2f_survey(probes: torch.Tensor, av: torch.Tensor, diff: torch.Tensor, sinks
 
 
 def c2f_plan(measured: torch.Tensor, av: torch.Tensor, diff: torch.Tensor, sinks: torch.Tensor, grid: sel.Grid, k: int,
-             first: int = 2, n_steps: int = 10, quota: int = R_SLOTS) -> "Plan":
+             first: int = 2, n_steps: int = 10, quota: int = R_SLOTS, core_all: bool = False) -> "Plan":
     """step0-explore C2F plan of steps ``first``..n_steps-1, from the scores of the ``measured`` tokens (unmeasured: 0): sinks as
     given; the core by ``make_plan``'s rule (A->V top 10 + Diff top 10, filled by A->V) to k - sinks - quota; the measured
     periphery tokens (best A->V first) fill the last two slices, the rest of the periphery the earlier ones by raster interlace
@@ -274,7 +274,7 @@ def c2f_plan(measured: torch.Tensor, av: torch.Tensor, diff: torch.Tensor, sinks
     m[measured.cpu()] = True
     av_m, df_m = torch.where(m, av.float(), torch.zeros(kf)), torch.where(m, diff.float(), torch.zeros(kf))
     c = max(0, k - int(sinks.numel()) - quota)
-    core = select_core(av_m, df_m, sinks.cpu(), c)
+    core = select_core(av.float() if core_all else av_m, diff.float() if core_all else df_m, sinks.cpu(), c)  # core_all: spread scores
     mask = torch.ones(kf, dtype=torch.bool)
     mask[sinks.cpu()] = False
     mask[core] = False
@@ -282,7 +282,7 @@ def c2f_plan(measured: torch.Tensor, av: torch.Tensor, diff: torch.Tensor, sinks
     n = n_steps - first
     pm = periphery[m[periphery]]
     best = pm[torch.argsort(-av_m[pm], stable=True)][:2 * quota]
-    sl, cut = step0_slices(periphery, best, av_m, n=n, quota=quota)
+    sl, cut = step0_slices(periphery, best, av.float() if core_all else av_m, n=n, quota=quota)
     # real(s) reads slices[(s - 1) % n]: step s (first..n_steps-1) must read sl[s - first]
     slices = [None] * n
     for s in range(first, n_steps):

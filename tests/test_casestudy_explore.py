@@ -96,3 +96,20 @@ def test_step0_slices_overflow_and_spread():
     with pytest.raises(ValueError):
         parse_config({"method": "prune", "score_layer": 18, "prune": {"keep_ratio": 0.2, "fovea": "interlace_w", "step0": "b",
                                                                       "step0_rows": "f1s39"}})  # grid drafts need the probe grid
+
+
+def test_late_config_and_core_all():
+    base = {"method": "prune", "score_layer": 18, "prune": {"keep_ratio": 0.2, "fovea": "interlace_w", "step0": "b"}}
+    cfg = parse_config({**base, "prune": {**base["prune"], "late": "f1s84", "step0_draft": "near", "step0_gain": 1.05}})
+    assert cfg.prune.late == "f1s84"
+    for bad in ({"late": "f1s84"}, {"late": "f1s84", "step0_draft": "near", "c2f": 3}, {"late": "f1s84", "step0_draft": "near", "step0_rows": "f1s39"}):
+        with pytest.raises(ValueError):
+            parse_config({**base, "prune": {**base["prune"], **bad}})
+    av = torch.rand(196, generator=torch.Generator().manual_seed(5))
+    df = torch.rand(196, generator=torch.Generator().manual_seed(6))
+    measured = torch.arange(0, 84)
+    sinks = torch.tensor([182, 3, 40])
+    p = fv.c2f_plan(measured, av, df, sinks, GRID, 39, core_all=True)
+    assert torch.equal(p.core, fv.select_core(av, df, sinks, 20))  # the core may hold unmeasured (far-frame) tokens
+    assert torch.equal(torch.sort(torch.cat(p.slices + [p.truncated])).values, p.periphery)
+    assert set(p.slices[(9 - 1) % 8].tolist()) <= set(measured.tolist())

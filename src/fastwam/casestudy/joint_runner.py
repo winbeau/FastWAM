@@ -974,7 +974,9 @@ class JointCaseStudyRunner:
         if s0_mode is not None:
             s0_probes = all_future if prune.step0_all else (fv.probe_index(grid) if prune.step0_rows is None else
                                                              self._explore_rows(prune.step0_rows, grid, None)).to(model.device)
-            if not (prune.step0_all or prune.step0_nobias):
+            if prune.late is not None:  # step0-explore late anchor: step 0 computes no future token
+                s0_probes = all_future[:0]
+            if not (prune.step0_all or prune.step0_nobias or prune.late is not None):
                 s0_bias = math.log(num_future / int(s0_probes.numel()))
         s0_zf: Optional[torch.Tensor] = None
         s0_pilot: Optional[torch.Tensor] = None
@@ -986,6 +988,12 @@ class JointCaseStudyRunner:
         dmod = prune.draft_mod if prune is not None else None
         # step0-explore C2F: the raw step-0 x^0 of the probes, their A->V / Diff, then step 1's measurements (the plan of steps 2-9).
         c2f: Optional[dict] = {} if prune is not None and prune.c2f is not None else None
+        # step0-explore late anchor: step 0 computes no future token, step 1 computes the set ``prune.late`` and forms the
+        # imagination (drafts spread from it), the plan of steps 2-9 comes from step 1.
+        late = prune.late if prune is not None else None
+        late_st: dict = {"recv": torch.zeros(num_future, device=model.device)} if late is not None else {}
+        z_late = rearrange(latents_video[0, :, 0:int(patch[0])].float(), "c (f a) (h b) (w e) -> f (h w) (c a b e)", a=int(patch[0]),
+                           b=int(patch[1]), e=int(patch[2]))[0] if late is not None else None
         z_c2f = rearrange(latents_video[0, :, 0:int(patch[0])].float(), "c (f a) (h b) (w e) -> f (h w) (c a b e)", a=int(patch[0]),
                           b=int(patch[1]), e=int(patch[2]))[0] if c2f is not None else None
         # step0-sparse-r2: R1 / R3b side forward on step 0 (its plan inputs / outputs), R5 / R7 step-by-step drafts, the call's
@@ -1412,13 +1420,22 @@ class JointCaseStudyRunner:
                         d_cur[s, layer] = pa[:, :f0].half().cpu()  # per frame-0 key
                     if recv_acc is not None and s == 0 and idx_rel.numel() != num_future:
                         # step0-sparse: the probes' received attention, softmax with step 0's key bias.
-                        recv_acc[idx_rel] += self._masked_probs(io_v[0], k_vid, fv_mask_v)[:, f0:].sum(dim=0)
+                        if io_v is not None:  # step0-explore late: step 0 may compute no future token
+                            recv_acc[idx_rel] += self._masked_probs(io_v[0], k_vid, fv_mask_v)[:, f0:].sum(dim=0)
                         recv_acc[idx_rel] += self._masked_probs(io_a[0], k_all, fv_mask_a)[:, f0:f0 + n_q].sum(dim=0)
                     elif recv_acc is not None and s == 0:
                         # Sinks: the step-0 attention every future key receives from the video rows (all future
                         # tokens on this full step) and the action rows, head mean, summed over rows.
                         recv_acc += self._attention_probs(io_v[0], k_vid)[:, f0:].sum(dim=0)
                         recv_acc += self._attention_probs(io_a[0], k_all)[:, f0:f0 + num_future].sum(dim=0)
+                    if late is not None and s == 1:
+                        # late anchor: step 1's A->V (score layer, normalized) and the attention its future tokens receive.
+                        if layer == self._layers["act"]:
+                            nf_ = int(k_all.shape[1]) - f0 - int(io_a[1].shape[1])
+                            av_s = self._masked_probs(io_a[0], k_all, amask)[:, f0:f0 + nf_].sum(dim=0)
+                            late_st["av"] = av_s / av_s.sum()
+                        late_st["recv"][idx_rel] += self._masked_probs(io_v[0], k_vid, fv_mask_v)[:, f0:].sum(dim=0)
+                        late_st["recv"][idx_rel] += self._masked_probs(io_a[0], k_all, amask)[:, f0:f0 + n_q].sum(dim=0)
                     if c2f is not None and s == 1 and layer == self._layers["act"]:
                         # C2F: step 1's A->V on its computed future keys (softmax with the step's key bias), normalized.
                         nf_ = int(k_all.shape[1]) - f0 - int(io_a[1].shape[1])
@@ -1524,6 +1541,9 @@ class JointCaseStudyRunner:
                 fattn_rows.append(row)
 
             # ---- heads and scheduler step
+            if vel_tokens is None and not idx_abs.numel():  # step0-explore late: a step 0 without future rows
+                vel_tokens = torch.zeros((1, f0 + num_future, pt * ph * pw * int(latents_video.shape[1])), device=latents_video.device,
+                                         dtype=latents_video.dtype)
             if idx_abs.numel() or merge_step:  # keep 0: no future token is recomputed after warm-up
                 n_real = int(idx_abs.numel())
                 if merge_step:
@@ -1568,6 +1588,19 @@ class JointCaseStudyRunner:
             sig_s = t_video[s].float() / float(model.infer_video_scheduler.num_train_timesteps)
             gsz = pre_v["meta"]["grid_size"]
             side_pred = None
+            if late is not None and s == 0:
+                # step0-explore late anchor: step 0 computes no future token; every future token stays on pure noise (x^0 = 0).
+                x_tok0 = rearrange(latents_video, "b c (f x) (h y) (w z) -> b (f h w) (x y z c)", x=pt, y=ph, z=pw)
+                vel_tokens[:, f0:] = (x_tok0[:, f0:].float() / sig_s).to(vel_tokens.dtype)
+            if late is not None and s == 1:
+                # late anchor: step 1 forms the imagination; every other future token is drafted from it (spread, gain), and
+                # the computed ones move along their corrected change.
+                v_draft, late_st["zf"] = self._set_draft(latents_video, vel_tokens, gsz, grid, idx_rel, sig_s, (pt, ph, pw),
+                                                         float(prune.step0_gain), prune.step0_draft, float(prune.step0_far_lambda))
+                rest = torch.ones(num_future, dtype=torch.bool, device=idx_rel.device)
+                rest[idx_rel] = False
+                upd_abs = torch.nonzero(rest).flatten() + f0 if float(prune.step0_gain) == 1.0 else torch.arange(num_future, device=idx_rel.device) + f0
+                vel_tokens[:, upd_abs] = v_draft[:, upd_abs].to(vel_tokens.dtype)
             if side0 is not None and s == 0:
                 # step0-sparse-r2 R1 / R3b: B's step 0 (the probes; every token on the first side0_m blocks) beside the dense
                 # main pass; it gives B's plan inputs (plan / both) and / or step 0's outputs (draft / both).
@@ -1787,6 +1820,25 @@ class JointCaseStudyRunner:
                     }
                 else:
                     self._layers = {"act": -1, "inst": -1}
+            if late is not None and s == 1:
+                # late anchor: the plan of steps 2-9 from step 1 (sinks 182 + the 2 computed tokens receiving the most; core
+                # from the spread A->V and the Diff of the spread drafts; computed tokens in the last slices).
+                rows1 = idx_rel
+                av_full = self._spread(torch.zeros(num_future, 1, device=rows1.device).index_copy(0, rows1, late_st["av"][:, None].float()),
+                                       rows1, grid, prune.step0_draft, torch.zeros(num_future, 1, device=rows1.device), 0.0)[:, 0]
+                zo = z_late[grid.future_obs_index(z_late.device)]
+                df_full = (late_st["zf"] - zo).norm(dim=-1)
+                r_ = (late_st["recv"] / self.num_layers).float().clone()
+                out_ = torch.ones(num_future, dtype=torch.bool, device=r_.device)
+                out_[rows1] = False
+                out_[fv.PROBE_SINK] = True
+                r_[out_] = float("-inf")
+                sinks_l = torch.cat([torch.tensor([fv.PROBE_SINK], device=r_.device), torch.topk(r_, fv.N_SINKS - 1).indices])
+                fplan = fv.c2f_plan(rows1.cpu(), av_full.cpu(), df_full.cpu(), sinks_l.cpu(), grid,
+                                    max(1, int(round(prune.keep_ratio * num_future))), core_all=True).to(kept.device)
+                kept = fplan.fixed
+                diag["late"].update(core=fplan.core.tolist(), sinks=fplan.sinks.tolist(), slices=[int(x.numel()) for x in fplan.slices],
+                                    truncated=int(fplan.truncated.numel()))
             if c2f is not None and s == 1 and "df1" in c2f:
                 # C2F: the plan of steps 2-9 from the scores measured at steps 0 and 1 (the latest for every token).
                 av_m, df_m = c2f["av"].clone(), c2f["diff"].clone()
@@ -1881,7 +1933,13 @@ class JointCaseStudyRunner:
                     if side0_inputs is not None:  # step0-sparse-r2 R1-plan / R3b: B's plan from the side forward
                         av_plan, diff_plan, recv = side0_inputs["av"], side0_inputs["diff"], side0_inputs["recv"]
                         s0_sinks, plan_probes = side0_inputs["sinks"], side0_inputs["probes"].cpu()
-                    if c2f is not None:
+                    if late is not None:
+                        survey = self._explore_rows(late, grid, None)
+                        lg = math.log(num_future / int(survey.numel()))
+                        empty_ = survey[:0]
+                        fplan = fv.Plan(fovea_m, empty_, empty_, empty_, survey, bias_real={int(j): lg for j in survey.tolist()}).to(kept.device)
+                        diag["late"] = {"set": late, "n": int(survey.numel())}
+                    elif c2f is not None:
                         # step0-explore C2F: step 1 computes the sinks + the neighbourhoods of the hottest probes (A->V, Diff
                         # measured at the probes themselves), every key + log(Kf / n); the plan of steps 2-9 comes after it.
                         zfo = z_c2f[grid.future_obs_index(z_c2f.device)]
@@ -2142,7 +2200,7 @@ class JointCaseStudyRunner:
                 diag["fovea"]["ht_counts_ok"] = ok
                 if not ok and len(fv_rows) == len(fplan.slices):
                     raise RuntimeError("fovea interlace_ht: a token was not computed f_j times, or the rows differ by step")
-            elif fplan.slices and not reselected and c2f is None:
+            elif fplan.slices and not reselected and c2f is None and late is None:
                 # Interlace: every periphery token not cut by the quota computed exactly once on the pruned steps.
                 cut = set(fplan.truncated.tolist())
                 cnt = fv_count[fplan.periphery].tolist()
