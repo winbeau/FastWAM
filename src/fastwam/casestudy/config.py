@@ -258,6 +258,13 @@ class PruneConfig:
     late_plan_far_av: Optional[float] = None
     late_plan_far_diff: Optional[float] = None
     late_plan_core: Optional[str] = None
+    #: step-marginal: per-step changes of the late anchor's computed set, ((step, n), ...) with step 1-9: n > 0 computes n more
+    #: tokens on that step, drawn from the tokens the step does not compute, stratified by (frame, camera) in proportion to the
+    #: pool (generator seed ``step_delta_seed``); n < 0 drops |n| of the step's computed tokens, the sinks excepted, lowest plan
+    #: A->V first (step 1, no A->V yet: stratified random). Step 1 changes the late set (key bias log(Kf / n) of its new size),
+    #: steps 2-9 the step's slice (slice bias log(N / n_s) of its new size; dropped core tokens leave that step only). n = 0: no-op.
+    step_delta: tuple = ()
+    step_delta_seed: int = 0
 
 
 @dataclass(frozen=True)
@@ -486,6 +493,8 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             late_plan_far_av=None if block.get("late_plan_far_av") is None else float(block["late_plan_far_av"]),
             late_plan_far_diff=None if block.get("late_plan_far_diff") is None else float(block["late_plan_far_diff"]),
             late_plan_core=None if block.get("late_plan_core") is None else str(block["late_plan_core"]),
+            step_delta=tuple(sorted((int(s_), int(n_)) for s_, n_ in (block.get("step_delta") or {}).items())),
+            step_delta_seed=int(block.get("step_delta_seed", 0)),
         )
         if prune.fovea is not None or prune.fovea_off:
             _require(prune.fovea in FOVEA_METHODS, f"prune.fovea must be one of {FOVEA_METHODS} (fovea_off needs a method)")
@@ -537,6 +546,10 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             prune.late is not None and prune.late_step == 1 and prune.late_oracle != "plan" and (prune.late_plan_core in (None, "measured"))
             and all(x is None or x >= 0 for x in (prune.late_plan_far_av, prune.late_plan_far_diff))),
                  "prune.late_plan_far_av / far_diff (>= 0) / late_plan_core (measured) are options of the late anchor's plan")
+        _require(not prune.step_delta or (prune.late is not None and prune.late_step == 1 and prune.late_oracle is None
+                                          and all(1 <= s_ <= 9 for s_, _ in prune.step_delta)
+                                          and len({s_ for s_, _ in prune.step_delta}) == len(prune.step_delta)),
+                 "prune.step_delta ({step 1-9: n}) is an option of the late anchor (late_step 1)")
         _require(prune.late_oracle is None or (prune.late_oracle in LATE_ORACLES and prune.late is not None and prune.late_step == 1),
                  f"prune.late_oracle must be one of {LATE_ORACLES} on the late anchor (late_step 1)")
         _require(prune.late is None or (prune.step0 == "b" and prune.step0_draft in ("idw", "near", "nearres") and prune.c2f is None

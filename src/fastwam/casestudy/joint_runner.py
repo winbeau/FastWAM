@@ -2179,10 +2179,16 @@ class JointCaseStudyRunner:
                     av_full = torch.where(far_unm, av_full * float(prune.late_plan_far_av), av_full)
                 fplan = fv.c2f_plan(rows1.cpu(), av_full.cpu(), df_full.cpu(), sinks_l.cpu(), grid,
                                     max(1, int(round(prune.keep_ratio * num_future))), core_all=prune.late_plan_core != "measured",
-                                    last_extra=int(prune.late_extra)).to(kept.device)
+                                    last_extra=int(prune.late_extra))
+                if any(s_ >= 2 and n_ for s_, n_ in prune.step_delta):
+                    # step-marginal: steps 2-9 compute more (stratified random) or fewer (lowest plan A->V) tokens per step_delta.
+                    fplan = fv.apply_step_delta(fplan, prune.step_delta, av_full.cpu(), grid, prune.step_delta_seed)
+                    diag["late"]["step_rows"] = [int(fplan.real(s_).numel()) for s_ in range(2, steps)]
+                    diag["late"]["dropped"] = {int(s_): t.tolist() for s_, t in fplan.drop.items()}
+                fplan = fplan.to(kept.device)
                 kept = fplan.fixed
                 diag["late"].update(core=fplan.core.tolist(), sinks=fplan.sinks.tolist(), slices=[int(x.numel()) for x in fplan.slices],
-                                    truncated=int(fplan.truncated.numel()))
+                                    truncated=int(fplan.truncated.numel()), step1_rows=int(rows1.numel()))
             if c2f is not None and s == 1 and "df1" in c2f:
                 # C2F: the plan of steps 2-9 from the scores measured at steps 0 and 1 (the latest for every token).
                 av_m, df_m = c2f["av"].clone(), c2f["diff"].clone()
@@ -2279,6 +2285,17 @@ class JointCaseStudyRunner:
                         s0_sinks, plan_probes = side0_inputs["sinks"], side0_inputs["probes"].cpu()
                     if late is not None:
                         survey = self._explore_rows(late, grid, None)
+                        d1 = dict(prune.step_delta).get(1, 0)
+                        if d1:
+                            # step-marginal: step 1 computes d1 more tokens (stratified random from the rest) or d1 fewer (stratified
+                            # random from the set: no A->V before step 1); the key bias follows the set's new size.
+                            survey = survey.cpu()
+                            if d1 > 0:
+                                rest = torch.arange(num_future)
+                                rest = rest[~torch.isin(rest, survey)]
+                                survey = torch.sort(torch.cat([survey, fv.stratified_pick(rest, d1, grid, prune.step_delta_seed)])).values
+                            else:
+                                survey = survey[~torch.isin(survey, fv.stratified_pick(survey, -d1, grid, prune.step_delta_seed))]
                         lg = math.log(num_future / int(survey.numel()))
                         empty_ = survey[:0]
                         fplan = fv.Plan(fovea_m, empty_, empty_, empty_, survey, bias_real={int(j): lg for j in survey.tolist()}).to(kept.device)

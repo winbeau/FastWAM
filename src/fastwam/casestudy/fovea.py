@@ -344,6 +344,64 @@ def add_last_extra(plan: "Plan", av: torch.Tensor, n: int, n_steps: int = 10) ->
                 bias_real=dict(plan.bias_real), regions=list(plan.regions), region_pos=plan.region_pos, slice_bias=bias, freq=plan.freq)
 
 
+def stratified_pick(pool: torch.Tensor, n: int, grid: sel.Grid, seed: int) -> torch.Tensor:
+    """step-marginal: ``n`` tokens of ``pool`` (future indices), stratified by (future frame, camera) in proportion to the pool's
+    strata (largest remainder, ties to the earlier stratum), uniform within a stratum (torch generator ``seed``); sorted."""
+    pool = pool.cpu()
+    n = min(int(n), int(pool.numel()))
+    if n <= 0:
+        return pool[:0]
+    half = grid.width // 2
+    key = (pool // grid.per_frame) * 2 + ((pool % grid.per_frame) % grid.width) // half
+    strata = [pool[key == k] for k in range(2 * (grid.frames - 1))]
+    quota = torch.tensor([float(x.numel()) for x in strata]) * n / float(pool.numel())
+    take = torch.floor(quota).long()
+    rest = n - int(take.sum())
+    for k in sorted(range(len(strata)), key=lambda k: (-float(quota[k] - take[k]), k))[:rest]:
+        take[k] += 1
+    g = torch.Generator().manual_seed(int(seed))
+    picks = [x[torch.randperm(int(x.numel()), generator=g)[:int(t)]] for x, t in zip(strata, take)]
+    return torch.sort(torch.cat(picks)).values
+
+
+def lowest_av(computed: torch.Tensor, av: torch.Tensor, sinks: torch.Tensor, n: int) -> torch.Tensor:
+    """step-marginal: the ``n`` tokens of ``computed`` with the lowest ``av`` (ties to the smaller index), the sinks excepted;
+    sorted."""
+    computed = computed.cpu()
+    cand = computed[~torch.isin(computed, sinks.cpu())]
+    order = torch.argsort(av.float().cpu()[cand], stable=True)
+    return torch.sort(cand[order[:int(n)]]).values
+
+
+def apply_step_delta(plan: "Plan", deltas, av: torch.Tensor, grid: sel.Grid, seed: int) -> "Plan":
+    """step-marginal: steps 2-9 of the late anchor's plan (``c2f_plan``, slices of steps first..9) changed per ``deltas``
+    ((step, n), ...; step 1 is the late set's business, n = 0 does nothing). n > 0: step s's slice also computes n tokens the
+    step does not compute (``stratified_pick`` over every future token outside real(s)); n < 0: the |n| tokens of real(s) with
+    the lowest ``av`` leave it (the sinks stay; slice tokens leave the slice, core tokens are dropped for that step only). The
+    slice's key bias becomes log(N / n_s) of its new size (N = the periphery); every other step is unchanged."""
+    slices, bias, drop = list(plan.slices), list(plan.slice_bias), dict(plan.drop)
+    n_per = int(plan.periphery.numel())
+    for s, n in deltas:
+        if s < 2 or n == 0:
+            continue
+        i = (s - 1) % len(slices)
+        computed = plan.real(s).cpu()
+        if n > 0:
+            pool = torch.arange(grid.num_future)
+            pool = pool[~torch.isin(pool, computed)]
+            slices[i] = torch.sort(torch.cat([slices[i].cpu(), stratified_pick(pool, n, grid, seed)])).values
+        else:
+            gone = lowest_av(computed, av, plan.sinks, -n)
+            slices[i] = slices[i].cpu()[~torch.isin(slices[i].cpu(), gone)]
+            core_gone = gone[torch.isin(gone, plan.fixed.cpu())]
+            if core_gone.numel():
+                drop[s] = core_gone
+        bias[i] = math.log(n_per / int(slices[i].numel())) if slices[i].numel() else 0.0
+    return Plan(plan.method, plan.sinks, plan.core, plan.periphery, plan.fixed, slices=slices, truncated=plan.truncated,
+                bias_real=dict(plan.bias_real), regions=list(plan.regions), region_pos=plan.region_pos, slice_bias=bias,
+                freq=plan.freq, drop=drop)
+
+
 def tube_mask(cells: dict, grid: sel.Grid, wrist_rows: bool = False, dilate: int = 1) -> torch.Tensor:
     """Plan D: [Kf] bool, the agentview cells (row, column) of every future frame (``cells[f]``, f = 1..F-1) dilated by
     ``dilate`` within the block; ``wrist_rows`` adds the two bottom rows of every wrist block."""
@@ -504,17 +562,22 @@ class Plan:
     region_pos: torch.Tensor | None = None  # fov: [G, 3] (frame, mean h, mean w)
     slice_bias: list = field(default_factory=list)  # interlace_w: log(N / n_k) per slice
     freq: torch.Tensor | None = None  # interlace_ht: computations f_j of every future token over the pruned steps
+    drop: dict = field(default_factory=dict)  # step-marginal: step -> fixed tokens that step does not compute
 
     def to(self, dev) -> "Plan":
         mv = lambda t: None if t is None else t.to(dev)  # noqa: E731
         return Plan(self.method, mv(self.sinks), mv(self.core), mv(self.periphery), mv(self.fixed),
                     [x.to(dev) for x in self.slices], mv(self.truncated), dict(self.bias_real),
-                    [(g.to(dev), lg) for g, lg in self.regions], self.region_pos, list(self.slice_bias), mv(self.freq))
+                    [(g.to(dev), lg) for g, lg in self.regions], self.region_pos, list(self.slice_bias), mv(self.freq),
+                    {s: t.to(dev) for s, t in self.drop.items()})
 
     def real(self, s: int) -> torch.Tensor:
+        out = self.fixed
         if self.slices:
-            return torch.sort(torch.cat([self.fixed, self.slices[(s - 1) % len(self.slices)].to(self.fixed.device)])).values
-        return self.fixed
+            out = torch.sort(torch.cat([self.fixed, self.slices[(s - 1) % len(self.slices)].to(self.fixed.device)])).values
+        if s in self.drop:
+            out = out[~torch.isin(out, self.drop[s].to(out.device))]
+        return out
 
     def bias_at(self, s: int) -> dict:
         """Future index -> key logit bias on pruned step s: the representatives' log n (rep), this step's slice
@@ -629,5 +692,6 @@ def make_plan(method: str, k: int, grid: sel.Grid, av: torch.Tensor, diff: torch
 
 __all__ = ["INTERLACE", "METHODS", "PROBE_CORNERS", "PROBE_SINK", "Plan", "STEP0", "add_last_extra", "fill_map", "grid_regions",
            "ht_frequencies", "ht_schedule", "interlace_slices", "interp_tokens", "kmeans", "make_plan", "probe_index",
-           "roll_blocks", "rope_freqs_at", "step0_slices", "token_latent_mask", "token_norms", "tube_mask", "nearest_sources", "idw_fill", "align_frames", "memory_map",
+           "roll_blocks", "rope_freqs_at", "step0_slices", "token_latent_mask", "token_norms", "tube_mask", "stratified_pick",
+           "lowest_av", "apply_step_delta", "nearest_sources", "idw_fill", "align_frames", "memory_map",
            "select_core", "reselect"]
