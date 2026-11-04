@@ -75,6 +75,11 @@ Options (``policy.options``):
                          t + round(4 i delta), i = 1..8, through the VAE, injected). ``decode_dir`` saves dense's decoded
                          future at seed offset 0. Logged in ``diagnostics.inject``.
 
+``step0_tube``           optional {file, suite} for arms with ``prune.step0: d`` (step0-sparse plan D): a JSON with ``M``
+                         (3 x 3, summed simulator action xyz -> end-effector displacement in m) and ``cameras``
+                         ({"<suite>/<task id>": the agentview world -> pixel matrix, 256 x 256}). The runner gets the
+                         pilot's end-effector cells per future latent frame from this observation's ``state[0:3]``.
+
 An arm with ``casestudy.agc`` (pilot + automatic gain, ``fastwam/casestudy/agc.py``) has its de-normalized
 chunk rescaled here, for the executed arm, the shadow and the probes alike: ``cont_actions_f32`` and the
 executed actions are the rescaled chunk, ``raw_actions_f32`` stays the model's normalized output, and
@@ -335,6 +340,21 @@ class FastWAMJointPolicy:
             self.episode_plans_sha256 = _sha256(plans_path)
         self._override_runners: dict[str, object] = {}
         self._plan: dict = {}
+        self.step0_tube = None
+        self._tube_camera = None
+        self._state = None
+        if options.get("step0_tube") is not None:
+            import json as _json
+
+            t = dict(options["step0_tube"])
+            unknown = sorted(set(t) - {"file", "suite"})
+            if unknown or not t.get("file") or not t.get("suite"):
+                raise ValueError(f"step0_tube needs file and suite (unknown keys: {unknown})")
+            tube_path = _require_file(t["file"], "step0_tube.file")
+            spec = _json.loads(tube_path.read_text())
+            self.step0_tube = {"suite": str(t["suite"]), "M": np.asarray(spec["M"], dtype=np.float64),
+                               "cameras": {k: np.asarray(v, dtype=np.float64) for k, v in spec["cameras"].items()},
+                               "sha256": _sha256(tube_path)}
 
         self.rng_mode = (
             RNG_MODE_EPISODE_CALL_HASH if self.casestudy.seed_mode == "episode_call_hash" else RNG_MODE_FIXED_PER_PREDICT
@@ -414,6 +434,11 @@ class FastWAMJointPolicy:
         self._episode_id = episode_id
         self._episode_key = f"{episode.get('instruction', '')}|{_re.sub(r'-r[0-9]+', '', episode_id)}"
         self._plan = self.episode_plans.get(episode_id, {})
+        if self.step0_tube is not None:
+            key = f"{self.step0_tube['suite']}/{int(_re.match(r't(\d+)', episode_id).group(1))}"
+            if key not in self.step0_tube["cameras"]:
+                raise ValueError(f"step0_tube: no agentview camera for {key}")
+            self._tube_camera = self.step0_tube["cameras"][key]
         if self.hybrid is not None and self.hybrid["calls"] == "plan" and "hybrid_calls" not in self._plan:
             raise ValueError(f"hybrid calls: plan, but the episode plan of {episode_id} has no hybrid_calls")
         if self.inject is not None:
@@ -458,11 +483,12 @@ class FastWAMJointPolicy:
             torch.cuda.synchronize()
         model_started = time.perf_counter()
         video_cap = {} if self.inject is not None else None
+        self._state = state
         action, diag = runner.infer_action(
             prompt=prompt, input_image=image, proprio=proprio,
             action_horizon=self.action_horizon, num_video_frames=self.num_video_frames,
             seed=seed, sigma_shift=self.sigma_shift, rand_device=self.rand_device,
-            **({"_capture_video": video_cap} if video_cap is not None else {}),
+            **({"_capture_video": video_cap} if video_cap is not None else {}), **self._tube_kwargs(runner),
         )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -662,7 +688,7 @@ class FastWAMJointPolicy:
                 action, d = runner.infer_action(
                     prompt=prompt, input_image=image, proprio=proprio,
                     action_horizon=self.action_horizon, num_video_frames=self.num_video_frames,
-                    seed=seed, sigma_shift=self.sigma_shift, rand_device=self.rand_device,
+                    seed=seed, sigma_shift=self.sigma_shift, rand_device=self.rand_device, **self._tube_kwargs(runner),
                 )
                 cont, _, agc_log = self._agc(runner.cfg, d, self._continuous(action))
                 entry = {"seed": int(seed), **self._chunk_logs(action, cont), **agc_log}
@@ -671,11 +697,51 @@ class FastWAMJointPolicy:
                             "summary", "cache_kv_bytes", "recon", "recon_quality_f32", "recon_quality_shape",
                             "recon_checks", "av_scores_f16", "diff_scores_f16", "diff_sigma_v", "future_attn_f32",
                             "future_attn_shape", "dump_path", "gate_score", "fovea", "sink_index", "sink_share_step0",
-                            "sink_recv_f16"):
+                            "sink_recv_f16", "step0", "step0_x0_f32", "e9"):
                     if d.get(key) is not None:
                         entry[key] = d[key]
                 out[f"{name}@{offset}"] = entry
         return out
+
+    def _tube_kwargs(self, runner) -> dict:
+        """``_step0_tube`` for a runner with ``prune.step0: d`` (step0-sparse plan D), else nothing."""
+        prune = runner.cfg.prune
+        if prune is None or prune.step0 != "d":
+            return {}
+        if self._tube_camera is None:
+            raise ValueError("prune.step0 d needs policy.options.step0_tube")
+        return {"_step0_tube": self._tube(np.asarray(self._state, dtype=np.float64))}
+
+    def _tube(self, state: np.ndarray):
+        """step0-sparse plan D (DECISIONS B, D.2-D.4): pilot (normalized [T, 7]) -> (agentview cells per future latent frame,
+        gripper switch, info). p_t = p_0 + M sum_{i<t} a_i[0:3] in the world frame, projected by the episode's agentview
+        matrix (256 x 256, upright row / column, principal point at 128 so in pixel-edge units) onto the observation (the raw
+        render flipped up-down and left-right: x = 256 - column, y = row), cell = floor(pixel * 7 / 256); frame 1 from
+        t = 4..16, frame 2 from t = 20..32."""
+        cam, m_scale, p0, res, n = self._tube_camera, self.step0_tube["M"], state[0:3], 256, 7
+
+        def tube(pilot):
+            cont = self._continuous(pilot.clone()).astype(np.float64)
+            path = p0[None] + np.cumsum(cont[:, 0:3], axis=0) @ m_scale.T  # row t - 1 = p_t
+            cells, outside = {}, 0
+            for f, (a, b) in ((1, (4, 16)), (2, (20, 32))):
+                pts = set()
+                for t in range(a, b + 1):
+                    ph = cam @ np.append(path[t - 1], 1.0)
+                    row, col = ph[1] / ph[2], ph[0] / ph[2]
+                    x, y = res - col, row
+                    if 0 <= x < res and 0 <= y < res:
+                        pts.add((int(y * n // res), int(x * n // res)))
+                    else:
+                        outside += 1
+                cells[f] = sorted(pts)
+            g = np.sign(cont[:, 6])
+            switch = bool(np.any(g[1:] != g[:-1]))
+            info = {"cells": {str(f): [list(c) for c in v] for f, v in cells.items()}, "gripper_switch": switch,
+                    "outside": outside, "path_m": float(np.linalg.norm(path[-1] - p0))}
+            return cells, switch, info
+
+        return tube
 
     def _continuous(self, action) -> np.ndarray:
         """De-normalized chunk [T, 7] before gripper binarisation (float32)."""

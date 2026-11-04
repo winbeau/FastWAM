@@ -19,6 +19,10 @@ N1-N4 round: ``interlace_cal`` (M4's plan, the slice bias calibrated per layer /
 residual streams by the runner; ``singleton`` puts every future token in a group of its own) and ``interlace_ht`` (every
 token computed f_j >= 1 times over the 9 pruned steps, f proportional to A->V, key logit + log(9 / f_j): ``ht_frequencies``,
 ``ht_schedule``).
+step0-sparse round: step 0 sparse too (``prune.step0``). It computes only the 39 probes (``probe_index``: rows / columns
+{1, 3, 5} of every (future frame, camera) 7 x 7 block, the sink 182 and the corners 7 / 105), the rest drafted from the
+probes by in-block bilinear interpolation (``interp_tokens``); the plan's leftover probes go to the last slices
+(``step0_slices``); plan D marks the end-effector path on the agentview blocks (``tube_mask``).
 Pure functions; the runner applies the plan.
 """
 
@@ -35,6 +39,101 @@ N_SINKS, N_AV, N_DIFF, R_SLOTS, N_SLICES = 3, 10, 10, 16, 9
 METHODS = ("sink", "rep", "fov_grid", "fov_cluster", "interlace", "interlace_w", "interlace_wfar",
            "interlace_cal", "interlace_fill", "merge", "interlace_ht")
 INTERLACE = ("interlace", "interlace_w", "interlace_wfar", "interlace_cal", "interlace_fill")
+# step0-sparse (DECISIONS B.1): the probe rows / columns of a 7 x 7 block, the fixed sink, and the 2 block corners with the
+# highest mean step-0 received attention over the fovea-w M4w probes (both the wrist block's (0, 0)).
+PROBE_RC, PROBE_SINK, PROBE_CORNERS = (1, 3, 5), 182, (7, 105)
+STEP0 = ("b", "d")
+
+
+def probe_index(grid: sel.Grid) -> torch.Tensor:
+    """step0-sparse: the 39 probes (ascending future indices): rows and camera columns in ``PROBE_RC`` of every (future
+    frame, camera) block, the sink and the corners."""
+    half = grid.width // 2
+    idx = [f * grid.per_frame + r * grid.width + cam * half + c
+           for f in range(grid.frames - 1) for cam in (0, 1) for r in PROBE_RC for c in PROBE_RC]
+    idx += [PROBE_SINK, *PROBE_CORNERS]
+    if len(set(idx)) != len(idx) or max(idx) >= grid.num_future:
+        raise ValueError("step0: the probes are not distinct future tokens")
+    return torch.tensor(sorted(idx), dtype=torch.long)
+
+
+def _interp_weights(n: int = 7) -> torch.Tensor:
+    """[n, 3] weights of the block rows (or columns) on the probe rows {1, 3, 5}: nearest outside, linear between."""
+    w = torch.zeros(n, len(PROBE_RC), dtype=torch.float64)
+    for r in range(n):
+        if r <= PROBE_RC[0]:
+            w[r, 0] = 1.0
+        elif r >= PROBE_RC[-1]:
+            w[r, -1] = 1.0
+        else:
+            i = max(i for i, p in enumerate(PROBE_RC) if p <= r)
+            t = (r - PROBE_RC[i]) / (PROBE_RC[i + 1] - PROBE_RC[i])
+            w[r, i], w[r, i + 1] = 1.0 - t, t
+    return w
+
+
+def interp_tokens(values: torch.Tensor, grid: sel.Grid, computed: torch.Tensor) -> torch.Tensor:
+    """values [Kf, D] (float; only the rows of ``computed`` are read) -> [Kf, D] float32: every (future frame, camera) block
+    bilinearly interpolated from its 3 x 3 probe grid (separable, nearest at the edges), the ``computed`` rows their own
+    values. With every token computed this is the identity."""
+    half = grid.width // 2
+    out = torch.empty(values.shape, dtype=torch.float32, device=values.device)
+    w = _interp_weights(grid.height).float().to(values.device)
+    wc = _interp_weights(half).float().to(values.device)
+    pr = torch.tensor(PROBE_RC, device=values.device)
+    for f in range(grid.frames - 1):
+        for cam in (0, 1):
+            rows = torch.arange(grid.height, device=values.device)
+            cols = cam * half + torch.arange(half, device=values.device)
+            block = f * grid.per_frame + rows[:, None] * grid.width + cols[None, :]  # [7, 7]
+            g = values.float()[block[pr][:, pr]]  # [3, 3, D]
+            out[block] = torch.einsum("ri,ijd,cj->rcd", w, g, wc)
+    c = computed.to(values.device)
+    out[c] = values[c].float()
+    return out
+
+
+def step0_slices(periphery: torch.Tensor, probes: torch.Tensor, av: torch.Tensor, n: int = N_SLICES, quota: int = R_SLOTS):
+    """step0-sparse (DECISIONS B.5) -> (n slices, truncated): the periphery's probes by A->V (descending, ties to the smaller
+    index) fill slice n, then n - 1 (``quota`` each), the rest go to slice n - 2; the other periphery tokens (ascending) go
+    to slices 1..n - 2 by i mod (n - 2), each cut to its free slots by A->V."""
+    is_probe = torch.isin(periphery, probes.to(periphery.device))
+    pp, rest = periphery[is_probe], periphery[~is_probe]
+    pp = pp[torch.argsort(-av[pp].float(), stable=True)]
+    last, prev, third = pp[:quota], pp[quota:2 * quota], pp[2 * quota:]
+    if third.numel() > quota:
+        raise ValueError("step0: too many probes left for slice n - 2")
+    m = n - 2
+    slices, cut = [], []
+    for i in range(m):
+        part = rest[i::m]
+        room = quota - (third.numel() if i == m - 1 else 0)
+        if part.numel() > room:
+            order = torch.argsort(av[part].float(), descending=True, stable=True)
+            cut.append(part[order[room:]])
+            part = part[order[:room]]
+        if i == m - 1:
+            part = torch.cat([part, third])
+        slices.append(torch.sort(part).values)
+    slices += [torch.sort(prev).values, torch.sort(last).values]
+    return slices, (torch.cat(cut) if cut else periphery[:0])
+
+
+def tube_mask(cells: dict, grid: sel.Grid, wrist_rows: bool = False, dilate: int = 1) -> torch.Tensor:
+    """Plan D: [Kf] bool, the agentview cells (row, column) of every future frame (``cells[f]``, f = 1..F-1) dilated by
+    ``dilate`` within the block; ``wrist_rows`` adds the two bottom rows of every wrist block."""
+    half = grid.width // 2
+    m = torch.zeros(grid.num_future, dtype=torch.bool)
+    for f, pts in cells.items():
+        for r, c in pts:
+            for rr in range(max(0, r - dilate), min(grid.height, r + dilate + 1)):
+                for cc in range(max(0, c - dilate), min(half, c + dilate + 1)):
+                    m[(f - 1) * grid.per_frame + rr * grid.width + cc] = True
+    if wrist_rows:
+        for f in range(grid.frames - 1):
+            for rr in range(grid.height - 2, grid.height):
+                m[f * grid.per_frame + rr * grid.width + half:f * grid.per_frame + (rr + 1) * grid.width] = True
+    return m
 
 
 def grid_regions(grid: sel.Grid) -> torch.Tensor:
@@ -206,11 +305,13 @@ class Plan:
 
 def make_plan(method: str, k: int, grid: sel.Grid, av: torch.Tensor, diff: torch.Tensor, recv: torch.Tensor,
               x0_future: torch.Tensor | None = None, gen: torch.Generator | None = None, off: bool = False,
-              wzero: bool = False, nofar: bool = False, singleton: bool = False) -> Plan:
+              wzero: bool = False, nofar: bool = False, singleton: bool = False, sinks: torch.Tensor | None = None,
+              probes: torch.Tensor | None = None) -> Plan:
     """The plan of ``method`` for budget k from the step-0 scores (A->V, Diff, received attention) [Kf]; ``off`` gives S0
     (A->V top-k, nothing else). Self-checks: ``wzero`` drops interlace_w's slice bias (= interlace), ``nofar`` lifts
     interlace_wfar's far-frame core (= interlace_w), ``singleton`` gives merge one group per future token, nothing else
-    (= dense)."""
+    (= dense). step0-sparse: ``sinks`` given instead of the top 3 of ``recv``; ``probes`` slices the periphery by
+    ``step0_slices``."""
     dev = av.device
     kf = grid.num_future
     empty = torch.zeros(0, dtype=torch.long, device=dev)
@@ -222,7 +323,7 @@ def make_plan(method: str, k: int, grid: sel.Grid, av: torch.Tensor, diff: torch
         pos = torch.stack([(allf // grid.per_frame + 1).double(), ((allf % grid.per_frame) // grid.width).double(),
                            ((allf % grid.per_frame) % grid.width).double()], dim=1).cpu()
         return Plan(method, empty, empty, allf, empty, regions=[(allf[j:j + 1], 0.0) for j in range(kf)], region_pos=pos)
-    sinks = torch.sort(torch.topk(recv.float(), N_SINKS).indices).values
+    sinks = torch.sort(torch.topk(recv.float(), N_SINKS).indices if sinks is None else sinks.to(dev)).values
     if method == "interlace_ht":
         f = ht_frequencies(av, sinks, k).to(dev)
         if bool((f == N_SLICES).all()):
@@ -269,9 +370,10 @@ def make_plan(method: str, k: int, grid: sel.Grid, av: torch.Tensor, diff: torch
     if periphery.numel() <= R_SLOTS:  # the periphery fits its slots: computed token by token
         return Plan(method, sinks, core, periphery, torch.sort(torch.cat([fixed, periphery])).values)
     if method in INTERLACE:
-        slices, cut = interlace_slices(periphery, av)
+        slices, cut = interlace_slices(periphery, av) if probes is None else step0_slices(periphery, probes, av)
         weighted = method in ("interlace_w", "interlace_wfar") and not wzero  # interlace_cal's bias is the runner's
-        bias = [math.log(int(periphery.numel()) / int(x.numel())) for x in slices] if weighted else []
+        bias = ([math.log(int(periphery.numel()) / int(x.numel())) if x.numel() else 0.0 for x in slices]
+                if weighted else [])
         return Plan(method, sinks, core, periphery, fixed, slices=slices, truncated=cut, slice_bias=bias)
     if method in ("rep", "fov_grid", "merge"):
         rid = grid_regions(grid).to(dev)[periphery]
@@ -298,5 +400,6 @@ def make_plan(method: str, k: int, grid: sel.Grid, av: torch.Tensor, diff: torch
                 region_pos=pos)
 
 
-__all__ = ["INTERLACE", "METHODS", "Plan", "fill_map", "grid_regions", "ht_frequencies", "ht_schedule", "interlace_slices",
-           "kmeans", "make_plan", "rope_freqs_at"]
+__all__ = ["INTERLACE", "METHODS", "PROBE_CORNERS", "PROBE_SINK", "Plan", "STEP0", "fill_map", "grid_regions",
+           "ht_frequencies", "ht_schedule", "interlace_slices", "interp_tokens", "kmeans", "make_plan", "probe_index",
+           "rope_freqs_at", "step0_slices", "tube_mask"]

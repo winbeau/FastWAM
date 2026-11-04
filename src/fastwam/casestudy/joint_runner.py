@@ -36,6 +36,11 @@ N1-N4 (``prune.fovea``, ``fovea.py``): ``interlace_cal`` biases the slice keys p
 of periphery to slice mass (``_cal_bias``); ``interlace_fill`` gives every uncomputed position the K / V of the nearest token
 computed on the same step; ``merge`` keeps a residual stream per periphery member, merges the groups per layer and adds each
 group's increment back to its members; ``interlace_ht`` follows the plan's per-token frequencies.
+step0-sparse (``prune.step0``): step 0 computes the 39 probes only (every probe key + log(Kf / 39), video and action rows),
+the other future tokens move along the interpolated draft (``_probe_draft``) until computed; plan b scores with the
+interpolated A->V and Diff, plan d with the frame-0 attention and the pilot's end-effector tube (``_step0_tube`` from the
+adapter); the leftover probes go to the last slices. ``prune.e9`` (E9) redoes step 0's update of M4w with the interpolated
+draft on slices 1-6 or 8-9.
 ``frame0_cache=false`` (dense only) calls the model's native
 ``infer_action`` unchanged, as the reference for equivalence checks. ``cfg.dump`` writes
 one call's attention, action hidden states and decoded video to an ``.npz``.
@@ -48,7 +53,7 @@ import math
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 import torch
@@ -127,6 +132,26 @@ class JointCaseStudyRunner:
         kh = rearrange(k, "b s (n d) -> b n s d", n=self.num_heads)
         logits = (qh.float() @ kh.float().transpose(-1, -2)) * (qh.shape[-1] ** -0.5)
         return torch.softmax(logits, dim=-1).mean(dim=1)[0]
+
+    def _masked_probs(self, q: torch.Tensor, k: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+        """``_attention_probs`` with the additive key mask [1, 1, 1, Sk] of the forward pass in the logits (none: the same)."""
+        if mask is None:
+            return self._attention_probs(q, k)
+        return torch.softmax(self._head_logits(q, k) + mask[0].float(), dim=-1).mean(dim=0)
+
+    def _probe_draft(self, latents: torch.Tensor, vel_tokens: torch.Tensor, grid_size, grid: sel.Grid, probes: torch.Tensor,
+                     sigma: torch.Tensor, patch: tuple[int, int, int]) -> tuple[torch.Tensor, torch.Tensor]:
+        """step0-sparse: the clean estimate x - sigma v of the ``probes`` interpolated over every future block
+        (``fv.interp_tokens``) -> (draft velocity (x - x0) / sigma in the token layout of ``vel_tokens`` [1, f0 + Kf, D]
+        (fp32), interpolated clean estimate of the future tokens [Kf, D'] in the Diff layout (fp32))."""
+        pt, ph, pw = patch
+        x0 = latents.float() - sigma * self.video.unpatchify(vel_tokens, grid_size).float()
+        z = rearrange(x0[0], "c (f a) (h b) (w e) -> f (h w) (c a b e)", a=pt, b=ph, e=pw)
+        zf = fv.interp_tokens(z[1:].reshape(-1, z.shape[-1]), grid, probes)
+        z_int = torch.cat([z[:1], zf.reshape(z.shape[0] - 1, z.shape[1], -1)], dim=0)
+        x0_int = rearrange(z_int, "f (h w) (c a b e) -> c (f a) (h b) (w e)", h=grid.height, a=pt, b=ph, e=pw)[None]
+        v = (latents.float() - x0_int) / sigma
+        return rearrange(v, "b c (f x) (h y) (w z) -> b (f h w) (x y z c)", x=pt, y=ph, z=pw), zf
 
     def _head_logits(self, q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
         """Per-head q k^T / sqrt(d) for batch 1 -> [H, Sq, Sk] (fp32)."""
@@ -445,10 +470,16 @@ class JointCaseStudyRunner:
         rand_device: str = "cpu",
         _capture_kv: Optional[dict] = None,
         _capture_video: Optional[dict] = None,
+        _step0_tube: Optional[Callable] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         cfg = self.cfg
         model = self.model
         steps = int(cfg.num_inference_steps)
+        if cfg.prune is not None and cfg.prune.step0 is not None:
+            # step0-sparse: no dense step 0 to choose the layer on; A->V always on casestudy.score_layer.
+            self._layers = {"act": int(cfg.score_layer), "inst": -1}
+            if cfg.prune.step0 == "d" and _step0_tube is None:
+                raise ValueError("prune.step0 d needs the adapter's end-effector tube (_step0_tube)")
         # X2 (prune.oracle_kv): a dense pass of the same call and seed first, keeping every
         # step's future K/V per layer for the action rows of the pruned pass below.
         # record_recon_quality: the same dense pass, its K/V only compared with the reconstruction.
@@ -664,6 +695,20 @@ class JointCaseStudyRunner:
         fill_src: list[torch.Tensor] = []
         fill_checked = False
         mg: Optional[dict] = None
+        # step0-sparse: step 0's probes (every future token for step0_all) and their key bias; plan b's interpolated clean
+        # estimate (its Diff), plan d's pilot, the step-0 facts; E9's step-0 latents (to redo step 0's update).
+        s0_mode = prune.step0 if prune is not None else None
+        s0_probes: Optional[torch.Tensor] = None
+        s0_bias = 0.0
+        if s0_mode is not None:
+            s0_probes = all_future if prune.step0_all else fv.probe_index(grid).to(model.device)
+            if not (prune.step0_all or prune.step0_nobias):
+                s0_bias = math.log(num_future / int(s0_probes.numel()))
+        s0_zf: Optional[torch.Tensor] = None
+        s0_pilot: Optional[torch.Tensor] = None
+        s0_info: dict[str, Any] = {}
+        e9 = prune.e9 if prune is not None else None
+        e9_prev: Optional[torch.Tensor] = None
         no_future = prune is not None and prune.action_no_future
         ex_w = prune.extrapolate_w if prune is not None else None
         cost_extra: list[list[int]] = []
@@ -729,7 +774,8 @@ class JointCaseStudyRunner:
                 tea_prev = signal
 
             fv_step = fplan is not None and mode == "pruned"
-            idx_rel = (fplan.real(s) if fv_step else kept) if mode == "pruned" else all_future
+            p0_step = s0_probes is not None and s == 0
+            idx_rel = (fplan.real(s) if fv_step else kept) if mode == "pruned" else (s0_probes if p0_step else all_future)
             idx_abs = idx_rel + f0
             xv = pre_v["tokens"][:, idx_abs]
             n_syn = len(fv_members) if fv_step else 0
@@ -776,14 +822,17 @@ class JointCaseStudyRunner:
                 step_probs: dict[int, torch.Tensor] = {}
                 n_q = int(idx_rel.numel()) + n_syn  # 0 on the pruned steps of keep 0: no video rows at all
                 fv_mask_v = fv_mask_a = None
-                if fv_step:
+                if fv_step or p0_step:
                     # Key logit bias log(n_g) of representatives (rep) and region tokens (fov), for every row; no mask at
-                    # all without a bias, so that the kernel is S0's.
+                    # all without a bias, so that the kernel is S0's. step0-sparse: every probe key + log(Kf / 39) on step 0.
                     bias = torch.zeros(n_q, device=model.device)
-                    for j, lg in fplan.bias_at(s).items():  # rep: log n; interlace_w: this step's slice log(N / n_k)
-                        bias[torch.nonzero(idx_rel == j).flatten()] = lg
-                    for g, (_, lg) in enumerate(fplan.regions):
-                        bias[int(idx_rel.numel()) + g] = lg
+                    if p0_step:
+                        bias += s0_bias
+                    else:
+                        for j, lg in fplan.bias_at(s).items():  # rep: log n; interlace_w: this step's slice log(N / n_k)
+                            bias[torch.nonzero(idx_rel == j).flatten()] = lg
+                        for g, (_, lg) in enumerate(fplan.regions):
+                            bias[int(idx_rel.numel()) + g] = lg
                     if bool((bias != 0).any()):
                         n_act = int(pre_a["tokens"].shape[1])
                         fv_mask_v = torch.zeros((1, 1, 1, f0 + n_q), device=model.device)
@@ -791,7 +840,10 @@ class JointCaseStudyRunner:
                         fv_mask_a = torch.zeros((1, 1, 1, f0 + n_q + n_act), device=model.device)
                         fv_mask_a[..., f0:f0 + n_q] = bias
                         fv_mask_v, fv_mask_a = fv_mask_v.to(xv.dtype), fv_mask_a.to(xv.dtype)
-                    fv_rows.append(n_q)
+                    if fv_step:
+                        fv_rows.append(n_q)
+                    elif int(idx_rel.numel()) != int(s0_probes.numel()):
+                        raise RuntimeError("step0: step 0 does not compute exactly the probes")
                 rc_step = recon is not None and mode == "pruned" and rc is not None and rc["n"] > 0
                 if rc_step and recon == "r2":
                     tmod_src = pre_v["t_mod"][:, f0 + rc["src_u"]]  # this step's future-frame modulation
@@ -918,7 +970,7 @@ class JointCaseStudyRunner:
                             vmask = sum_mask_v[layer]
                         else:
                             kv_k, kv_v = k_vid, v_vid
-                            if fv_step:
+                            if fv_step or p0_step:
                                 vmask = cal_v if cal_v is not None else fv_mask_v
                         out_v = flash_attention(q=io_v[0], k=kv_k, v=kv_v, num_heads=self.num_heads, ctx_mask=vmask)
                         n_vk = int(kv_k.shape[1])
@@ -956,9 +1008,10 @@ class JointCaseStudyRunner:
                         k_all = torch.cat([kv0[layer]["k"], k_o[:, idx_rel], io_a[1]], dim=1)
                         v_all = torch.cat([kv0[layer]["v"], v_o[:, idx_rel], io_a[2]], dim=1)
                         kept_cols = slice(f0, f0 + n_q)
-                    elif fv_step:
+                    elif fv_step or p0_step:
                         # Fovea: the action rows see frame 0, this step's computed future rows (real and region
-                        # tokens, nothing older; N2: every position filled from them) and themselves.
+                        # tokens, nothing older; N2: every position filled from them) and themselves. step0-sparse:
+                        # step 0's probes with their bias.
                         k_all = torch.cat([k_vid, io_a[1]], dim=1)
                         v_all = torch.cat([v_vid, io_a[2]], dim=1)
                         n_fk = int(k_new.shape[1])
@@ -1019,7 +1072,11 @@ class JointCaseStudyRunner:
                         if d_cur is None:
                             d_cur = torch.zeros((steps, self.num_layers, pa.shape[0], f0), dtype=torch.float16)
                         d_cur[s, layer] = pa[:, :f0].half().cpu()  # per frame-0 key
-                    if recv_acc is not None and s == 0:
+                    if recv_acc is not None and s == 0 and idx_rel.numel() != num_future:
+                        # step0-sparse: the probes' received attention, softmax with step 0's key bias.
+                        recv_acc[idx_rel] += self._masked_probs(io_v[0], k_vid, fv_mask_v)[:, f0:].sum(dim=0)
+                        recv_acc[idx_rel] += self._masked_probs(io_a[0], k_all, fv_mask_a)[:, f0:f0 + n_q].sum(dim=0)
+                    elif recv_acc is not None and s == 0:
                         # Sinks: the step-0 attention every future key receives from the video rows (all future
                         # tokens on this full step) and the action rows, head mean, summed over rows.
                         recv_acc += self._attention_probs(io_v[0], k_vid)[:, f0:].sum(dim=0)
@@ -1033,7 +1090,16 @@ class JointCaseStudyRunner:
                         fattn_acc[:f0] += pa_m[:f0]
                         fattn_acc[f0 + idx_rel] += pa_m[f0:f0 + n_q]
                     if layer in capture_layers:
-                        if idx_rel.numel() != num_future:
+                        if p0_step and idx_rel.numel() != num_future:
+                            # step0-sparse: the probes' columns of the full layout [frame-0 | Kf | action] (softmax with
+                            # step 0's key bias), 0 on the uncomputed future tokens.
+                            pm = self._masked_probs(io_a[0], k_all, fv_mask_a)
+                            n_a = int(pm.shape[0])
+                            probs = torch.zeros((n_a, f0 + num_future + n_a), dtype=pm.dtype, device=pm.device)
+                            probs[:, :f0] = pm[:, :f0]
+                            probs[:, f0 + idx_rel] = pm[:, f0:f0 + n_q]
+                            probs[:, f0 + num_future:] = pm[:, f0 + n_q:]
+                        elif idx_rel.numel() != num_future:
                             # P2 reselection on a pruned step: score every future token, with
                             # fresh keys for kept tokens and warm-up keys for pruned ones.
                             k_future = k_future_store[layer]
@@ -1126,7 +1192,27 @@ class JointCaseStudyRunner:
                         vel_tokens[:, members] = vel_part[:, n_real + g:n_real + g + 1]  # a region token's velocity to every member
                 if fv_step:
                     fv_count[idx_rel] += 1
+                if p0_step and idx_rel.numel() != num_future:
+                    # step0-sparse draft (DECISIONS B.4): the probes' clean estimate interpolated over every block; the
+                    # uncomputed future tokens move along (x - x0) / sigma_0 until computed. Plan b's Diff reads it.
+                    sigma0_v = t_video[0].float() / float(model.infer_video_scheduler.num_train_timesteps)
+                    v_draft, s0_zf = self._probe_draft(latents_video, vel_tokens, pre_v["meta"]["grid_size"], grid,
+                                                       idx_rel, sigma0_v, (pt, ph, pw))
+                    rest = torch.ones(num_future, dtype=torch.bool, device=idx_rel.device)
+                    rest[idx_rel] = False
+                    rest_abs = torch.nonzero(rest).flatten() + f0
+                    vel_tokens[:, rest_abs] = v_draft[:, rest_abs].to(vel_tokens.dtype)
             pred_video = self.video.unpatchify(vel_tokens, pre_v["meta"]["grid_size"])
+            if s == 0 and (cfg.record_step0_x0 or e9 is not None):
+                # step0-sparse E8: the step-0 clean estimate at the 39 probes (exact there on every arm); E9: step 0's
+                # latents, to redo its update once the plan is known.
+                sigma0_v = t_video[0].float() / float(model.infer_video_scheduler.num_train_timesteps)
+                x0 = latents_video.float() - sigma0_v * pred_video.float()
+                z = rearrange(x0[0], "c (f a) (h b) (w e) -> f (h w) (c a b e)", a=pt, b=ph, e=pw)
+                if cfg.record_step0_x0:
+                    diag["step0_x0_f32"] = _f32_b64(z[1:].reshape(-1, z.shape[-1])[fv.probe_index(grid).to(z.device)])
+                if e9 is not None:
+                    e9_prev = latents_video.clone()
             if want_motion_steps:
                 # This step's clean estimate x - sigma * v (sigma_s = -sum of the remaining deltas; the
                 # schedule ends at 0, so at the last step it is the final latent), frame 1 vs frame 0.
@@ -1141,7 +1227,8 @@ class JointCaseStudyRunner:
                 x0 = latents_video.float() - sigma_v * pred_video.float()
                 z = rearrange(x0[0], "c (f a) (h b) (w e) -> f (h w) (c a b e)", a=pt, b=ph, e=pw)
                 z_cur = rearrange(latents_video[0, :, 0:pt].float(), "c (f a) (h b) (w e) -> f (h w) (c a b e)", a=pt, b=ph, e=pw)[0]
-                diff_score = sel.diff_scores(z[1:].reshape(-1, z.shape[-1]), z_cur, grid)
+                # step0-sparse plan b: the interpolated clean estimate itself (not through the draft's rounded velocity).
+                diff_score = sel.diff_scores(z[1:].reshape(-1, z.shape[-1]) if s0_zf is None else s0_zf, z_cur, grid)
                 diag["diff_scores_f16"] = _f16_b64(diff_score)
                 diag["diff_sigma_v"] = float(sigma_v)
                 if fovea_m == "fov_cluster":
@@ -1157,10 +1244,14 @@ class JointCaseStudyRunner:
                 sigma0 = t_action[0].float() / float(model.infer_action_scheduler.num_train_timesteps)
                 diag["pilot_f32"] = _f32_b64(latents_action[0].float() - sigma0 * pred_action[0].float())
                 diag["pilot_sigma0"] = float(sigma0)
+            if s0_mode == "d" and s == 0:
+                # step0-sparse plan d: the pilot of the probe step (normalized), for the adapter's end-effector tube.
+                sigma0_a = t_action[0].float() / float(model.infer_action_scheduler.num_train_timesteps)
+                s0_pilot = (latents_action[0].float() - sigma0_a * pred_action[0].float()).cpu()
             latents_video = model.infer_video_scheduler.step(pred_video, d_video[s], latents_video)
             latents_action = model.infer_action_scheduler.step(pred_action, d_action[s], latents_action)
             latents_video[:, :, 0:1] = first.clone()
-            modes.append(mode)
+            modes.append("probe" if p0_step and idx_rel.numel() != num_future else mode)
             if dump is not None:
                 d_latents.append(latents_action[0].float().cpu())
 
@@ -1251,10 +1342,57 @@ class JointCaseStudyRunner:
                     av_all = sel.av_scores(act_probs_sel[self._layers["act"]], grid)
                     recv = recv_acc / self.num_layers
                     gen = torch.Generator(device="cpu").manual_seed((int(seed) + 3) & 0x7FFFFFFF)
-                    fplan = fv.make_plan(fovea_m, k, grid, av_all.float().cpu(), diff_score.float().cpu(), recv.float().cpu(),
+                    av_plan, diff_plan, s0_sinks = av_all, diff_score, None
+                    if s0_mode is not None:
+                        # step0-sparse (DECISIONS B): sinks = 182 + the 2 probes receiving the most; plan b: A->V
+                        # interpolated from the probes (Diff already from the interpolated clean estimate); plan d: the
+                        # frame-0 attention at the same (h, w) and the end-effector tube x (1 + it).
+                        r = recv.float().clone()
+                        out = torch.ones(num_future, dtype=torch.bool, device=r.device)
+                        out[s0_probes] = False
+                        out[fv.PROBE_SINK] = True
+                        r[out] = float("-inf")
+                        s0_sinks = torch.cat([torch.tensor([fv.PROBE_SINK], device=r.device), torch.topk(r, fv.N_SINKS - 1).indices])
+                        s0_info.update(sinks_eq_top3=sorted(s0_sinks.tolist()) == sorted(torch.topk(recv.float(), fv.N_SINKS).indices.tolist()))
+                        if s0_mode == "b":
+                            av_plan = fv.interp_tokens(av_all.float()[:, None], grid, s0_probes)[:, 0]
+                        else:
+                            obs = act_probs_sel[self._layers["act"]][:, :f0].float().sum(dim=0)
+                            av_plan = obs[grid.future_obs_index(obs.device)]
+                            cells, switch, s0_info["tube"] = _step0_tube(s0_pilot)
+                            tube = fv.tube_mask(cells, grid, wrist_rows=switch)
+                            diff_plan = tube.to(av_plan.device).float() * (1.0 + av_plan)
+                            s0_info["tube_index"] = torch.nonzero(tube).flatten().tolist()
+                    fplan = fv.make_plan(fovea_m, k, grid, av_plan.float().cpu(), diff_plan.float().cpu(), recv.float().cpu(),
                                          None if x0_fut is None else x0_fut.cpu(), gen, off=prune.fovea_off,
                                          wzero=prune.fovea_wzero, nofar=prune.fovea_nofar,
-                                         singleton=prune.fovea_singleton).to(kept.device)
+                                         singleton=prune.fovea_singleton,
+                                         sinks=None if s0_sinks is None else s0_sinks.cpu(),
+                                         probes=None if s0_mode is None or prune.step0_all else s0_probes.cpu()).to(kept.device)
+                    if s0_mode is not None and fplan.slices:
+                        # Runner check (DECISIONS C.3): the slices and the truncated tokens partition the periphery.
+                        parts = torch.cat(fplan.slices + [fplan.truncated])
+                        if parts.numel() != fplan.periphery.numel() or not torch.equal(torch.sort(parts).values, fplan.periphery):
+                            raise RuntimeError("step0: the slices and the truncated tokens do not partition the periphery")
+                        pset = set(s0_probes.tolist())
+                        s0_info.update(probes=int(s0_probes.numel()), bias=round(s0_bias, 6),
+                                       slice_probes=[sum(int(j) in pset for j in x.tolist()) for x in fplan.slices],
+                                       core_probes=sum(int(j) in pset for j in fplan.core.tolist()))
+                        diag["step0"] = {"mode": s0_mode, "all": bool(prune.step0_all), "nobias": bool(prune.step0_nobias),
+                                         **s0_info}
+                    if e9 is not None and fplan.slices:
+                        # E9: the drafts of slices 1-6 (early) or 8-9 (late) from the probe interpolation of step 0's clean
+                        # estimate; step 0's update redone (bitwise the same for every other token).
+                        sl = fplan.slices[:6] if e9 == "early" else fplan.slices[7:]
+                        toks = torch.cat(sl).to(vel_tokens.device) + f0
+                        sigma0_v = t_video[0].float() / float(model.infer_video_scheduler.num_train_timesteps)
+                        v_draft, _ = self._probe_draft(e9_prev, vel_tokens, pre_v["meta"]["grid_size"], grid,
+                                                       fv.probe_index(grid).to(vel_tokens.device), sigma0_v, (pt, ph, pw))
+                        vel_tokens[:, toks] = v_draft[:, toks].to(vel_tokens.dtype)
+                        latents_video = model.infer_video_scheduler.step(
+                            self.video.unpatchify(vel_tokens, pre_v["meta"]["grid_size"]), d_video[0], e9_prev)
+                        latents_video[:, :, 0:1] = first.clone()
+                        diag["e9"] = {"mode": e9, "tokens": int(toks.numel())}
                     kept = fplan.fixed
                     fv_members = [g + f0 for g, _ in fplan.regions]
                     if fv_members:
@@ -1388,6 +1526,8 @@ class JointCaseStudyRunner:
             pruned_steps = sum(1 for m in modes if m == "pruned")
             n_kept = int(kept.numel())
             diag["future_token_steps"] = (steps - pruned_steps) * num_future + pruned_steps * n_kept
+            if s0_probes is not None:  # step0-sparse: step 0 computed the probes only
+                diag["future_token_steps"] -= num_future - int(s0_probes.numel())
             diag["future_token_steps_dense"] = steps * num_future
         if tea is not None:
             diag["teacache_rel_l1"] = [round(r, 6) for r in tea_rel]

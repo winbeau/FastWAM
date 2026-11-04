@@ -87,6 +87,7 @@ from typing import Any, Optional
 
 METHODS = ("dense", "prune", "teacache", "noise")
 SELECTIONS = ("av", "vv", "cf", "random", "diff", "diff_global")
+STEP0 = ("b", "d")
 FOVEA_METHODS = ("sink", "rep", "fov_grid", "fov_cluster", "interlace", "interlace_w", "interlace_wfar",
                  "interlace_cal", "interlace_fill", "merge", "interlace_ht")
 LAYER_RULES = ("min_entropy", "fixed")
@@ -189,6 +190,16 @@ class PruneConfig:
     fovea_nofar: bool = False
     #: N1-N4 self-check: merge with every future token in a group of its own and no sinks / core (must equal dense).
     fovea_singleton: bool = False
+    #: step0-sparse (``fovea.py``, interlace_w only): step 0 computes the 39 probes only, every probe key logit + log(Kf / 39),
+    #: the rest drafted by interpolation; plan ``b`` (interpolated A->V and Diff) or ``d`` (frame-0 attention and the
+    #: end-effector tube of the pilot). ``step0_nobias`` drops the step-0 bias (E8); ``step0_all`` probes every future
+    #: token without the bias and slices as M4w (self-check: = interlace_w).
+    step0: Optional[str] = None
+    step0_nobias: bool = False
+    step0_all: bool = False
+    #: step0-sparse E9 (interlace_w, dense step 0): the drafts of slices 1-6 (``early``) or 8-9 (``late``) replaced by the
+    #: probe interpolation of step 0's clean estimate, from step 0's update on.
+    e9: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -289,6 +300,8 @@ class CaseStudyConfig:
     record_sinks: bool = False
     #: fovea-w G4 (dense only): every denoising step recomputes the video stream from step 0's latents and sigma.
     video_freeze: bool = False
+    #: step0-sparse E8: log the step-0 clean estimate x - sigma_0 v at the 39 probes (``fovea.probe_index``).
+    record_step0_x0: bool = False
 
     def describe(self) -> dict[str, Any]:
         return asdict(self)
@@ -369,6 +382,10 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             fovea_wzero=bool(block.get("fovea_wzero", False)),
             fovea_nofar=bool(block.get("fovea_nofar", False)),
             fovea_singleton=bool(block.get("fovea_singleton", False)),
+            step0=None if block.get("step0") is None else str(block["step0"]),
+            step0_nobias=bool(block.get("step0_nobias", False)),
+            step0_all=bool(block.get("step0_all", False)),
+            e9=None if block.get("e9") is None else str(block["e9"]),
         )
         if prune.fovea is not None or prune.fovea_off:
             _require(prune.fovea in FOVEA_METHODS, f"prune.fovea must be one of {FOVEA_METHODS} (fovea_off needs a method)")
@@ -377,6 +394,15 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             _require(not prune.fovea_nofar or prune.fovea == "interlace_wfar", "prune.fovea_nofar is for interlace_wfar")
             _require(not prune.fovea_singleton or (prune.fovea == "merge" and not prune.fovea_off),
                      "prune.fovea_singleton is for merge (without fovea_off)")
+            _require(prune.step0 is None or (prune.step0 in STEP0 and prune.fovea == "interlace_w" and not prune.fovea_off
+                                             and not prune.fovea_wzero), "prune.step0 is b or d on interlace_w")
+            _require(prune.e9 is None or (prune.e9 in ("early", "late") and prune.fovea == "interlace_w"
+                                          and not prune.fovea_off and not prune.fovea_wzero and prune.step0 is None),
+                     "prune.e9 is early or late on interlace_w (dense step 0)")
+        _require(not (prune.step0_nobias or prune.step0_all) or prune.step0 is not None,
+                 "prune.step0_nobias / step0_all need prune.step0")
+        _require(not prune.step0_all or prune.step0 == "b", "prune.step0_all is the plan-b self-check")
+        _require(prune.e9 is None or prune.fovea is not None, "prune.e9 needs prune.fovea interlace_w")
             _require(prune.selection == "av" and prune.warmup_steps == 1 and prune.keep_ratio > 0.0 and not (
                 prune.action_full_kv or prune.video_full_kv or prune.summary_grid or prune.oracle_kv or prune.recon is not None
                 or prune.steer is not None or prune.steer_video is not None or prune.dense_bias or prune.video_eager
@@ -539,6 +565,7 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
         record_future_attn=bool(raw.get("record_future_attn", False)),
         record_sinks=bool(raw.get("record_sinks", False)),
         video_freeze=bool(raw.get("video_freeze", False)),
+        record_step0_x0=bool(raw.get("record_step0_x0", False)),
     )
     p = cfg.prune
     _require(p is None or p.fovea in (None, "sink") or p.fovea_off or not (
@@ -560,6 +587,9 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
              "record_recon_quality needs prune.recon")
     _require(cfg.dump is None or cfg.prune is None or cfg.prune.recon is None, "dump is not defined for prune.recon")
     _require(cfg.score_layer is None or cfg.score_layer >= 0, "casestudy.score_layer must be >= 0")
+    _require(p is None or p.step0 is None or cfg.score_layer is not None,
+             "prune.step0 scores on a fixed layer (casestudy.score_layer)")
+    _require(not cfg.record_step0_x0 or cfg.frame0_cache, "record_step0_x0 is logged on the frame-0-cache path only")
     _require(cfg.prune is None or not cfg.record_vv or cfg.prune.warmup_steps == 1,
              "record_vv needs prune.warmup_steps == 1 (V→V is captured at step 0)")
     return cfg
