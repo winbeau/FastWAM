@@ -435,7 +435,8 @@ class FastWAMJointPolicy:
         self._episode_key = f"{episode.get('instruction', '')}|{_re.sub(r'-r[0-9]+', '', episode_id)}"
         self._plan = self.episode_plans.get(episode_id, {})
         if self.step0_tube is not None:
-            key = f"{self.step0_tube['suite']}/{int(_re.match(r't(\d+)', episode_id).group(1))}"
+            task_id = int(_re.match(r"t(\d+)", episode_id).group(1))
+            key = f"{self.step0_tube['suite']}/{task_id}"
             if key not in self.step0_tube["cameras"]:
                 raise ValueError(f"step0_tube: no agentview camera for {key}")
             self._tube_camera = self.step0_tube["cameras"][key]
