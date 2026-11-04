@@ -1702,14 +1702,18 @@ class JointCaseStudyRunner:
                         # tokens on this full step) and the action rows, head mean, summed over rows.
                         recv_acc += self._attention_probs(io_v[0], k_vid)[:, f0:].sum(dim=0)
                         recv_acc += self._attention_probs(io_a[0], k_all)[:, f0:f0 + num_future].sum(dim=0)
-                    if late is not None and s == 1:
+                    if late is not None and (s == 1 or (s == 2 and "cs" in late_st)):
                         # late anchor: step 1's A->V (score layer, normalized) and the attention its future tokens receive.
+                        # cam-split: the same on both anchor steps, kept per step (av1 / av2 over the step's rows, recv1 / recv2).
+                        sfx = str(s) if "cs" in late_st else ""
                         if layer == self._layers["act"]:
                             nf_ = int(k_all.shape[1]) - f0 - int(io_a[1].shape[1])
                             av_s = self._masked_probs(io_a[0], k_all, amask)[:, f0:f0 + nf_].sum(dim=0)
-                            late_st["av"] = av_s / av_s.sum()
-                        late_st["recv"][idx_rel] += self._masked_probs(io_v[0], k_vid, fv_mask_v)[:, f0:].sum(dim=0)
-                        late_st["recv"][idx_rel] += self._masked_probs(io_a[0], k_all, amask)[:, f0:f0 + n_q].sum(dim=0)
+                            late_st["av" + sfx] = av_s / av_s.sum()
+                        if sfx and "recv" + sfx not in late_st:
+                            late_st["recv" + sfx] = torch.zeros(num_future, device=model.device)
+                        late_st["recv" + sfx][idx_rel] += self._masked_probs(io_v[0], k_vid, fv_mask_v)[:, f0:].sum(dim=0)
+                        late_st["recv" + sfx][idx_rel] += self._masked_probs(io_a[0], k_all, amask)[:, f0:f0 + n_q].sum(dim=0)
                     if c2f is not None and s == 1 and layer == self._layers["act"]:
                         # C2F: step 1's A->V on its computed future keys (softmax with the step's key bias), normalized.
                         nf_ = int(k_all.shape[1]) - f0 - int(io_a[1].shape[1])
@@ -1831,7 +1835,16 @@ class JointCaseStudyRunner:
                     vel_part = self.video.head(xv, t_rows)
                 if vel_tokens is None:
                     vel_tokens = torch.zeros((1, f0 + num_future, vel_part.shape[-1]), device=vel_part.device, dtype=vel_part.dtype)
+                cs_ctx = late_st["cs"][s][1].to(idx_rel.device) if late is not None and "cs" in late_st and s in (1, 2) else None
+                if cs_ctx is not None:
+                    # cam-split runner check: an anchor step computes its camera's anchor and the other camera's context, nothing else.
+                    if not torch.equal(idx_rel, torch.sort(torch.cat([late_st["cs"][s][0].to(idx_rel.device), cs_ctx])).values):
+                        raise RuntimeError("cam-split: an anchor step computes rows other than its camera's anchor and context")
+                    cs_keep = vel_tokens[:, f0 + cs_ctx].clone()
                 vel_tokens[:, idx_abs] = vel_part[:, :n_real]  # pruned tokens keep their last velocity
+                if cs_ctx is not None and cs_ctx.numel():
+                    # cam-split: the context rows lend their keys / values only; their latents keep moving as before (no draft).
+                    vel_tokens[:, f0 + cs_ctx] = cs_keep
                 if merge_step:
                     vel_tokens[:, mg["abs"]] = vel_part[:, n_real:]
                     fv_count[mg["abs"] - f0] += 1
@@ -1876,7 +1889,31 @@ class JointCaseStudyRunner:
                     vt[:, f0 + all_future] = side["vel"]
                     late_st.update(x0d=self._clean_future(latents_video, vt, gsz, sig_s, (pt, ph, pw)),
                                    av_d=sel.av_scores(side["probs"], grid).float(), recv_d=side["recv"].float())
-            if late is not None and s == 1:
+            if late is not None and "cs" in late_st and s in (1, 2):
+                # cam-split: this step's camera drafts from its anchor (near: measured x^0, IDW for the missing; far: extrapolated),
+                # change x its gain; its anchor rows move along their corrected change unless the gain is 1. The other camera keeps
+                # moving as before: on x^0 = 0 before its anchor step, along its draft after it.
+                anchor = late_st["cs"][s][0].to(idx_rel.device)
+                cam = int(((anchor[:1] % grid.per_frame) % grid.width) // (grid.width // 2))
+                g_cam = prune.cs_gain_w if cam == 1 else prune.cs_gain_a
+                g_cam = float(prune.step0_gain if g_cam is None else g_cam)
+                if s == 1:
+                    # self-check: before its anchor the other camera is still on x^0 = 0 (its step-0 velocity, context rows restored)
+                    other = fv.camera_tokens(1 - cam, grid).to(idx_rel.device)
+                    x0_o = self._clean_future(latents_video, vel_tokens, gsz, sig_s, (pt, ph, pw))[other]
+                    diag["late"]["cs_second_x0_rel"] = float(x0_o.abs().max() / latents_video.float().abs().max().clamp_min(1e-12))
+                v_draft, zf_c = self._set_draft(latents_video, vel_tokens, gsz, grid, anchor, sig_s, (pt, ph, pw), g_cam,
+                                                prune.step0_draft, float(prune.step0_far_lambda), prune.step0_far_lambda_wrist)
+                own = fv.camera_tokens(cam, grid).to(idx_rel.device)
+                late_st["zf"] = zf_c.clone() if "zf" not in late_st else late_st["zf"]
+                late_st["zf"][own] = zf_c[own]
+                late_st.setdefault("cs_anchor", {})[cam] = int(s)
+                upd = own if g_cam != 1.0 else own[~torch.isin(own, anchor)]
+                vel_tokens[:, f0 + upd] = v_draft[:, f0 + upd].to(vel_tokens.dtype)
+                if cfg.record_drafts and s == 2:
+                    diag["drafts_f32"], diag["drafts_step"] = _f32_b64(late_st["zf"]), 2
+                    diag["cs_anchor"] = {"agent": late_st["cs_anchor"][0], "wrist": late_st["cs_anchor"][1]}
+            elif late is not None and s == 1:
                 # late anchor: step 1 forms the imagination; every other future token is drafted from it (spread, gain), and
                 # the computed ones move along their corrected change.
                 v_draft, late_st["zf"] = self._set_draft(latents_video, vel_tokens, gsz, grid, idx_rel, sig_s, (pt, ph, pw),
@@ -2049,9 +2086,9 @@ class JointCaseStudyRunner:
                     cfg.mech.get("calls", 10 ** 6)):
                 diag.setdefault("mech", {})[str(s)] = self._mech_step(pre_v, kv0, latents_video, vel_tokens, t_video[s], grid, f0, seed, s,
                                                                       (pt, ph, pw))
-            if cfg.record_drafts and s in (0, 1) and (prune is None or (s == 0 and prune.step0 is None and prune.late is None and dmod is None)):
+            if cfg.record_drafts and s in (0, 1, 2) and (prune is None or (s == 0 and prune.step0 is None and prune.late is None and dmod is None)):
                 # shrinkage-mechanism: dense: its step-0 / step-1 clean estimate (the references) and the current frame; M4w: its
-                # step-0 drafts (the dense step-0 clean estimate).
+                # step-0 drafts (the dense step-0 clean estimate). cam-split: dense also its step-2 clean estimate.
                 sig_r = t_video[s].float() / float(model.infer_video_scheduler.num_train_timesteps)
                 zr = rearrange((latents_video.float() - sig_r * pred_video.float())[0], "c (f a) (h b) (w e) -> f (h w) (c a b e)",
                                a=pt, b=ph, e=pw)
@@ -2146,7 +2183,46 @@ class JointCaseStudyRunner:
                     }
                 else:
                     self._layers = {"act": -1, "inst": -1}
-            if late is not None and s == 1:
+            if late is not None and "cs" in late_st and s == 1:
+                # cam-split: step 2 computes the second camera's anchor (+ the first camera's context), keys + cs_bias.
+                rows2 = torch.sort(torch.cat(late_st["cs"][2])).values
+                lg2 = fv.cs_bias(prune.cs_bias, int(prune.cs_n))
+                fplan = fv.Plan(fovea_m, rows2[:0], rows2[:0], rows2[:0], rows2, bias_real={int(j): lg2 for j in rows2.tolist()}).to(kept.device)
+                kept = fplan.fixed
+                late_st["rows1"] = idx_rel.clone()
+            elif late is not None and "cs" in late_st and s == 2:
+                # cam-split: the plan of steps 3-9 (7 slices, measured core, step 9 + late_extra) from the two anchor steps' scores
+                # (A->V, received attention, Diff of the drafts), each divided by its step's mean over its anchor rows (context
+                # rows not scored); sinks 182 + the 2 anchor tokens receiving the most.
+                steps_rows = {1: late_st["cs"][1][0].to(idx_rel.device), 2: late_st["cs"][2][0].to(idx_rel.device)}
+                pos = {1: late_st["rows1"], 2: idx_rel}
+                av_raw = torch.zeros(num_future, device=idx_rel.device)
+                recv_raw = torch.zeros(num_future, device=idx_rel.device)
+                for s_, rows_ in steps_rows.items():
+                    av_raw[pos[s_]] = late_st[f"av{s_}"].float()  # over the step's computed rows, in their (sorted) order
+                    recv_raw[rows_] = late_st[f"recv{s_}"][rows_].float() / self.num_layers
+                zo = z_late[grid.future_obs_index(z_late.device)]
+                df_raw = (late_st["zf"] - zo).norm(dim=-1)
+                av_n = fv.step_normalized(av_raw, steps_rows)
+                df_n = fv.step_normalized(df_raw, steps_rows)
+                r_ = fv.step_normalized(recv_raw, steps_rows)
+                measured = torch.sort(torch.cat(list(steps_rows.values()))).values
+                out_ = torch.ones(num_future, dtype=torch.bool, device=r_.device)
+                out_[measured] = False
+                out_[fv.PROBE_SINK] = True
+                r_[out_] = float("-inf")
+                sinks_l = torch.cat([torch.tensor([fv.PROBE_SINK], device=r_.device), torch.topk(r_, fv.N_SINKS - 1).indices])
+                fplan = fv.c2f_plan(measured.cpu(), av_n.cpu(), df_n.cpu(), sinks_l.cpu(), grid,
+                                    max(1, int(round(prune.keep_ratio * num_future))), first=3, core_all=False,
+                                    last_extra=int(prune.late_extra)).to(kept.device)
+                kept = fplan.fixed
+                half_ = grid.width // 2
+                cam_of = lambda t: [int(((int(j) % grid.per_frame) % grid.width) // half_) for j in t]  # noqa: E731
+                diag["late"].update(core=fplan.core.tolist(), sinks=fplan.sinks.tolist(), slices=[int(x.numel()) for x in fplan.slices],
+                                    truncated=int(fplan.truncated.numel()), cs_anchor=late_st.get("cs_anchor"),
+                                    core_cams={"agent": cam_of(fplan.core).count(0), "wrist": cam_of(fplan.core).count(1)},
+                                    step_rows={1: int(late_st["rows1"].numel()), 2: int(idx_rel.numel())})
+            elif late is not None and s == 1:
                 # late anchor: the plan of steps 2-9 from step 1 (sinks 182 + the 2 computed tokens receiving the most; core
                 # from the spread A->V and the Diff of the spread drafts; computed tokens in the last slices).
                 rows1 = idx_rel
@@ -2309,6 +2385,11 @@ class JointCaseStudyRunner:
                             else:
                                 survey = survey[~torch.isin(survey, fv.stratified_pick(survey, -d1, grid, prune.step_delta_seed))]
                         lg = math.log(num_future / int(survey.numel()))
+                        if prune.cs_order is not None:
+                            # cam-split: step 1 computes the first camera's anchor (+ the other camera's context), keys + cs_bias.
+                            late_st["cs"] = fv.cs_rows(prune.cs_order, int(prune.cs_n), int(prune.cs_k), survey, grid, int(prune.cs_seed))
+                            survey = torch.sort(torch.cat(late_st["cs"][1])).values
+                            lg = fv.cs_bias(prune.cs_bias, int(prune.cs_n))
                         empty_ = survey[:0]
                         fplan = fv.Plan(fovea_m, empty_, empty_, empty_, survey, bias_real={int(j): lg for j in survey.tolist()}).to(kept.device)
                         diag["late"] = {"set": late, "n": int(survey.numel())}

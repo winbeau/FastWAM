@@ -271,6 +271,20 @@ class PruneConfig:
     role_select: Optional[str] = None
     role_tips: tuple = ()
     role_seed: int = 0
+    #: cam-split: the late anchor spread over two steps by camera. Step 1 computes the near frame of the first camera
+    #: (``cs_order`` "wa": wrist first, "aw": agentview first), step 2 the other's; ``cs_n`` tokens per camera (49: all, 42: the
+    #: camera's tokens of ``late``), ``cs_k`` near-frame tokens of the other camera as context only (stratified, ``cs_seed``; no
+    #: draft, no score), every row's keys + ``cs_bias`` ("0", "98": log(98 / n), "196": log(196 / n)). Each camera drafts on its
+    #: anchor step (near: measured, IDW for the missing; far: extrapolated) with its gain ``cs_gain_w`` / ``cs_gain_a`` (None:
+    #: step0_gain); before it its tokens stay on x^0 = 0. Steps 3-9: the late anchor's plan (c2f, measured core, 7 slices) from the
+    #: two anchor steps' scores, each normalized by its step's mean over its anchor tokens.
+    cs_order: Optional[str] = None
+    cs_n: int = 49
+    cs_k: int = 0
+    cs_bias: str = "98"
+    cs_gain_w: Optional[float] = None
+    cs_gain_a: Optional[float] = None
+    cs_seed: int = 0
 
 
 @dataclass(frozen=True)
@@ -504,6 +518,13 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             role_select=None if block.get("role_select") is None else str(block["role_select"]),
             role_tips=tuple(int(x) for x in (block.get("role_tips") or ())),
             role_seed=int(block.get("role_seed", 0)),
+            cs_order=None if block.get("cs_order") is None else str(block["cs_order"]),
+            cs_n=int(block.get("cs_n", 49)),
+            cs_k=int(block.get("cs_k", 0)),
+            cs_bias=str(block.get("cs_bias", "98")),
+            cs_gain_w=None if block.get("cs_gain_w") is None else float(block["cs_gain_w"]),
+            cs_gain_a=None if block.get("cs_gain_a") is None else float(block["cs_gain_a"]),
+            cs_seed=int(block.get("cs_seed", 0)),
         )
         if prune.fovea is not None or prune.fovea_off:
             _require(prune.fovea in FOVEA_METHODS, f"prune.fovea must be one of {FOVEA_METHODS} (fovea_off needs a method)")
@@ -555,6 +576,13 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             prune.late is not None and prune.late_step == 1 and prune.late_oracle != "plan" and (prune.late_plan_core in (None, "measured"))
             and all(x is None or x >= 0 for x in (prune.late_plan_far_av, prune.late_plan_far_diff))),
                  "prune.late_plan_far_av / far_diff (>= 0) / late_plan_core (measured) are options of the late anchor's plan")
+        _require(prune.cs_order is None or (prune.cs_order in ("wa", "aw") and prune.late is not None and prune.late_step == 1
+                 and prune.late_oracle is None and not prune.step_delta and prune.role_select is None and prune.late_plan_far_av is None
+                 and prune.late_plan_far_diff is None and prune.step0_draft in ("near", "idw") and prune.cs_n in (42, 49)
+                 and 0 <= prune.cs_k <= 49 and prune.cs_bias in ("0", "98", "196")
+                 and all(g is None or g > 0 for g in (prune.cs_gain_w, prune.cs_gain_a))),
+                 "prune.cs_order (wa / aw; cs_n 42 / 49, cs_k 0-49, cs_bias 0 / 98 / 196) spreads the late anchor (late_step 1, no oracle, "
+                 "step_delta, role_select or far scaling) over steps 1-2 by camera")
         _require(prune.role_select is None or (prune.role_select in ROLE_VARIANTS and prune.late is not None and prune.late_step == 1
                  and prune.late_oracle is None and not prune.step_delta and prune.late_plan_far_av is None and prune.late_plan_far_diff is None
                  and (prune.role_select == "notip" or len(prune.role_tips) == 2)), f"prune.role_select ({ROLE_VARIANTS}, 2 role_tips but for notip) "

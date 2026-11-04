@@ -525,6 +525,45 @@ def role_plan(measured: torch.Tensor, av: torch.Tensor, diff: torch.Tensor, sink
                 truncated=truncated, step_bias=step_bias)
 
 
+def camera_tokens(cam: int, grid: sel.Grid, near_only: bool = False) -> torch.Tensor:
+    """cam-split: the future tokens of camera ``cam`` (0 agentview, 1 wrist), both future frames or the near frame only."""
+    j = torch.arange(grid.per_frame if near_only else grid.num_future)
+    return j[((j % grid.per_frame) % grid.width) // (grid.width // 2) == cam]
+
+
+def cs_rows(order: str, n: int, k: int, late_rows: torch.Tensor, grid: sel.Grid, seed: int) -> dict:
+    """cam-split: step -> (anchor rows, context rows) of the two anchor steps. Step 1 anchors the first camera of ``order`` ("wa":
+    wrist, "aw": agentview), step 2 the other; a camera's anchor is its whole near frame (n = 49) or its tokens of the late set
+    (n = 42, the L84 anchor's); the context is k near-frame tokens of the other camera (``spread_order``, seed ``seed``)."""
+    cams = (1, 0) if order == "wa" else (0, 1)
+    late_rows = late_rows.cpu()
+    out = {}
+    for s, cam in zip((1, 2), cams):
+        near = camera_tokens(cam, grid, near_only=True)
+        anchor = near if n >= int(near.numel()) else near[torch.isin(near, late_rows)]
+        if int(anchor.numel()) != n:
+            raise ValueError(f"cs_rows: camera {cam} has {int(anchor.numel())} anchor tokens, not {n}")
+        ctx = spread_order(camera_tokens(1 - cam, grid, near_only=True), grid, seed)[:k]
+        out[s] = (anchor, torch.sort(ctx).values)
+    return out
+
+
+def cs_bias(spec: str, n: int) -> float:
+    """cam-split: the anchor steps' key bias, "0", "98" (log(98 / n)) or "196" (log(196 / n))."""
+    return 0.0 if spec == "0" else math.log(float(spec) / n)
+
+
+def step_normalized(values: torch.Tensor, steps: dict) -> torch.Tensor:
+    """cam-split: scores measured on separate steps made comparable: ``values`` [Kf] known on each step's anchor rows (``steps``:
+    step -> rows), each step's divided by its mean over its rows; every other token 0."""
+    out = torch.zeros_like(values, dtype=torch.float32)
+    for rows in steps.values():
+        v = values[rows].float()
+        m = float(v.mean())
+        out[rows] = v / m if m > 0 else v
+    return out
+
+
 def tube_mask(cells: dict, grid: sel.Grid, wrist_rows: bool = False, dilate: int = 1) -> torch.Tensor:
     """Plan D: [Kf] bool, the agentview cells (row, column) of every future frame (``cells[f]``, f = 1..F-1) dilated by
     ``dilate`` within the block; ``wrist_rows`` adds the two bottom rows of every wrist block."""
@@ -819,5 +858,6 @@ def make_plan(method: str, k: int, grid: sel.Grid, av: torch.Tensor, diff: torch
 __all__ = ["INTERLACE", "METHODS", "PROBE_CORNERS", "PROBE_SINK", "Plan", "STEP0", "add_last_extra", "fill_map", "grid_regions",
            "ht_frequencies", "ht_schedule", "interlace_slices", "interp_tokens", "kmeans", "make_plan", "probe_index",
            "roll_blocks", "rope_freqs_at", "step0_slices", "token_latent_mask", "token_norms", "tube_mask", "stratified_pick",
-           "lowest_av", "apply_step_delta", "ROLE_VARIANTS", "role_strata", "spread_order", "role_plan", "nearest_sources", "idw_fill", "align_frames", "memory_map",
+           "lowest_av", "apply_step_delta", "ROLE_VARIANTS", "role_strata", "spread_order", "role_plan", "camera_tokens", "cs_rows",
+           "cs_bias", "step_normalized", "nearest_sources", "idw_fill", "align_frames", "memory_map",
            "select_core", "reselect"]

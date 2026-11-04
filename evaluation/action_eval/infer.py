@@ -834,7 +834,7 @@ class FastWAMJointPolicy:
                             "future_attn_shape", "dump_path", "gate_score", "fovea", "sink_index", "sink_share_step0",
                             "sink_recv_f16", "step0", "step0_x0_f32", "e9", "r2", "r3", "mem", "mem_rec", "side0",
                             "terminal_x0_f32", "draft", "reselect", "explore", "explore_plan", "x0d_f16", "zcur_f16",
-                            "draft_mod", "late", "drafts_f32", "drafts_step", "drafts_y0_f32", "drafts_y1_f32", "zcur_f32",
+                            "draft_mod", "late", "drafts_f32", "drafts_step", "drafts_y0_f32", "drafts_y1_f32", "drafts_y2_f32", "cs_anchor", "zcur_f32",
                             "kval_f16", "kval_m", "kval_shape"):
                     if d.get(key) is not None:
                         entry[key] = d[key]
