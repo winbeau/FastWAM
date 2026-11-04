@@ -1596,11 +1596,43 @@ class JointCaseStudyRunner:
                 # step0-explore late anchor: step 0 computes no future token; every future token stays on pure noise (x^0 = 0).
                 x_tok0 = rearrange(latents_video, "b c (f x) (h y) (w z) -> b (f h w) (x y z c)", x=pt, y=ph, z=pw)
                 vel_tokens[:, f0:] = (x_tok0[:, f0:].float() / sig_s).to(vel_tokens.dtype)
+                if prune.late_oracle is not None:
+                    # late-anchor-c4 attribution (diagnostic, not a method, FLOPs not counted): the dense step 0 beside the arm,
+                    # its clean estimate of every future token, its A->V (score layer) and received attention.
+                    side = self._explore_forward(pre_v, pre_a, kv0, all_future, f0, num_future, self._layers["act"], grid)
+                    vt = torch.zeros((1, f0 + num_future, int(side["vel"].shape[-1])), device=side["vel"].device, dtype=side["vel"].dtype)
+                    vt[:, f0 + all_future] = side["vel"]
+                    late_st.update(x0d=self._clean_future(latents_video, vt, gsz, sig_s, (pt, ph, pw)),
+                                   av_d=sel.av_scores(side["probs"], grid).float(), recv_d=side["recv"].float())
             if late is not None and s == 1:
                 # late anchor: step 1 forms the imagination; every other future token is drafted from it (spread, gain), and
                 # the computed ones move along their corrected change.
                 v_draft, late_st["zf"] = self._set_draft(latents_video, vel_tokens, gsz, grid, idx_rel, sig_s, (pt, ph, pw),
                                                          float(prune.step0_gain), prune.step0_draft, float(prune.step0_far_lambda))
+                if prune.late_oracle is not None and prune.late_oracle != "plan":
+                    # late-anchor-c4 attribution: one part of the drafts replaced by the dense step-0 clean estimate (change from
+                    # the current frame x the same gain); near: the far frame extrapolated from the replaced near frame. The plan
+                    # keeps the arm's own drafts (zf_own).
+                    zo = z_late[grid.future_obs_index(z_late.device)]
+                    zd = zo + float(prune.step0_gain) * (late_st["x0d"] - zo)
+                    late_st["zf_own"] = late_st["zf"]
+                    zf_o = late_st["zf"].clone()
+                    j_ = torch.arange(num_future, device=zf_o.device)
+                    col = (j_ % grid.per_frame) % grid.width
+                    region = {"all": torch.ones_like(j_, dtype=torch.bool), "far": j_ >= grid.per_frame, "near": j_ < grid.per_frame,
+                              "wrist": col >= grid.width // 2, "agent": col < grid.width // 2}[prune.late_oracle]
+                    zf_o[region] = zd[region]
+                    if prune.late_oracle == "near":
+                        pf_ = grid.per_frame
+                        own = idx_rel[idx_rel >= pf_]
+                        far_x = zf_o[:pf_] + float(prune.step0_far_lambda) * (zf_o[:pf_] - zo[:pf_])
+                        keep_own = zf_o[own].clone()
+                        zf_o[pf_:] = far_x
+                        zf_o[own] = keep_own
+                    late_st["zf"] = zf_o
+                    v_draft = self._map_draft(latents_video, zf_o, grid, sig_s, (pt, ph, pw))
+                if cfg.record_drafts:
+                    diag["drafts_f32"] = _f32_b64(late_st["zf"])
                 rest = torch.ones(num_future, dtype=torch.bool, device=idx_rel.device)
                 rest[idx_rel] = False
                 upd_abs = torch.nonzero(rest).flatten() + f0 if float(prune.step0_gain) == 1.0 else torch.arange(num_future, device=idx_rel.device) + f0
@@ -1831,13 +1863,19 @@ class JointCaseStudyRunner:
                 av_full = self._spread(torch.zeros(num_future, 1, device=rows1.device).index_copy(0, rows1, late_st["av"][:, None].float()),
                                        rows1, grid, prune.step0_draft, torch.zeros(num_future, 1, device=rows1.device), 0.0)[:, 0]
                 zo = z_late[grid.future_obs_index(z_late.device)]
-                df_full = (late_st["zf"] - zo).norm(dim=-1)
+                df_full = (late_st.get("zf_own", late_st["zf"]) - zo).norm(dim=-1)
                 r_ = (late_st["recv"] / self.num_layers).float().clone()
                 out_ = torch.ones(num_future, dtype=torch.bool, device=r_.device)
                 out_[rows1] = False
                 out_[fv.PROBE_SINK] = True
                 r_[out_] = float("-inf")
                 sinks_l = torch.cat([torch.tensor([fv.PROBE_SINK], device=r_.device), torch.topk(r_, fv.N_SINKS - 1).indices])
+                if prune.late_oracle == "plan":
+                    # late-anchor-c4 attribution: the plan of steps 2-9 from the dense step 0's scores by the same rule (sinks: the
+                    # top 3 of the dense received attention, as M4w; A->V and Diff of the dense clean estimate).
+                    av_full = late_st["av_d"]
+                    df_full = (late_st["x0d"] - zo).norm(dim=-1)
+                    sinks_l = torch.topk(late_st["recv_d"], fv.N_SINKS).indices
                 fplan = fv.c2f_plan(rows1.cpu(), av_full.cpu(), df_full.cpu(), sinks_l.cpu(), grid,
                                     max(1, int(round(prune.keep_ratio * num_future))), core_all=True,
                                     last_extra=int(prune.late_extra)).to(kept.device)
@@ -2028,6 +2066,8 @@ class JointCaseStudyRunner:
                                         "far": j_ >= grid.per_frame, "near": j_ < grid.per_frame}[dmod]
                                 e = e * keep[:, None]
                             d = y + e * (float(prune.draft_mod_scale) * y.norm() / e.norm())
+                        if cfg.record_drafts:  # late-anchor-c4 self-check 2
+                            diag["drafts_f32"] = _f32_b64(d)
                         v_new = self._map_draft(e9_prev, d, grid, sigma0_v, (pt, ph, pw))
                         vel_tokens[:, f0:] = v_new[:, f0:].to(vel_tokens.dtype)
                         latents_video = model.infer_video_scheduler.step(self.video.unpatchify(vel_tokens, gsz), d_video[0], e9_prev)

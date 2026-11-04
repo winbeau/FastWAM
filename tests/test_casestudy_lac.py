@@ -74,3 +74,15 @@ def test_early_plan_from_step0():
     assert set(p.slices[7].tolist()) <= set(rows.tolist())  # step 8's slice: computed tokens only
     assert len(set(p.slices[8].tolist()) & set(rows.tolist())) >= 16  # step 9: 16 computed + the 10 extra reads
     assert p.truncated.numel() == 19
+
+
+def test_late_oracle_config():
+    """late-anchor-c4 attribution switch: only on the late anchor (late_step 1); record_drafts parses."""
+    for o in ("far", "near", "wrist", "agent", "plan", "all"):
+        cfg = parse_config({**LATE, "record_drafts": True, "prune": {**LATE["prune"], "late_oracle": o}})
+        assert cfg.prune.late_oracle == o and cfg.record_drafts
+    assert parse_config(LATE).prune.late_oracle is None and not parse_config(LATE).record_drafts
+    for bad in ({**LATE["prune"], "late_oracle": "both"}, {**LATE["prune"], "late_oracle": "far", "late_step": 0},
+                {**M4W["prune"], "late_oracle": "far"}):
+        with pytest.raises(ValueError):
+            parse_config({**LATE, "prune": bad})

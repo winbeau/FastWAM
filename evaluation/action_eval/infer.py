@@ -704,7 +704,7 @@ class FastWAMJointPolicy:
                             "future_attn_shape", "dump_path", "gate_score", "fovea", "sink_index", "sink_share_step0",
                             "sink_recv_f16", "step0", "step0_x0_f32", "e9", "r2", "r3", "mem", "mem_rec", "side0",
                             "terminal_x0_f32", "draft", "reselect", "explore", "explore_plan", "x0d_f16", "zcur_f16",
-                            "draft_mod"):
+                            "draft_mod", "late", "drafts_f32"):
                     if d.get(key) is not None:
                         entry[key] = d[key]
                 for row in list((entry.get("r3") or {}).values()) + list((entry.get("explore") or {}).values()):  # R3 / explore pilots, simulator units

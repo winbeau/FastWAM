@@ -89,6 +89,7 @@ METHODS = ("dense", "prune", "teacache", "noise")
 SELECTIONS = ("av", "vv", "cf", "random", "diff", "diff_global")
 STEP0 = ("b", "d")
 DRAFT_MODS = ("prior", "atten", "white", "low", "high", "wrist", "agent", "far", "near")
+LATE_ORACLES = ("far", "near", "wrist", "agent", "plan", "all")
 FOVEA_METHODS = ("sink", "rep", "fov_grid", "fov_cluster", "interlace", "interlace_w", "interlace_wfar",
                  "interlace_cal", "interlace_fill", "merge", "interlace_ht")
 LAYER_RULES = ("min_entropy", "fixed")
@@ -243,6 +244,10 @@ class PruneConfig:
     #: late-anchor-confirm X-early: the step that computes ``late`` and forms the imagination: 1 (the late anchor) or 0 (step 0
     #: computes the set with key bias log(Kf / n) and drafts from it; the plan of steps 1-9 from step 0 by the same rule).
     late_step: int = 1
+    #: late-anchor-c4 attribution (diagnostic, not a method): a dense step 0 beside the late anchor (FLOPs not counted) whose
+    #: clean estimate (x the gain) replaces the drafts of the far / near (far extrapolated from it) / wrist / agent tokens or
+    #: all of them, or whose scores give the plan of steps 2-9 (plan).
+    late_oracle: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -357,6 +362,8 @@ class CaseStudyConfig:
     #: ``explore_track`` adds the per-block hidden-state difference to the dense pass.
     explore: tuple = ()
     explore_track: bool = False
+    #: late-anchor-c4: log the drafts (every future token's target clean estimate) of the late anchor (step 1) and of draft_mod.
+    record_drafts: bool = False
 
     def describe(self) -> dict[str, Any]:
         return asdict(self)
@@ -458,6 +465,7 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             late=None if block.get("late") is None else str(block["late"]),
             late_extra=int(block.get("late_extra", 0)),
             late_step=int(block.get("late_step", 1)),
+            late_oracle=None if block.get("late_oracle") is None else str(block["late_oracle"]),
         )
         if prune.fovea is not None or prune.fovea_off:
             _require(prune.fovea in FOVEA_METHODS, f"prune.fovea must be one of {FOVEA_METHODS} (fovea_off needs a method)")
@@ -503,6 +511,8 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             prune.fovea == "interlace_w" and not prune.fovea_off and not prune.fovea_wzero and prune.step0 is None and prune.e9 is None
             and not r2)), "prune.late_extra (>= 0) needs prune.late or plain interlace_w")
         _require(prune.late_step in (0, 1) and (prune.late_step == 1 or prune.late is not None), "prune.late_step (0 or 1) needs prune.late")
+        _require(prune.late_oracle is None or (prune.late_oracle in LATE_ORACLES and prune.late is not None and prune.late_step == 1),
+                 f"prune.late_oracle must be one of {LATE_ORACLES} on the late anchor (late_step 1)")
         _require(prune.late is None or (prune.step0 == "b" and prune.step0_draft in ("idw", "near") and prune.c2f is None
                                         and not prune.step0_all and prune.step0_rows is None), "prune.late needs step0 b with idw / near drafts")
         _require(prune.c2f is None or (prune.step0 == "b" and not prune.step0_all and prune.c2f >= 1), "prune.c2f (>= 1) needs prune.step0 b")
@@ -674,6 +684,7 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
                        int(e.get("proxies", 0)), float(e.get("vscale", 1.0)), None if e.get("bias") is None else float(e["bias"]))
                       for e in raw.get("explore") or ()),
         explore_track=bool(raw.get("explore_track", False)),
+        record_drafts=bool(raw.get("record_drafts", False)),
     )
     p = cfg.prune
     _require(p is None or p.fovea in (None, "sink") or p.fovea_off or not (
