@@ -131,3 +131,12 @@ def test_spread_nearres_and_wrist_lambda():
     assert cfg.prune.step0_draft == "nearres" and cfg.prune.step0_far_lambda_wrist == 0.25
     with pytest.raises(ValueError):
         parse_config({**LATE, "prune": {**LATE["prune"], "step0_draft": "idw", "step0_far_lambda_wrist": 0.25}})
+
+
+def test_late_plan_options_config():
+    cfg = parse_config({**LATE, "prune": {**LATE["prune"], "late_plan_far_av": 0.5, "late_plan_far_diff": 0.9, "late_plan_core": "measured"}})
+    assert (cfg.prune.late_plan_far_av, cfg.prune.late_plan_far_diff, cfg.prune.late_plan_core) == (0.5, 0.9, "measured")
+    for bad in ({**M4W["prune"], "late_plan_far_av": 0.5}, {**LATE["prune"], "late_plan_core": "all"},
+                {**LATE["prune"], "late_plan_far_diff": -1.0}, {**LATE["prune"], "late_plan_far_av": 0.5, "late_oracle": "plan"}):
+        with pytest.raises(ValueError):
+            parse_config({**LATE, "prune": bad})

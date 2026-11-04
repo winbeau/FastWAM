@@ -1897,8 +1897,19 @@ class JointCaseStudyRunner:
                     av_full = late_st["av_d"]
                     df_full = (late_st["x0d"] - zo).norm(dim=-1)
                     sinks_l = torch.topk(late_st["recv_d"], fv.N_SINKS).indices
+                pf_ = grid.per_frame
+                far_unm = torch.arange(num_future, device=rows1.device) >= pf_
+                far_unm[rows1] = False
+                if prune.late_plan_far_diff is not None:
+                    # late-anchor-c4: an uncomputed far token's Diff for the plan = this factor x the near token's at the same (h, w)
+                    # (the extrapolated far frame adds no information, it only scales the near frame's change up)
+                    df_near = df_full[torch.arange(num_future, device=rows1.device) % pf_]
+                    df_full = torch.where(far_unm, df_near * float(prune.late_plan_far_diff), df_full)
+                if prune.late_plan_far_av is not None:
+                    # late-anchor-c4: the uncomputed far tokens' spread A->V (copies of the near frame) scaled for the plan
+                    av_full = torch.where(far_unm, av_full * float(prune.late_plan_far_av), av_full)
                 fplan = fv.c2f_plan(rows1.cpu(), av_full.cpu(), df_full.cpu(), sinks_l.cpu(), grid,
-                                    max(1, int(round(prune.keep_ratio * num_future))), core_all=True,
+                                    max(1, int(round(prune.keep_ratio * num_future))), core_all=prune.late_plan_core != "measured",
                                     last_extra=int(prune.late_extra)).to(kept.device)
                 kept = fplan.fixed
                 diag["late"].update(core=fplan.core.tolist(), sinks=fplan.sinks.tolist(), slices=[int(x.numel()) for x in fplan.slices],

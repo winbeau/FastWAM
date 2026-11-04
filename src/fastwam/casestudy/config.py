@@ -251,6 +251,12 @@ class PruneConfig:
     #: clean estimate (x the gain) replaces the drafts of the far / near (far extrapolated from it) / wrist / agent tokens or
     #: all of them, or whose scores give the plan of steps 2-9 (plan).
     late_oracle: Optional[str] = None
+    #: late-anchor-c4 plan of the late anchor (steps 2-9): the uncomputed far tokens' A->V (copies of the near frame) and Diff
+    #: (late_plan_far_diff x the near token's at the same (h, w)) scaled before the core is chosen; ``late_plan_core`` measured:
+    #: the core from the computed tokens' scores only (c2f_plan core_all False).
+    late_plan_far_av: Optional[float] = None
+    late_plan_far_diff: Optional[float] = None
+    late_plan_core: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -470,6 +476,9 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             late_extra=int(block.get("late_extra", 0)),
             late_step=int(block.get("late_step", 1)),
             late_oracle=None if block.get("late_oracle") is None else str(block["late_oracle"]),
+            late_plan_far_av=None if block.get("late_plan_far_av") is None else float(block["late_plan_far_av"]),
+            late_plan_far_diff=None if block.get("late_plan_far_diff") is None else float(block["late_plan_far_diff"]),
+            late_plan_core=None if block.get("late_plan_core") is None else str(block["late_plan_core"]),
         )
         if prune.fovea is not None or prune.fovea_off:
             _require(prune.fovea in FOVEA_METHODS, f"prune.fovea must be one of {FOVEA_METHODS} (fovea_off needs a method)")
@@ -517,6 +526,10 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
         _require(prune.late_step in (0, 1) and (prune.late_step == 1 or prune.late is not None), "prune.late_step (0 or 1) needs prune.late")
         _require(prune.step0_far_lambda_wrist is None or prune.step0_draft in ("near", "nearres"),
                  "prune.step0_far_lambda_wrist needs near / nearres drafts")
+        _require((prune.late_plan_far_av is None and prune.late_plan_far_diff is None and prune.late_plan_core is None) or (
+            prune.late is not None and prune.late_step == 1 and prune.late_oracle != "plan" and (prune.late_plan_core in (None, "measured"))
+            and all(x is None or x >= 0 for x in (prune.late_plan_far_av, prune.late_plan_far_diff))),
+                 "prune.late_plan_far_av / far_diff (>= 0) / late_plan_core (measured) are options of the late anchor's plan")
         _require(prune.late_oracle is None or (prune.late_oracle in LATE_ORACLES and prune.late is not None and prune.late_step == 1),
                  f"prune.late_oracle must be one of {LATE_ORACLES} on the late anchor (late_step 1)")
         _require(prune.late is None or (prune.step0 == "b" and prune.step0_draft in ("idw", "near", "nearres") and prune.c2f is None
