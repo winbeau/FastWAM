@@ -66,6 +66,11 @@ Options (``policy.options``):
                          the partner's chunks. ``partner_seed_offset`` (along-cross placebo) gives the partner its own
                          per-call seed offset instead of the executed arm's seed.
 
+``shrink``               optional {frames_dir, metrics}: shrinkage-mechanism. ``<frames_dir>/<episode>.npz`` (future-inject's
+                         re-rendered dense rollout) gives probes with ``draft_mod: real`` their drafts (the frames t + round(4 i
+                         delta), delta = draft_mod_scale, encoded as a clip; past the rollout's end the probe is skipped), and
+                         ``metrics`` adds ``diagnostics.shrink``: every probe's drafts decoded against the dense probe's (pixel
+                         projection, RAFT flow ratio / cosine, gripper-disk flow) and the dense flow against the real future.
 ``inject_future``        optional {frames_dir, deltas, seeds, sparse, decode_dir}: future-injection probes. The executed
                          arm replays a dense rollout whose per-step observations were re-rendered into
                          ``<frames_dir>/<episode>.npz`` (``agentview`` / ``wrist`` [steps + 1, H, W, 3], frame k = after k
@@ -315,6 +320,16 @@ class FastWAMJointPolicy:
             self.hybrid_runner = make_runner(self.model, parse_config(h["partner"]), prompt_store=self.prompt_store)
             if self.casestudy.seed_mode != "episode_call_hash":
                 raise ValueError("hybrid needs seed_mode=episode_call_hash")
+        self.shrink = None
+        self._sm_frames = None
+        self._raft = None
+        self._sm_cache: dict = {}
+        if options.get("shrink") is not None:
+            f = dict(options["shrink"])
+            unknown = sorted(set(f) - {"frames_dir", "metrics"})
+            if unknown or not f.get("frames_dir"):
+                raise ValueError(f"shrink needs frames_dir (unknown keys: {unknown})")
+            self.shrink = {"frames_dir": Path(str(f["frames_dir"])), "metrics": bool(f.get("metrics", True))}
         self.inject = None
         self.inject_sparse = None
         self._inject_frames = None
@@ -442,6 +457,13 @@ class FastWAMJointPolicy:
             self._tube_camera = self.step0_tube["cameras"][key]
         if self.hybrid is not None and self.hybrid["calls"] == "plan" and "hybrid_calls" not in self._plan:
             raise ValueError(f"hybrid calls: plan, but the episode plan of {episode_id} has no hybrid_calls")
+        if self.shrink is not None:
+            path = self.shrink["frames_dir"] / f"{_re.sub(r'-r[0-9]+.*$', '', episode_id)}.npz"
+            self._sm_frames = None
+            if path.is_file():
+                with np.load(path) as z:
+                    self._sm_frames = {k: z[k] for k in ("agentview", "wrist", "eef", "cam_agentview")}
+            self._sm_cache = {}
         if self.inject is not None:
             self.inject_sparse.reset_episode()
             path = self.inject["frames_dir"] / f"{_re.sub(r'-r[0-9]+.*$', '', episode_id)}.npz"
@@ -525,6 +547,8 @@ class FastWAMJointPolicy:
             diag["shadow"] = self._shadow_metrics(prompt, image, proprio, shadow_seed, action, actions)
         if self.probes and (self.probe_calls is None or call_index in self.probe_calls):
             diag["probes"] = self._probe_metrics(prompt, image, proprio, call_index)
+            if self.shrink is not None and self.shrink["metrics"]:
+                diag["shrink"] = self._shrink_metrics(diag["probes"], image, images, call_index)
         if self.inject is not None:
             diag["inject"] = self._inject_call(runner, call_index, prompt, image, proprio, images, action, video_cap)
         return Prediction(
@@ -689,11 +713,15 @@ class FastWAMJointPolicy:
             for name, runner in self.probes:
                 if layers is not None and int(layers.get("act", -1)) >= 0:
                     runner._layers = dict(layers)
+                real = self._real_kwargs(runner, image, call_index)
+                if real is None:  # shrinkage-mechanism: real future frames run past the rollout's end
+                    out[f"{name}@{offset}"] = {"seed": int(seed), "skipped": "frames"}
+                    continue
                 action, d = runner.infer_action(
                     prompt=prompt, input_image=image, proprio=proprio,
                     action_horizon=self.action_horizon, num_video_frames=self.num_video_frames,
                     seed=seed, sigma_shift=self.sigma_shift, rand_device=self.rand_device, **self._tube_kwargs(runner),
-                    **self._mem_kwargs(runner, offset),
+                    **self._mem_kwargs(runner, offset), **real,
                 )
                 cont, _, agc_log = self._agc(runner.cfg, d, self._continuous(action))
                 entry = {"seed": int(seed), **self._chunk_logs(action, cont), **agc_log}
@@ -704,7 +732,8 @@ class FastWAMJointPolicy:
                             "future_attn_shape", "dump_path", "gate_score", "fovea", "sink_index", "sink_share_step0",
                             "sink_recv_f16", "step0", "step0_x0_f32", "e9", "r2", "r3", "mem", "mem_rec", "side0",
                             "terminal_x0_f32", "draft", "reselect", "explore", "explore_plan", "x0d_f16", "zcur_f16",
-                            "draft_mod", "late", "drafts_f32"):
+                            "draft_mod", "late", "drafts_f32", "drafts_step", "drafts_y0_f32", "drafts_y1_f32", "zcur_f32",
+                            "kval_f16", "kval_m", "kval_shape"):
                     if d.get(key) is not None:
                         entry[key] = d[key]
                 for row in list((entry.get("r3") or {}).values()) + list((entry.get("explore") or {}).values()):  # R3 / explore pilots, simulator units
@@ -712,6 +741,150 @@ class FastWAMJointPolicy:
                     row["pilot_cont_f32"] = base64.b64encode(
                         self._continuous(self._torch.from_numpy(p.copy())).astype(np.float32).tobytes()).decode()
                 out[f"{name}@{offset}"] = entry
+        return out
+
+    # ---- shrinkage-mechanism: real future frames as drafts, and the metrics of every probe's imagination
+    def _sm_model_frame(self, j: int):
+        fr = self._sm_frames
+        rgb = self._io.compose_model_image(fr["agentview"][j], fr["wrist"][j], processor=self.processor,
+                                           concatenation=self.concatenation, width=self.input_w, height=self.input_h)
+        return self._io.image_to_model_tensor(rgb, device=self.device, dtype=self.model.torch_dtype)
+
+    def _real_latents(self, image, call_index: int, delta: float):
+        """VAE latents [1, z, 3, h, w] of the current frame + the dense rollout's frames t + round(4 i delta) (i = 1..8), encoded
+        as training encodes clips; None past the rollout's end (cached per call and delta)."""
+        key = ("real", call_index, float(delta))
+        if key not in self._sm_cache:
+            fr, t = self._sm_frames, 10 * call_index
+            idx = [t + int(round(4 * i * delta)) for i in range(1, 9)]
+            if fr is None or max(idx) >= len(fr["agentview"]):
+                self._sm_cache[key] = None
+            else:
+                clip = self._torch.cat([image] + [self._sm_model_frame(j) for j in idx], dim=0)
+                self._sm_cache[key] = self.runner.encode_clip(clip)
+        return self._sm_cache[key]
+
+    def _real_kwargs(self, runner, image, call_index: int) -> dict | None:
+        """``_real_future`` for a probe with draft_mod real (delta = draft_mod_scale); {} for other runners; None when the real
+        future runs past the rollout's end (the probe is skipped on this call)."""
+        prune = runner.cfg.prune
+        if prune is None or prune.draft_mod != "real":
+            return {}
+        if self.shrink is None:
+            raise ValueError("draft_mod real needs the adapter option shrink (frames_dir)")
+        lat = self._real_latents(image, call_index, float(prune.draft_mod_scale))
+        return None if lat is None else {"_real_future": lat[:, :, 1:]}
+
+    def _shrink_metrics(self, probes: dict, image, images: dict, call_index: int) -> dict:
+        """shrinkage-mechanism metrics of every probe that logged drafts, against the dense probe of the same seed offset (its
+        step-0 / step-1 clean estimate, by the probe's drafts_step): VAE-decoded pixel projection, RAFT flow (magnitude ratio
+        and direction cosine on the 20 % most-moving dense pixels) per camera for the near (pixel frame 4) and far (8) frame,
+        the gripper-disk flow (end effector projected into the third-person view), and the dense flow against the real
+        future (delta 1) as the pipeline's reference."""
+        import base64
+
+        torch = self._torch
+        from einops import rearrange
+
+        if self._raft is None:
+            from torchvision.models.optical_flow import Raft_Large_Weights, raft_large
+            self._raft = raft_large(weights=Raft_Large_Weights.C_T_SKHT_V2).to(self.device).eval()
+        rn = self.runner
+        pt, ph, pw = (int(x) for x in rn.video.patch_size)
+        first = self.model._encode_input_image_latents_tensor(input_image=image, tiled=False)
+        _, cz, _, lh, lw = first.shape
+
+        def f32(b64: str) -> np.ndarray:
+            return np.frombuffer(base64.b64decode(b64), dtype=np.float32)
+
+        def decode(zf: np.ndarray) -> np.ndarray:
+            z = torch.from_numpy(zf.copy()).to(self.device).reshape(2, (lh // ph) * (lw // pw), -1)
+            fut = rearrange(z, "f (h w) (c a b e) -> c (f a) (h b) (w e)", h=lh // ph, a=pt, b=ph, e=pw)[None]
+            lat = torch.cat([first.float(), fut.float()], dim=2).to(first.dtype)
+            return rn.decode_video(lat)
+
+        def flow(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+            t1 = torch.from_numpy(np.stack(a)).permute(0, 3, 1, 2).float().to(self.device) / 127.5 - 1.0
+            t2 = torch.from_numpy(np.stack(b)).permute(0, 3, 1, 2).float().to(self.device) / 127.5 - 1.0
+            with torch.no_grad():
+                return self._raft(t1, t2)[-1].float().cpu().numpy()  # [N, 2, H, W]
+
+        fr, t = self._sm_frames, 10 * call_index
+        grip_xy = None
+        if fr is not None and t < len(fr["eef"]):
+            ph_ = fr["cam_agentview"] @ np.append(fr["eef"][t], 1.0)
+            h0 = fr["agentview"].shape[1]
+            grip_xy = ((h0 - 1 - ph_[0] / ph_[2]) * 224 / h0, (ph_[1] / ph_[2]) * 224 / h0)
+        out: dict = {"grip_xy": None if grip_xy is None else [round(float(v), 2) for v in grip_xy]}
+        if fr is not None:
+            out["frames_current_equal"] = bool(np.array_equal(fr["agentview"][t], images["agentview"])
+                                               and np.array_equal(fr["wrist"][t], images["wrist"]))
+        yy, xx = np.mgrid[0:224, 0:224]
+        disk = None if grip_xy is None else ((xx - grip_xy[0]) ** 2 + (yy - grip_xy[1]) ** 2) <= 12 ** 2
+        refs: dict = {}
+        for key, e in probes.items():
+            name, j = key.split("@")
+            if name == "dense" and e.get("drafts_y0_f32"):
+                for st in (0, 1):
+                    if e.get(f"drafts_y{st}_f32"):
+                        refs[(j, st)] = decode(f32(e[f"drafts_y{st}_f32"]))
+        res: dict = {}
+        cams = {"agent": slice(0, 224), "wrist": slice(224, 448)}
+        for key, e in probes.items():
+            name, j = key.split("@")
+            st = int(e.get("drafts_step", 0))
+            if not e.get("drafts_f32") or (j, st) not in refs:
+                continue
+            dy, dd = refs[(j, st)], decode(f32(e["drafts_f32"]))
+            iz = refs[(j, 0)][0]
+            pairs_a, pairs_b, labels = [], [], []
+            for fi, fname in ((4, "near"), (8, "far")):
+                for cname, cs in cams.items():
+                    for src, lab in ((dy, "y"), (dd, "d")):
+                        pairs_a.append(iz[:, cs])
+                        pairs_b.append(src[fi][:, cs])
+                        labels.append((fname, cname, lab))
+            fl = flow(pairs_a, pairs_b)
+            fmap = {lab: fl[i] for i, lab in enumerate(labels)}
+            rec: dict = {}
+            for fi, fname in ((4, "near"), (8, "far")):
+                for cname, cs in cams.items():
+                    fy, fd = fmap[(fname, cname, "y")], fmap[(fname, cname, "d")]
+                    my = np.linalg.norm(fy, axis=0)
+                    m = my >= np.quantile(my, 0.8)
+                    md = np.linalg.norm(fd, axis=0)
+                    cos = (fy * fd).sum(axis=0) / (my * md + 1e-6)
+                    a, b, z_ = dd[fi][:, cs].astype(np.float64), dy[fi][:, cs].astype(np.float64), iz[:, cs].astype(np.float64)
+                    r = {"flow_ratio": float(md[m].mean() / max(my[m].mean(), 1e-6)), "flow_cos": float(cos[m].mean()),
+                         "pix_proj": float(((a - z_) * (b - z_)).sum() / max(((b - z_) ** 2).sum(), 1e-6)),
+                         "flow_mag_dense": float(my[m].mean())}
+                    if cname == "agent" and disk is not None:
+                        gy, gd = fy[:, disk].mean(axis=1), fd[:, disk].mean(axis=1)
+                        ny, nd = float(np.linalg.norm(gy)), float(np.linalg.norm(gd))
+                        r.update(grip_ratio=nd / max(ny, 1e-6), grip_angle=float(np.degrees(np.arccos(np.clip(
+                            float(gy @ gd) / max(ny * nd, 1e-9), -1.0, 1.0)))), grip_dense=ny)
+                    rec[f"{fname}_{cname}"] = r
+            res[key] = rec
+        # the pipeline's reference: the dense imagination's flow against the real future (delta 1), seed offset 0
+        real_idx = [t + 16, t + 32]
+        if fr is not None and ("0", 0) in refs and max(real_idx) < len(fr["agentview"]):
+            ref = {}
+            iz = refs[("0", 0)][0]
+            for fi, ri, fname in ((4, real_idx[0], "near"), (8, real_idx[1], "far")):
+                rgb = self._io.compose_model_image(fr["agentview"][ri], fr["wrist"][ri], processor=self.processor,
+                                                   concatenation=self.concatenation, width=self.input_w, height=self.input_h)
+                rgb = np.asarray(rgb)
+                for cname, cs in cams.items():
+                    fl = flow([iz[:, cs], iz[:, cs]], [refs[("0", 0)][fi][:, cs], rgb[:, cs]])
+                    mr = np.linalg.norm(fl[1], axis=0)
+                    m = mr >= np.quantile(mr, 0.8)
+                    ref[f"{fname}_{cname}"] = {"dense_over_real": float(np.linalg.norm(fl[0], axis=0)[m].mean() / max(mr[m].mean(), 1e-6))}
+            out["real_ref"] = ref
+        lat1 = self._sm_cache.get(("real", call_index, 1.0))
+        if lat1 is not None:
+            z1 = rearrange(lat1[0, :, 1:].float(), "c (f a) (h b) (w e) -> f (h w) (c a b e)", a=pt, b=ph, e=pw)
+            out["real1_f32"] = base64.b64encode(z1.reshape(-1, z1.shape[-1]).cpu().numpy().astype(np.float32).tobytes()).decode()
+        out["probes"] = res
         return out
 
     def _mem_kwargs(self, runner, key) -> dict:

@@ -101,6 +101,7 @@ class JointCaseStudyRunner:
         self._prompt_cache.clear()
         self._layers = None
         self._memory.clear()
+        self._mech_call = 0
 
     # ------------------------------------------------------------------ helpers
     def _encode_prompt(self, prompt: str) -> tuple[torch.Tensor, torch.Tensor, int]:
@@ -446,6 +447,246 @@ class JointCaseStudyRunner:
         kh = rearrange(k, "b s (n d) -> b n s d", n=self.num_heads)[0].float()
         return (qh @ kh.transpose(-1, -2)) * (qh.shape[-1] ** -0.5)
 
+    KVAL_DIM = 64
+
+    def _kval(self, q: torch.Tensor, k_all: torch.Tensor, v_all: torch.Tensor, mask: Optional[torch.Tensor], f0: int,
+              n_act: int) -> tuple[torch.Tensor, float]:
+        """shrinkage-mechanism: the action rows' o - c_bar = m (f_bar - c_bar) of one layer (per head, before the output
+        projection; "present" = frame 0 + action keys, f_bar / c_bar normalized within future / present keys), as a fixed
+        64-dim random sketch of the flattened [H, A, Dh] tensor (inner products preserved in expectation), and the mean
+        future share m."""
+        logits = self._head_logits(q, k_all)
+        if mask is not None:
+            logits = logits + mask[0].float()
+        p = torch.softmax(logits, dim=-1)  # [H, A, K]
+        vh = rearrange(v_all, "b s (n d) -> b n s d", n=self.num_heads)[0].float()  # [H, K, Dh]
+        nf = int(k_all.shape[1]) - f0 - n_act
+        pf = p[..., f0:f0 + nf]
+        m = pf.sum(dim=-1, keepdim=True)
+        o_f = pf @ vh[:, f0:f0 + nf]
+        o_c = p[..., :f0] @ vh[:, :f0] + p[..., f0 + nf:] @ vh[:, f0 + nf:]
+        delta = (o_f - m * o_c / (1.0 - m).clamp_min(1e-6)).reshape(-1)
+        key = (int(delta.numel()), str(delta.device))
+        if getattr(self, "_kval_proj", None) is None or self._kval_proj[0] != key:
+            g = torch.Generator(device="cpu").manual_seed(4321)
+            proj = torch.randn((int(delta.numel()), self.KVAL_DIM), generator=g) / math.sqrt(self.KVAL_DIM)
+            self._kval_proj = (key, proj.to(delta.device))
+        return delta @ self._kval_proj[1], float(m.mean())
+
+    # ---- shrinkage-mechanism: the diagnostic video forward (explicit attention, path split, noise, patching, lens)
+    def _mech_forward(self, pre_v: dict, kv0: list, rows: torch.Tensor, f0: int, grid: sel.Grid, bias: float = 0.0,
+                      selfkey_nobias: bool = False, noise: Optional[dict] = None, patch: Optional[dict] = None,
+                      dense: Optional[dict] = None, capture: bool = False, stats: bool = False) -> dict:
+        """shrinkage-mechanism: the video stream over the future ``rows`` (frame-0 K/V prepended; video rows never see actions),
+        with fp32 softmax attention split into the frame-0 and future paths. ``bias``: added to every future key (log(N / n));
+        ``selfkey_nobias``: not to the query's own key. ``noise`` {"layers": set, "scale", "subsets": (a, b)}: every row's
+        attention output + scale (o_a - o_b) / sqrt(2), o_a / o_b the outputs over frame 0 + one random subset (key bias
+        log(Kf / |a|)). ``patch`` {"layers": set, "path": all | fut}: the rows' attention output (all) or future path (fut)
+        taken from ``dense`` (its capture). -> {x0 [n, D] (token layout, fp32), hidden [L][n, Dm] (if capture), out / out_f
+        (capture), stats per layer (if stats and dense)}."""
+        dev = pre_v["tokens"].device
+        rows = rows.to(dev)
+        n = int(rows.numel())
+        kf = grid.num_future
+        idx_abs = rows + f0
+        x = pre_v["tokens"][:, idx_abs]
+        freqs, tmod, ctxm, t_rows = pre_v["freqs"][idx_abs], pre_v["t_mod"][:, idx_abs], pre_v["context_mask"][:, idx_abs], pre_v["t"][:, idx_abs]
+        hn = self.num_heads
+        col_bias = torch.zeros(f0 + n, device=dev)
+        col_bias[f0:] = bias
+        pos = {} if dense is None else {int(j): i for i, j in enumerate(dense["rows"].tolist())}
+        di = None if dense is None else torch.tensor([pos[int(j)] for j in rows.tolist()], device=dev)
+        cap: dict = {"hidden": [], "out": [], "out_f": []} if capture else {}
+        st: list = []
+        if stats:
+            # attention categories of a (query row, key) pair: self, same-frame 3x3 neighbours (same camera block), same
+            # frame other, other future frame, frame 0 same (h, w), frame 0 other
+            fr_r, rem_r = rows // grid.per_frame, rows % grid.per_frame
+            hr, wr = rem_r // grid.width, rem_r % grid.width
+            cam_r = wr >= grid.width // 2
+            keys_f = rows
+            fr_k, rem_k = keys_f // grid.per_frame, keys_f % grid.per_frame
+            hk, wk = rem_k // grid.width, rem_k % grid.width
+            same_f = fr_r[:, None] == fr_k[None]
+            near = same_f & (cam_r[:, None] == (wk >= grid.width // 2)[None]) & ((hr[:, None] - hk[None]).abs() <= 1) & (
+                (wr[:, None] - wk[None]).abs() <= 1)
+            eye = rows[:, None] == keys_f[None]
+            cats_f = torch.stack([eye, near & ~eye, same_f & ~near & ~eye, ~same_f])  # [4, n, n]
+            f0_same = torch.zeros((n, f0), dtype=torch.bool, device=dev)
+            f0_same[torch.arange(n, device=dev), rem_r] = True
+        for layer in range(self.num_layers):
+            bv = self.video.blocks[layer]
+            io = self.mot._build_expert_attention_io(expert=self.video, block=bv, x=x, freqs=freqs, t_mod=tmod)
+            k = torch.cat([kv0[layer]["k"], io[1]], dim=1)
+            v = torch.cat([kv0[layer]["v"], io[2]], dim=1)
+            logits = self._head_logits(io[0], k) + col_bias  # [H, n, f0 + n]
+            if selfkey_nobias and bias != 0.0:
+                ar = torch.arange(n, device=dev)
+                logits[:, ar, f0 + ar] -= bias
+            p = torch.softmax(logits, dim=-1)
+            vh = rearrange(v, "b s (h d) -> b h s d", h=hn)[0].float()
+            o0 = p[..., :f0] @ vh[:, :f0]
+            of = p[..., f0:] @ vh[:, f0:]
+            out = o0 + of
+            if noise is not None and layer in noise["layers"] and float(noise["scale"]) != 0.0:
+                ests = []
+                for sub in noise["subsets"]:
+                    sub = sub.to(dev)
+                    ks = torch.cat([kv0[layer]["k"], io[1][:, sub]], dim=1)
+                    vs = torch.cat([kv0[layer]["v"], io[2][:, sub]], dim=1)
+                    lg = self._head_logits(io[0], ks)
+                    lg[..., f0:] += math.log(kf / int(sub.numel()))
+                    ests.append(torch.softmax(lg, dim=-1) @ rearrange(vs, "b s (h d) -> b h s d", h=hn)[0].float())
+                out = out + float(noise["scale"]) * (ests[0] - ests[1]) / math.sqrt(2.0)
+            if patch is not None and layer in patch["layers"]:
+                if patch["path"] == "all":
+                    out = dense["out"][layer][:, di]
+                else:
+                    out = o0 + dense["out_f"][layer][:, di]
+            if capture:
+                cap["out"].append(out)
+                cap["out_f"].append(of)
+            if stats and dense is not None:
+                pm = p.mean(dim=0)  # [n, f0 + n]
+                pk = pm[:, f0:]
+                row = {"self": float((pk * cats_f[0]).sum(dim=1).mean()), "near": float((pk * cats_f[1]).sum(dim=1).mean()),
+                       "frame_other": float((pk * cats_f[2]).sum(dim=1).mean()), "other_frame": float((pk * cats_f[3]).sum(dim=1).mean()),
+                       "f0_same": float((pm[:, :f0] * f0_same).sum(dim=1).mean()), "f0_other": float((pm[:, :f0] * ~f0_same).sum(dim=1).mean())}
+                df_, d0_ = dense["out_f"][layer][:, di], dense["out"][layer][:, di] - dense["out_f"][layer][:, di]
+                row.update(norm_f=float(of.norm(dim=-1).mean()), norm_0=float(o0.norm(dim=-1).mean()),
+                           norm_f_dense=float(df_.norm(dim=-1).mean()), norm_0_dense=float(d0_.norm(dim=-1).mean()),
+                           proj_f=float((of * df_).sum() / (df_ * df_).sum().clamp_min(1e-12)),
+                           proj_0=float((o0 * d0_).sum() / (d0_ * d0_).sum().clamp_min(1e-12)))
+                st.append(row)
+            merged = rearrange(out[None], "b h s d -> b s (h d)").to(x.dtype)
+            x = self._post(bv, io, merged, {"context": pre_v["context"], "mask": ctxm})
+            if capture:
+                cap["hidden"].append(x[0].float())
+            if stats and dense is not None:
+                hs, hd = x[0].float(), dense["hidden"][layer][di]
+                coef = (hs * hd).sum(dim=-1, keepdim=True) / (hd * hd).sum(dim=-1, keepdim=True).clamp_min(1e-12)
+                par = coef * hd
+                st[-1]["sig_noise"] = float(((hs - par) ** 2).sum() / (par ** 2).sum().clamp_min(1e-12))
+                st[-1]["hidden_rel"] = float((hs - hd).norm() / hd.norm())
+        vel = self.video.head(x, t_rows)
+        sig = pre_v["sigma"]
+        x_tok = pre_v["x_tok"][0, idx_abs].float()
+        out = {"rows": rows, "x0": x_tok - sig * vel[0].float(), "stats": st}
+        if capture:
+            out.update(cap)
+        return out
+
+    def _lens_update(self, key, hidden: list, target: torch.Tensor) -> None:
+        """shrinkage-mechanism tuned lens: accumulate the ridge statistics of hidden [L][n, Dm] -> target [n, D] per layer."""
+        acc = self._lens_acc.setdefault(key, [None] * len(hidden))
+        for l, h in enumerate(hidden):
+            xa = torch.cat([h.float(), torch.ones((h.shape[0], 1), dtype=torch.float32, device=h.device)], dim=1)
+            if acc[l] is None:
+                acc[l] = [xa.T @ xa, xa.T @ target.float(), 0]
+            else:
+                acc[l][0] += xa.T @ xa
+                acc[l][1] += xa.T @ target.float()
+            acc[l][2] += int(h.shape[0])
+
+    def _lens_save(self, path: str, ridge: float = 1e-3) -> None:
+        out = {}
+        for key, acc in self._lens_acc.items():
+            ws = []
+            for xtx, xty, n in acc:
+                lam = ridge * float(torch.diagonal(xtx).mean())
+                a = xtx.double() + lam * torch.eye(xtx.shape[0], dtype=torch.float64, device=xtx.device)
+                ws.append(torch.linalg.solve(a, xty.double()).float().cpu())
+            out[key] = {"w": ws, "n": acc[0][2]}
+        torch.save(out, path)
+
+    @staticmethod
+    def _lens_pred(w: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+        return torch.cat([h.float(), torch.ones((h.shape[0], 1), device=h.device)], dim=1) @ w.to(h.device)
+
+    @staticmethod
+    def _mech_path(path: str) -> Path:
+        """A lens file path from a casestudy config: relative paths resolve against the FastWAM checkout."""
+        p = Path(path)
+        return p if p.is_absolute() else Path(__file__).resolve().parents[3] / p
+
+    def _mech_step(self, pre_v: dict, kv0: list, latents: torch.Tensor, vel_tokens: torch.Tensor, t_s: torch.Tensor, grid: sel.Grid,
+                   f0: int, seed: int, s: int, patch: tuple[int, int, int]) -> dict:
+        """shrinkage-mechanism (dense arm, beside the pass): on this step's latents the explicit-attention dense forward (the
+        reference) and every configured diagnostic forward -> kappa / e_x per spec, per-layer stats, per-layer lens kappa_l;
+        tuned-lens fitting (``lens_fit``) or applying (``lens_apply``)."""
+        mc = self.cfg.mech
+        pt, ph, pw = patch
+        kf = grid.num_future
+        sig = t_s.float() / float(self.model.infer_video_scheduler.num_train_timesteps)
+        x_tok = rearrange(latents, "b c (f x) (h y) (w z) -> b (f h w) (x y z c)", x=pt, y=ph, z=pw)
+        pre = {**pre_v, "sigma": sig, "x_tok": x_tok}
+        allf = torch.arange(kf, device=latents.device)
+        dense = self._mech_forward(pre, kv0, allf, f0, grid, capture=True)
+        dense["rows"] = allf
+        y = dense["x0"]
+        z = x_tok[0, :f0].float()[allf % grid.per_frame]
+        main = x_tok[0, f0:].float() - sig * vel_tokens[0, f0:].float()
+        out: dict = {"dense": {"e_main": float((y - main).norm() / main.norm()), "sigma": float(sig)}}
+        if mc.get("lens_fit"):
+            if not hasattr(self, "_lens_acc"):
+                self._lens_acc = {}
+            self._lens_update(s, dense["hidden"], y)
+            self._lens_save(str(self._mech_path(mc["lens_fit"])))
+            out["dense"]["lens_n"] = int(self._lens_acc[s][0][2])
+        lens = None
+        if mc.get("lens_apply"):
+            if getattr(self, "_lens_cache", None) is None:
+                self._lens_cache = torch.load(str(self._mech_path(mc["lens_apply"])))
+            lens = self._lens_cache.get(s)
+            if lens is not None:
+                yc = y - y.mean(dim=0)
+                out["dense"]["lens_sse"] = [float(((self._lens_pred(w, h) - y) ** 2).sum()) for w, h in zip(lens["w"], dense["hidden"])]
+                out["dense"]["lens_sst"] = float((yc ** 2).sum())
+
+        def kap(xh: torch.Tensor, rows: torch.Tensor) -> tuple[float, float]:
+            yy, zz = y[rows], z[rows]
+            dy = yy - zz
+            return float(((xh - zz) * dy).sum() / (dy * dy).sum()), float((xh - yy).norm() / yy.norm())
+
+        g = torch.Generator(device="cpu").manual_seed((int(seed) + 77) & 0x7FFFFFFF)
+        subsets = (torch.randperm(kf, generator=g)[:39], torch.randperm(kf, generator=g)[:39])
+        specs: list = []
+        for spec in mc.get("sets", ()):
+            rows = allf if spec == "all" else self._explore_rows(spec, grid, None).to(allf.device)
+            specs.append((spec, rows, {"bias": 0.0 if spec == "all" else math.log(kf / int(rows.numel())), "stats": True}))
+        noise_list = [("noise0", 0, self.num_layers, 0.0)] + [(f"noise{lo}_{hi}", lo, hi, 1.0) for lo, hi in mc.get("noise", ())]
+        for name, lo, hi, sc in noise_list:
+            specs.append((name, allf, {"noise": {"layers": set(range(lo, hi)), "scale": sc, "subsets": subsets}}))
+        if mc.get("patch_set"):
+            prow = self._explore_rows(mc["patch_set"], grid, None).to(allf.device)
+            for path in ("all", "fut"):
+                for lo, hi in mc.get("patch_ranges", ()):
+                    specs.append((f"patch_{path}{lo}_{hi}", prow, {"bias": math.log(kf / int(prow.numel())),
+                                                                 "patch": {"layers": set(range(lo, hi)), "path": path}}))
+        for spec in mc.get("selfkey", ()):
+            rows = self._explore_rows(spec, grid, None).to(allf.device)
+            specs.append((f"selfkey_{spec}", rows, {"bias": math.log(kf / int(rows.numel())), "selfkey_nobias": True}))
+        for name, rows, kw in specs:
+            want_stats = kw.pop("stats", False)
+            r = self._mech_forward(pre, kv0, rows, f0, grid, dense=dense, capture=lens is not None, stats=want_stats, **kw)
+            k_, e_ = kap(r["x0"], rows)
+            rec: dict = {"kappa": k_, "e_x": e_, "n": int(rows.numel())}
+            if r["stats"]:
+                rec["stats"] = r["stats"]
+            if name == "noise0":
+                rec["equal_dense"] = bool(torch.equal(r["x0"], y))
+            if name == f"patch_all0_{self.num_layers}":
+                rec["equal_dense"] = bool(torch.equal(r["x0"], y[rows]))
+            if lens is not None:
+                zz, kl, kly = z[rows], [], []
+                for w, hs, hd in zip(lens["w"], r["hidden"], dense["hidden"]):
+                    ps, pd = self._lens_pred(w, hs), self._lens_pred(w, hd[rows])
+                    kl.append(float(((ps - zz) * (pd - zz)).sum() / ((pd - zz) ** 2).sum()))
+                    kly.append(float(((ps - zz) * (y[rows] - zz)).sum() / ((y[rows] - zz) ** 2).sum()))
+                rec["kappa_l"], rec["kappa_l_y"] = kl, kly
+            out[name] = rec
+        return out
+
     @staticmethod
     def _steered_probs(logits: torch.Tensor, cols, bias: Optional[torch.Tensor], lam: float) -> torch.Tensor:
         """softmax over keys after adding ``lam * bias`` [H, Sq] to the columns ``cols`` (a slice
@@ -759,6 +1000,7 @@ class JointCaseStudyRunner:
         _capture_video: Optional[dict] = None,
         _step0_tube: Optional[Callable] = None,
         _memory_key: Any = None,
+        _real_future: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         cfg = self.cfg
         model = self.model
@@ -1094,6 +1336,9 @@ class JointCaseStudyRunner:
         dump = cfg.dump
         d_future = d_obs = d_act = d_hidden = d_cur = None
         d_latents: list[torch.Tensor] = []
+        # shrinkage-mechanism: the action rows' o - c_bar sketches [steps, even layers, 64] and future shares (record_kval)
+        kval_buf = ((torch.zeros(steps, (self.num_layers + 1) // 2, self.KVAL_DIM), torch.zeros(steps, (self.num_layers + 1) // 2))
+                    if cfg.record_kval else None)
         pre_v_freeze: Optional[dict] = None
 
         for s in range(steps):
@@ -1426,6 +1671,11 @@ class JointCaseStudyRunner:
                                 # Contiguous, so that with every token kept mFk is summed exactly like mF.
                                 steer_fut[layer] = fut.contiguous()
                                 steer_logits[layer] = logits
+                    if kval_buf is not None and layer % 2 == 0 and not biased:
+                        # shrinkage-mechanism: the action rows' o - c_bar sketch and future share (diagnostic, beside the pass)
+                        sk_, m_ = self._kval(io_a[0], k_all, v_all, amask, f0, int(io_a[1].shape[1]))
+                        kval_buf[0][s, layer // 2] = sk_.float().cpu()
+                        kval_buf[1][s, layer // 2] = m_
                     if want_share:
                         share_layers.append(share.mean())
                     if dump is not None and dump.attention:
@@ -1603,6 +1853,8 @@ class JointCaseStudyRunner:
                         v_draft, s0_zf = self._set_draft(latents_video, vel_tokens, pre_v["meta"]["grid_size"], grid, idx_rel, sigma0_v,
                                                          (pt, ph, pw), float(prune.step0_gain), prune.step0_draft,
                                                          float(prune.step0_far_lambda), prune.step0_far_lambda_wrist)
+                    if cfg.record_drafts:  # shrinkage-mechanism: the anchor step's drafts
+                        diag["drafts_f32"], diag["drafts_step"] = _f32_b64(s0_zf), 0
                     rest = torch.ones(num_future, dtype=torch.bool, device=idx_rel.device)
                     rest[idx_rel] = False
                     rest_abs = torch.nonzero(rest).flatten() + f0
@@ -1654,6 +1906,7 @@ class JointCaseStudyRunner:
                     v_draft = self._map_draft(latents_video, zf_o, grid, sig_s, (pt, ph, pw))
                 if cfg.record_drafts:
                     diag["drafts_f32"] = _f32_b64(late_st["zf"])
+                    diag["drafts_step"] = 1
                 rest = torch.ones(num_future, dtype=torch.bool, device=idx_rel.device)
                 rest[idx_rel] = False
                 upd_abs = torch.nonzero(rest).flatten() + f0 if float(prune.step0_gain) == 1.0 else torch.arange(num_future, device=idx_rel.device) + f0
@@ -1792,6 +2045,22 @@ class JointCaseStudyRunner:
                     if upd.numel():
                         x0_est[upd] = zf[upd]
             pred_video = self.video.unpatchify(vel_tokens, pre_v["meta"]["grid_size"])
+            if cfg.mech is not None and prune is None and s in cfg.mech.get("steps", (0, 1)) and getattr(self, "_mech_call", 0) < int(
+                    cfg.mech.get("calls", 10 ** 6)):
+                diag.setdefault("mech", {})[str(s)] = self._mech_step(pre_v, kv0, latents_video, vel_tokens, t_video[s], grid, f0, seed, s,
+                                                                      (pt, ph, pw))
+            if cfg.record_drafts and s in (0, 1) and (prune is None or (s == 0 and prune.step0 is None and prune.late is None and dmod is None)):
+                # shrinkage-mechanism: dense: its step-0 / step-1 clean estimate (the references) and the current frame; M4w: its
+                # step-0 drafts (the dense step-0 clean estimate).
+                sig_r = t_video[s].float() / float(model.infer_video_scheduler.num_train_timesteps)
+                zr = rearrange((latents_video.float() - sig_r * pred_video.float())[0], "c (f a) (h b) (w e) -> f (h w) (c a b e)",
+                               a=pt, b=ph, e=pw)
+                if prune is None:
+                    diag[f"drafts_y{s}_f32"] = _f32_b64(zr[1:].reshape(-1, zr.shape[-1]))
+                    if s == 0:
+                        diag["zcur_f32"] = _f32_b64(zr[0])
+                else:
+                    diag["drafts_f32"], diag["drafts_step"] = _f32_b64(zr[1:].reshape(-1, zr.shape[-1])), 0
             if s == 0 and (cfg.record_step0_x0 or e9 is not None or dmod is not None):
                 # step0-sparse E8: the step-0 clean estimate at the 39 probes (exact there on every arm); E9: step 0's
                 # latents, to redo its update once the plan is known.
@@ -2071,8 +2340,9 @@ class JointCaseStudyRunner:
                             self.video.unpatchify(vel_tokens, pre_v["meta"]["grid_size"]), d_video[0], e9_prev)
                         latents_video[:, :, 0:1] = first.clone()
                         diag["e9"] = {"mode": e9, "tokens": int(toks.numel())}
-                    if dmod is not None:
-                        # step0-explore D1 (exploratory): every future token's step-0 draft y (the dense x^0) replaced by
+                    if dmod is not None and not (dmod == "atten" and float(prune.draft_mod_scale) == 1.0):
+                        # shrinkage-mechanism: atten 1.0 leaves M4w untouched (self-check 1). step0-explore D1 (exploratory):
+                        # every future token's step-0 draft y (the dense x^0) replaced by
                         # y + e (white / low / high frequency, or white on one region) with |e| = scale |y|, or by the current
                         # frame (prior); step 0's update redone.
                         sigma0_v = t_video[0].float() / float(model.infer_video_scheduler.num_train_timesteps)
@@ -2082,6 +2352,14 @@ class JointCaseStudyRunner:
                         g_ = torch.Generator(device="cpu").manual_seed((int(seed) + 7) & 0x7FFFFFFF)
                         if dmod == "prior":
                             d = zc[grid.future_obs_index(zc.device)]
+                        elif dmod == "shift":  # shrinkage-mechanism: the change field moved one token along the row in every block
+                            zo = zc[grid.future_obs_index(zc.device)]
+                            d = zo + fv.roll_blocks(y - zo, grid)
+                        elif dmod == "real":  # shrinkage-mechanism: the encoded real future frames (adapter, per call)
+                            if _real_future is None:
+                                raise ValueError("draft_mod real needs the adapter's _real_future latents")
+                            d = rearrange(_real_future[0].float(), "c (f a) (h b) (w e) -> f (h w) (c a b e)", a=pt, b=ph,
+                                          e=pw).reshape(-1, y.shape[-1]).to(y.device)
                         elif dmod == "atten":  # the change from the current frame scaled by draft_mod_scale
                             zo = zc[grid.future_obs_index(zc.device)]
                             d = zo + float(prune.draft_mod_scale) * (y - zo)
@@ -2100,6 +2378,7 @@ class JointCaseStudyRunner:
                             d = y + e * (float(prune.draft_mod_scale) * y.norm() / e.norm())
                         if cfg.record_drafts:  # late-anchor-c4 self-check 2
                             diag["drafts_f32"] = _f32_b64(d)
+                            diag["drafts_step"] = 0
                         v_new = self._map_draft(e9_prev, d, grid, sigma0_v, (pt, ph, pw))
                         vel_tokens[:, f0:] = v_new[:, f0:].to(vel_tokens.dtype)
                         latents_video = model.infer_video_scheduler.step(self.video.unpatchify(vel_tokens, gsz), d_video[0], e9_prev)
@@ -2323,6 +2602,11 @@ class JointCaseStudyRunner:
                                    "route": bool(route_plan)}
         # Relative compute (token passes + attention): per step [video queries, video keys, action
         # queries, action keys] at layer 0, the parameter counts and the context length.
+        if kval_buf is not None:
+            diag["kval_f16"], diag["kval_m"] = _f16_b64(kval_buf[0]), [[round(float(v), 6) for v in r] for r in kval_buf[1]]
+            diag["kval_shape"] = list(kval_buf[0].shape)
+        if cfg.mech is not None:
+            self._mech_call = getattr(self, "_mech_call", 0) + 1
         diag["cost"] = {**self._cost_model(), "attn_dim": cost_dim, "ctx": int(context.shape[1]), "f0": int(f0),
                         "steps": cost_steps, "oracle_pass": oracle is not None}
         if side0 == "both":  # R3b: step 0 as the side forward computed it (its per-block rows), not the dense main pass

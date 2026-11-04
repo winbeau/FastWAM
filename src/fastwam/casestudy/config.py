@@ -88,7 +88,8 @@ from typing import Any, Optional
 METHODS = ("dense", "prune", "teacache", "noise")
 SELECTIONS = ("av", "vv", "cf", "random", "diff", "diff_global")
 STEP0 = ("b", "d")
-DRAFT_MODS = ("prior", "atten", "white", "low", "high", "wrist", "agent", "far", "near")
+DRAFT_MODS = ("prior", "atten", "white", "low", "high", "wrist", "agent", "far", "near", "shift", "real")
+MECH_KEYS = {"steps", "calls", "sets", "noise", "patch_set", "patch_ranges", "selfkey", "lens_fit", "lens_apply"}
 LATE_ORACLES = ("far", "near", "wrist", "agent", "plan", "all")
 FOVEA_METHODS = ("sink", "rep", "fov_grid", "fov_cluster", "interlace", "interlace_w", "interlace_wfar",
                  "interlace_cal", "interlace_fill", "merge", "interlace_ht")
@@ -373,6 +374,12 @@ class CaseStudyConfig:
     explore_track: bool = False
     #: late-anchor-c4: log the drafts (every future token's target clean estimate) of the late anchor (step 1) and of draft_mod.
     record_drafts: bool = False
+    #: shrinkage-mechanism: the action rows' o - c_bar per step and even layer as a 64-dim random sketch (kappa_val), and m.
+    record_kval: bool = False
+    #: shrinkage-mechanism (dense only): diagnostic video forwards beside the pass on ``steps`` of the first ``calls`` calls
+    #: of an episode: visible ``sets`` (stats), dense ``noise`` injection layer ranges, ``patch_set`` x ``patch_ranges`` path
+    #: patching, ``selfkey`` sets; tuned lens ``lens_fit`` / ``lens_apply`` (a path; relative to the FastWAM checkout).
+    mech: Optional[dict] = None
 
     def describe(self) -> dict[str, Any]:
         return asdict(self)
@@ -704,7 +711,12 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
                       for e in raw.get("explore") or ()),
         explore_track=bool(raw.get("explore_track", False)),
         record_drafts=bool(raw.get("record_drafts", False)),
+        record_kval=bool(raw.get("record_kval", False)),
+        mech=None if raw.get("mech") is None else dict(raw["mech"]),
     )
+    _require(cfg.mech is None or (cfg.method == "dense" and cfg.frame0_cache and set(cfg.mech) <= MECH_KEYS
+                                  and not (cfg.mech.get("lens_fit") and cfg.mech.get("lens_apply"))),
+             f"casestudy.mech is a dense diagnostic with keys {sorted(MECH_KEYS)} (lens_fit or lens_apply, not both)")
     p = cfg.prune
     _require(p is None or p.fovea in (None, "sink") or p.fovea_off or not (
         cfg.record_future_attn or cfg.record_video_frame0 or cfg.record_motion_steps

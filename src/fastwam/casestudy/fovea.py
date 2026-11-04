@@ -124,6 +124,18 @@ def step0_slices(periphery: torch.Tensor, probes: torch.Tensor, av: torch.Tensor
     return slices, (torch.cat(cut) if cut else periphery[:0])
 
 
+def roll_blocks(values: torch.Tensor, grid: sel.Grid, shift: int = 1) -> torch.Tensor:
+    """shrinkage-mechanism: values [Kf, D] moved ``shift`` tokens along the row (columns, cyclic) inside every (future frame,
+    camera) block: same values, same size, every one at the wrong position."""
+    half = grid.width // 2
+    j = torch.arange(grid.num_future)
+    rem = j % grid.per_frame
+    col = rem % grid.width
+    cam, c = col // half, col % half
+    src = j - col + cam * half + (c - shift) % half
+    return values[src.to(values.device)]
+
+
 def block_smooth(values: torch.Tensor, grid: sel.Grid) -> torch.Tensor:
     """step0-explore: values [Kf, D] smoothed by a 3 x 3 box mean inside every (future frame, camera) 7 x 7 block (edges:
     the mean of the cells present)."""
@@ -601,5 +613,5 @@ def make_plan(method: str, k: int, grid: sel.Grid, av: torch.Tensor, diff: torch
 
 __all__ = ["INTERLACE", "METHODS", "PROBE_CORNERS", "PROBE_SINK", "Plan", "STEP0", "add_last_extra", "fill_map", "grid_regions",
            "ht_frequencies", "ht_schedule", "interlace_slices", "interp_tokens", "kmeans", "make_plan", "probe_index",
-           "rope_freqs_at", "step0_slices", "tube_mask", "nearest_sources", "idw_fill", "align_frames", "memory_map",
+           "roll_blocks", "rope_freqs_at", "step0_slices", "tube_mask", "nearest_sources", "idw_fill", "align_frames", "memory_map",
            "select_core", "reselect"]
