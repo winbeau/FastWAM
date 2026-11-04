@@ -88,7 +88,7 @@ from typing import Any, Optional
 METHODS = ("dense", "prune", "teacache", "noise")
 SELECTIONS = ("av", "vv", "cf", "random", "diff", "diff_global")
 STEP0 = ("b", "d")
-DRAFT_MODS = ("prior", "white", "low", "high", "wrist", "agent", "far", "near")
+DRAFT_MODS = ("prior", "atten", "white", "low", "high", "wrist", "agent", "far", "near")
 FOVEA_METHODS = ("sink", "rep", "fov_grid", "fov_cluster", "interlace", "interlace_w", "interlace_wfar",
                  "interlace_cal", "interlace_fill", "merge", "interlace_ht")
 LAYER_RULES = ("min_entropy", "fixed")
@@ -222,6 +222,9 @@ class PruneConfig:
     #: the current frame (prior); step 0's update redone.
     draft_mod: Optional[str] = None
     draft_mod_scale: float = 0.5
+    #: step0-explore: the probes' change from the current frame scaled by this gain before it drafts the other tokens (step0 b / d
+    #: and the side0 video / draft / both outputs; 1 = off).
+    step0_gain: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -429,6 +432,7 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             reselect_step=None if block.get("reselect_step") is None else int(block["reselect_step"]),
             draft_mod=None if block.get("draft_mod") is None else str(block["draft_mod"]),
             draft_mod_scale=float(block.get("draft_mod_scale", 0.5)),
+            step0_gain=float(block.get("step0_gain", 1.0)),
         )
         if prune.fovea is not None or prune.fovea_off:
             _require(prune.fovea in FOVEA_METHODS, f"prune.fovea must be one of {FOVEA_METHODS} (fovea_off needs a method)")
@@ -465,6 +469,8 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
         _require(prune.draft_mod is None or (prune.draft_mod in DRAFT_MODS and prune.fovea == "interlace_w" and not r2
                                               and prune.step0 is None and prune.e9 is None and prune.draft_mod_scale >= 0),
                  f"prune.draft_mod must be one of {DRAFT_MODS} on plain interlace_w")
+        _require(prune.step0_gain == 1.0 or (prune.step0_gain > 0 and (prune.step0 is not None or prune.side0_use in ("draft", "both", "video"))),
+                 "prune.step0_gain (> 0) is for step0 or the side0 video / draft / both outputs")
         _require(prune.draft_from is None or 0 <= prune.draft_from <= 10, "prune.draft_from must be in [0, 10]")
         _require(not (prune.mem_route or prune.mem_direct) or prune.mem, "prune.mem_route / mem_direct need prune.mem")
         _require(prune.reselect_step is None or (prune.mem_route and 1 <= prune.reselect_step < 10),

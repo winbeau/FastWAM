@@ -143,14 +143,20 @@ class JointCaseStudyRunner:
         return torch.softmax(self._head_logits(q, k) + mask[0].float(), dim=-1).mean(dim=0)
 
     def _probe_draft(self, latents: torch.Tensor, vel_tokens: torch.Tensor, grid_size, grid: sel.Grid, probes: torch.Tensor,
-                     sigma: torch.Tensor, patch: tuple[int, int, int]) -> tuple[torch.Tensor, torch.Tensor]:
+                     sigma: torch.Tensor, patch: tuple[int, int, int], gain: float = 1.0) -> tuple[torch.Tensor, torch.Tensor]:
         """step0-sparse: the clean estimate x - sigma v of the ``probes`` interpolated over every future block
         (``fv.interp_tokens``) -> (draft velocity (x - x0) / sigma in the token layout of ``vel_tokens`` [1, f0 + Kf, D]
-        (fp32), interpolated clean estimate of the future tokens [Kf, D'] in the Diff layout (fp32))."""
+        (fp32), interpolated clean estimate of the future tokens [Kf, D'] in the Diff layout (fp32)). step0-explore: ``gain``
+        scales the probes' change from the current frame at the same (h, w) before the interpolation (1: untouched)."""
         pt, ph, pw = patch
         x0 = latents.float() - sigma * self.video.unpatchify(vel_tokens, grid_size).float()
         z = rearrange(x0[0], "c (f a) (h b) (w e) -> f (h w) (c a b e)", a=pt, b=ph, e=pw)
-        zf = fv.interp_tokens(z[1:].reshape(-1, z.shape[-1]), grid, probes)
+        zfut = z[1:].reshape(-1, z.shape[-1])
+        if gain != 1.0:
+            zc = z[0][grid.future_obs_index(z.device)][probes]
+            zfut = zfut.clone()
+            zfut[probes] = zc + gain * (zfut[probes] - zc)
+        zf = fv.interp_tokens(zfut, grid, probes)
         z_int = torch.cat([z[:1], zf.reshape(z.shape[0] - 1, z.shape[1], -1)], dim=0)
         x0_int = rearrange(z_int, "f (h w) (c a b e) -> c (f a) (h b) (w e)", h=grid.height, a=pt, b=ph, e=pw)[None]
         v = (latents.float() - x0_int) / sigma
@@ -1496,11 +1502,13 @@ class JointCaseStudyRunner:
                     # uncomputed future tokens move along (x - x0) / sigma_0 until computed. Plan b's Diff reads it.
                     sigma0_v = t_video[0].float() / float(model.infer_video_scheduler.num_train_timesteps)
                     v_draft, s0_zf = self._probe_draft(latents_video, vel_tokens, pre_v["meta"]["grid_size"], grid,
-                                                       idx_rel, sigma0_v, (pt, ph, pw))
+                                                       idx_rel, sigma0_v, (pt, ph, pw), gain=float(prune.step0_gain))
                     rest = torch.ones(num_future, dtype=torch.bool, device=idx_rel.device)
                     rest[idx_rel] = False
                     rest_abs = torch.nonzero(rest).flatten() + f0
                     vel_tokens[:, rest_abs] = v_draft[:, rest_abs].to(vel_tokens.dtype)
+                    if float(prune.step0_gain) != 1.0:  # step0-explore: the probes move along their corrected change too
+                        vel_tokens[:, f0 + idx_rel] = v_draft[:, f0 + idx_rel].to(vel_tokens.dtype)
             sig_s = t_video[s].float() / float(model.infer_video_scheduler.num_train_timesteps)
             gsz = pre_v["meta"]["grid_size"]
             side_pred = None
@@ -1512,13 +1520,16 @@ class JointCaseStudyRunner:
                                           f0, num_future, self._layers["act"])
                 tmp = vel_tokens.clone()
                 tmp[:, f0 + probes] = side["vel"]
-                v_draft, zf_side = self._probe_draft(latents_video, tmp, gsz, grid, probes, sig_s, (pt, ph, pw))
+                v_draft, zf_side = self._probe_draft(latents_video, tmp, gsz, grid, probes, sig_s, (pt, ph, pw),
+                                                     gain=float(prune.step0_gain))
                 if side0 in ("draft", "both", "video"):  # step0-explore D2: video only / action only
                     rest = torch.ones(num_future, dtype=torch.bool, device=probes.device)
                     rest[probes] = False
                     rest_abs = torch.nonzero(rest).flatten() + f0
                     vel_tokens[:, f0 + probes] = side["vel"]
                     vel_tokens[:, rest_abs] = v_draft[:, rest_abs].to(vel_tokens.dtype)
+                    if float(prune.step0_gain) != 1.0:
+                        vel_tokens[:, f0 + probes] = v_draft[:, f0 + probes].to(vel_tokens.dtype)
                 if side0 in ("draft", "both", "action"):
                     side_pred = side["pred_action"]
                 if side0 in ("plan", "both"):
@@ -1838,6 +1849,9 @@ class JointCaseStudyRunner:
                         g_ = torch.Generator(device="cpu").manual_seed((int(seed) + 7) & 0x7FFFFFFF)
                         if dmod == "prior":
                             d = zc[grid.future_obs_index(zc.device)]
+                        elif dmod == "atten":  # the change from the current frame scaled by draft_mod_scale
+                            zo = zc[grid.future_obs_index(zc.device)]
+                            d = zo + float(prune.draft_mod_scale) * (y - zo)
                         else:
                             e = torch.randn(y.shape, generator=g_).to(y.device)
                             if dmod == "low":
