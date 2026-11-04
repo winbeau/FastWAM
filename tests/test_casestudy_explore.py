@@ -1,5 +1,6 @@
 """CPU checks of the step0-explore round (``fovea.block_smooth``, probe grid, layouts, explore / draft_mod config)."""
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -113,3 +114,16 @@ def test_late_config_and_core_all():
     assert torch.equal(p.core, fv.select_core(av, df, sinks, 20))  # the core may hold unmeasured (far-frame) tokens
     assert torch.equal(torch.sort(torch.cat(p.slices + [p.truncated])).values, p.periphery)
     assert set(p.slices[(9 - 1) % 8].tolist()) <= set(measured.tolist())
+
+
+def test_c2f_plan_last_extra():
+    av = torch.rand(196, generator=torch.Generator().manual_seed(7))
+    df = torch.rand(196, generator=torch.Generator().manual_seed(8))
+    sinks = torch.tensor([182, 3, 40])
+    base = fv.c2f_plan(torch.arange(84), av, df, sinks, GRID, 39, core_all=True)
+    p = fv.c2f_plan(torch.arange(84), av, df, sinks, GRID, 39, core_all=True, last_extra=11)
+    i9 = (9 - 1) % 8
+    assert p.slices[i9].numel() == base.slices[i9].numel() + 11 and p.truncated.numel() == base.truncated.numel() - 11
+    assert torch.equal(torch.sort(torch.cat(p.slices + [p.truncated])).values, p.periphery)
+    assert abs(p.slice_bias[i9] - math.log(173 / p.slices[i9].numel())) < 1e-12
+    assert all(torch.equal(x, y) for j, (x, y) in enumerate(zip(p.slices, base.slices)) if j != i9)

@@ -264,7 +264,7 @@ def c2f_survey(probes: torch.Tensor, av: torch.Tensor, diff: torch.Tensor, sinks
 
 
 def c2f_plan(measured: torch.Tensor, av: torch.Tensor, diff: torch.Tensor, sinks: torch.Tensor, grid: sel.Grid, k: int,
-             first: int = 2, n_steps: int = 10, quota: int = R_SLOTS, core_all: bool = False) -> "Plan":
+             first: int = 2, n_steps: int = 10, quota: int = R_SLOTS, core_all: bool = False, last_extra: int = 0) -> "Plan":
     """step0-explore C2F plan of steps ``first``..n_steps-1, from the scores of the ``measured`` tokens (unmeasured: 0): sinks as
     given; the core by ``make_plan``'s rule (A->V top 10 + Diff top 10, filled by A->V) to k - sinks - quota; the measured
     periphery tokens (best A->V first) fill the last two slices, the rest of the periphery the earlier ones by raster interlace
@@ -287,6 +287,12 @@ def c2f_plan(measured: torch.Tensor, av: torch.Tensor, diff: torch.Tensor, sinks
     slices = [None] * n
     for s in range(first, n_steps):
         slices[(s - 1) % n] = sl[s - first]
+    if last_extra and cut.numel():  # step0-explore: the last step also computes the best never-computed tokens by A->V
+        a_ = av.float() if core_all else av_m
+        extra = cut[torch.argsort(-a_[cut], stable=True)][:last_extra]
+        i9 = (n_steps - 1 - 1) % n
+        slices[i9] = torch.sort(torch.cat([slices[i9], extra])).values
+        cut = cut[~torch.isin(cut, extra)]
     bias = [math.log(int(periphery.numel()) / int(x.numel())) if x.numel() else 0.0 for x in slices]
     fixed = torch.sort(torch.cat([sinks.cpu(), core])).values
     return Plan("interlace_w", sinks.cpu(), core, periphery, fixed, slices=slices, truncated=cut, slice_bias=bias)

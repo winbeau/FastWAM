@@ -1835,7 +1835,8 @@ class JointCaseStudyRunner:
                 r_[out_] = float("-inf")
                 sinks_l = torch.cat([torch.tensor([fv.PROBE_SINK], device=r_.device), torch.topk(r_, fv.N_SINKS - 1).indices])
                 fplan = fv.c2f_plan(rows1.cpu(), av_full.cpu(), df_full.cpu(), sinks_l.cpu(), grid,
-                                    max(1, int(round(prune.keep_ratio * num_future))), core_all=True).to(kept.device)
+                                    max(1, int(round(prune.keep_ratio * num_future))), core_all=True,
+                                    last_extra=int(prune.late_extra)).to(kept.device)
                 kept = fplan.fixed
                 diag["late"].update(core=fplan.core.tolist(), sinks=fplan.sinks.tolist(), slices=[int(x.numel()) for x in fplan.slices],
                                     truncated=int(fplan.truncated.numel()))

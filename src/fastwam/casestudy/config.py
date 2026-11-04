@@ -237,6 +237,8 @@ class PruneConfig:
     #: step0-explore late anchor (step0 b): step 0 computes no future token (they stay on pure noise); step 1 computes this set
     #: (``_explore_rows``), drafts every other token from it (step0_draft, step0_gain) and gives the plan of steps 2-9.
     late: Optional[str] = None
+    #: late anchor: step 9's slice also computes this many never-computed tokens (best A->V), spending the FLOPs headroom.
+    late_extra: int = 0
 
 
 @dataclass(frozen=True)
@@ -450,6 +452,7 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             step0_draft=str(block.get("step0_draft", "grid")),
             step0_far_lambda=float(block.get("step0_far_lambda", 0.5)),
             late=None if block.get("late") is None else str(block["late"]),
+            late_extra=int(block.get("late_extra", 0)),
         )
         if prune.fovea is not None or prune.fovea_off:
             _require(prune.fovea in FOVEA_METHODS, f"prune.fovea must be one of {FOVEA_METHODS} (fovea_off needs a method)")
@@ -491,6 +494,7 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
         _require(prune.step0_draft in ("grid", "idw", "near") and (prune.step0 is not None or (prune.step0_rows is None
                  and prune.step0_draft == "grid")) and (prune.step0_draft != "grid" or prune.step0_rows in (None, "grid39")),
                  "prune.step0_rows / step0_draft (grid needs the probe grid; idw / near any set) are step0 options")
+        _require(prune.late_extra >= 0 and (prune.late_extra == 0 or prune.late is not None), "prune.late_extra (>= 0) needs prune.late")
         _require(prune.late is None or (prune.step0 == "b" and prune.step0_draft in ("idw", "near") and prune.c2f is None
                                         and not prune.step0_all and prune.step0_rows is None), "prune.late needs step0 b with idw / near drafts")
         _require(prune.c2f is None or (prune.step0 == "b" and not prune.step0_all and prune.c2f >= 1), "prune.c2f (>= 1) needs prune.step0 b")
