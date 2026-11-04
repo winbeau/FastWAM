@@ -79,6 +79,14 @@ Options (``policy.options``):
                          final future latents) and, for each valid delta, F_real (the clip of the current frame and frames
                          t + round(4 i delta), i = 1..8, through the VAE, injected). ``decode_dir`` saves dense's decoded
                          future at seed offset 0. Logged in ``diagnostics.inject``.
+``region_attrib``        optional {frames_dir, plan_dir, seeds}: region-attrib. The executed dense arm replays the rollout
+                         re-rendered in ``<frames_dir>/<episode>.npz`` (future-inject). ``<plan_dir>/<episode>.npz`` lists the
+                         ``calls``, the condition ``names`` / ``sources`` (static / half / fade), token ``masks`` [calls, conds,
+                         2, 98] and ``ok`` [calls, conds]. On a listed call and seed offset: ``base`` (F_real(1), with the action
+                         rows' attention on the future keys at every layer), ``Fr0`` (the static future, the current frame x 9)
+                         and every ok condition: the masked future tokens of F_real(1) replaced by the static future, the
+                         delta = 0.5 future (half) or static + 0.5 (real - static) (fade). Also each future token's latent change
+                         against the frame-0 latent and against the static future. Logged in ``diagnostics.region_attrib``.
 
 ``step0_tube``           optional {file, suite} for arms with ``prune.step0: d`` (step0-sparse plan D): a JSON with ``M``
                          (3 x 3, summed simulator action xyz -> end-effector displacement in m) and ``cameras``
@@ -344,6 +352,18 @@ class FastWAMJointPolicy:
             self.inject_sparse = make_runner(self.model, parse_config(f["sparse"]), prompt_store=self.prompt_store)
             if self.casestudy.seed_mode != "episode_call_hash" or self.casestudy.method != "dense":
                 raise ValueError("inject_future needs a dense executed arm with seed_mode=episode_call_hash")
+        self.region = None
+        self._ra_frames = None
+        self._ra_plan = None
+        if options.get("region_attrib") is not None:
+            f = dict(options["region_attrib"])
+            unknown = sorted(set(f) - {"frames_dir", "plan_dir", "seeds"})
+            if unknown or not f.get("frames_dir") or not f.get("plan_dir"):
+                raise ValueError(f"region_attrib needs frames_dir and plan_dir (unknown keys: {unknown})")
+            self.region = {"frames_dir": Path(str(f["frames_dir"])), "plan_dir": Path(str(f["plan_dir"])),
+                           "seeds": [int(x) for x in f.get("seeds") or [0]]}
+            if self.casestudy.seed_mode != "episode_call_hash" or self.casestudy.method != "dense":
+                raise ValueError("region_attrib needs a dense executed arm with seed_mode=episode_call_hash")
         self._repeat_offset = 0
         self.episode_plans = {}
         self.episode_plans_sha256 = None
@@ -411,6 +431,8 @@ class FastWAMJointPolicy:
             "inject_future": None if self.inject is None else {
                 **{k: str(v) if isinstance(v, Path) else v for k, v in self.inject.items()},
                 "sparse": self.inject_sparse.cfg.describe()},
+            "region_attrib": None if self.region is None else {
+                k: str(v) if isinstance(v, Path) else v for k, v in self.region.items()},
         }
         notes = (
             "FastWAM-Joint through its native Hydra build and shared policy_io transforms; the benchmark "
@@ -473,6 +495,19 @@ class FastWAMJointPolicy:
                 self._inject_frames = {k: z[k] for k in ("agentview", "wrist", "deltas", "call_ok", "valid")}
             if [float(x) for x in self._inject_frames["deltas"]] != self.inject["deltas"]:
                 raise ValueError(f"inject_future: {path} has deltas {self._inject_frames['deltas']}, not {self.inject['deltas']}")
+        if self.region is not None:
+            ep = _re.sub(r'-r[0-9]+.*$', '', episode_id)
+            fpath, ppath = self.region["frames_dir"] / f"{ep}.npz", self.region["plan_dir"] / f"{ep}.npz"
+            if not fpath.is_file() or not ppath.is_file():
+                raise FileNotFoundError(f"region_attrib: no rendered frames {fpath} or plan {ppath}")
+            with np.load(fpath) as z:
+                self._ra_frames = {k: z[k] for k in ("agentview", "wrist")}
+            with np.load(ppath) as z:
+                self._ra_plan = {"calls": [int(c) for c in z["calls"]], "names": [str(n) for n in z["names"]],
+                                 "sources": [str(s) for s in z["sources"]], "masks": z["masks"].astype(bool),
+                                 "ok": z["ok"].astype(bool)}
+            if not set(self._ra_plan["sources"]) <= {"static", "half", "fade"}:
+                raise ValueError(f"region_attrib: unknown sources in {ppath}: {sorted(set(self._ra_plan['sources']))}")
 
     def predict(self, observation: dict) -> Prediction:
         torch = self._torch
@@ -551,6 +586,8 @@ class FastWAMJointPolicy:
                 diag["shrink"] = self._shrink_metrics(diag["probes"], image, images, call_index)
         if self.inject is not None:
             diag["inject"] = self._inject_call(runner, call_index, prompt, image, proprio, images, action, video_cap)
+        if self.region is not None:
+            diag["region_attrib"] = self._region_call(runner, call_index, prompt, image, proprio, images)
         return Prediction(
             actions=actions,
             timing={"predict_seconds": round(time.perf_counter() - started, 6), "model_seconds": round(model_seconds, 6)},
@@ -609,6 +646,71 @@ class FastWAMJointPolicy:
                 inj["decode_dir"].mkdir(parents=True, exist_ok=True)
                 np.savez_compressed(inj["decode_dir"] / f"{self._episode_id}-c{call_index:02d}.npz", dense_future=runner.decode_video(vid))
         out["entries"] = entries
+        return out
+
+    def _region_call(self, runner, call_index: int, prompt, image, proprio, images: dict) -> dict:
+        """region-attrib (option ``region_attrib``): on a planned call and every seed offset, F_real(1) unmodified (``base``,
+        with the attention capture), the static future (``Fr0``) and every ok condition of the plan, all through
+        ``infer_inject``. A condition replaces its masked future tokens (both latent frames as the mask says) of F_real(1)
+        by the static future (the current frame x 9, delta = 0), the delta = 0.5 future (``half``) or static + 0.5 (real -
+        static) (``fade``)."""
+        import base64
+
+        from fastwam.casestudy import fovea as fv
+
+        torch = self._torch
+        plan, fr = self._ra_plan, self._ra_frames
+        if call_index not in plan["calls"]:
+            return {"used": False}
+        ci = plan["calls"].index(call_index)
+        t = 10 * call_index  # frame index of this call's observation: after 10 c executed steps
+        out: dict = {"used": True, "current_frame_equal": bool(np.array_equal(fr["agentview"][t], images["agentview"])
+                                                               and np.array_equal(fr["wrist"][t], images["wrist"]))}
+
+        def model_frame(j: int):
+            rgb = self._io.compose_model_image(fr["agentview"][j], fr["wrist"][j], processor=self.processor,
+                                               concatenation=self.concatenation, width=self.input_w, height=self.input_h)
+            return self._io.image_to_model_tensor(rgb, device=self.device, dtype=self.model.torch_dtype)
+
+        def future(delta: float):
+            clip = torch.cat([image] + [model_frame(t + int(round(4 * i * delta))) for i in range(1, 9)], dim=0)
+            return runner.encode_clip(clip)[:, :, 1:]
+
+        ok = plan["ok"][ci]
+        z1, zs = future(1.0), future(0.0)
+        src = {"static": zs,
+               "half": future(0.5) if any(s == "half" and o for s, o in zip(plan["sources"], ok)) else None,
+               "fade": (zs.float() + 0.5 * (z1.float() - zs.float())).to(z1.dtype)}
+        nf, lh, lw = (int(x) for x in z1.shape[2:])
+        ph, pw = int(runner.video.patch_size[1]), int(runner.video.patch_size[2])
+        gh, gw = lh // ph, lw // pw
+        if plan["masks"].shape[2:] != (nf, gh * gw):
+            raise ValueError(f"region_attrib: plan masks {plan['masks'].shape[2:]} do not match the grid ({nf}, {gh * gw})")
+        first = self.model._encode_input_image_latents_tensor(input_image=image, tiled=False)
+        out["diff_z0"] = fv.token_norms(z1.float() - first.float(), gh, gw, ph, pw).cpu().tolist()
+        out["diff_static"] = fv.token_norms(z1.float() - zs.float(), gh, gw, ph, pw).cpu().tolist()
+        conds = [(name, torch.where(fv.token_latent_mask(plan["masks"][ci, k], gh, gw, ph, pw).to(z1.device),
+                                    src[plan["sources"][k]], z1))
+                 for k, name in enumerate(plan["names"]) if ok[k]]
+        common = dict(prompt=prompt, input_image=image, proprio=proprio, action_horizon=self.action_horizon,
+                      num_video_frames=self.num_video_frames, sigma_shift=self.sigma_shift, rand_device=self.rand_device)
+        entries, attn = {}, {}
+        for j in self.region["seeds"]:
+            seed = self._call_seed(self._episode_key, call_index, j + self._repeat_offset)
+            cap: dict = {}
+            a_b, _ = runner.infer_inject(seed=seed, future_latents=z1, _attn_capture=cap, **common)
+            entries[f"base@{j}"] = self._chunk_logs(a_b)
+            av = cap["av"]
+            attn[f"base@{j}"] = {"shape": list(av.shape[1:]),
+                                 "av_mean_f32": base64.b64encode(av.mean(dim=0).numpy().astype(np.float32).tobytes()).decode(),
+                                 "av_step0_f32": base64.b64encode(av[0].numpy().astype(np.float32).tobytes()).decode(),
+                                 "f0_mean": cap["f0"].mean(dim=0).tolist()}
+            a_0, _ = runner.infer_inject(seed=seed, future_latents=zs, **common)
+            entries[f"Fr0@{j}"] = self._chunk_logs(a_0)
+            for name, z in conds:
+                a_c, _ = runner.infer_inject(seed=seed, future_latents=z, **common)
+                entries[f"{name}@{j}"] = self._chunk_logs(a_c)
+        out["entries"], out["attn"] = entries, attn
         return out
 
     def _hybrid_call(self, runner, call_index: int, prompt, image, proprio, seed: int, actions: np.ndarray):

@@ -136,6 +136,22 @@ def roll_blocks(values: torch.Tensor, grid: sel.Grid, shift: int = 1) -> torch.T
     return values[src.to(values.device)]
 
 
+def token_latent_mask(mask, height: int, width: int, patch_h: int, patch_w: int) -> torch.Tensor:
+    """region-attrib: a token mask [frames, height * width] (tokens flattened as (h w), the video patch embedding's order) ->
+    the latent mask [1, 1, frames, height * patch_h, width * patch_w]; token (f, r, c) covers latent rows r * patch_h ...
+    (r + 1) * patch_h - 1 and columns c * patch_w ... (c + 1) * patch_w - 1 of latent frame f."""
+    mt = torch.as_tensor(mask, dtype=torch.bool).reshape(-1, height, width)
+    return mt.repeat_interleave(patch_h, dim=1).repeat_interleave(patch_w, dim=2)[None, None]
+
+
+def token_norms(d: torch.Tensor, height: int, width: int, patch_h: int, patch_w: int) -> torch.Tensor:
+    """region-attrib: latents [1, z, frames, height * patch_h, width * patch_w] -> [frames, height * width], each token's norm
+    over its channels x patch (fp32)."""
+    ch, nf = int(d.shape[1]), int(d.shape[2])
+    x = d[0].float().reshape(ch, nf, height, patch_h, width, patch_w)
+    return x.pow(2).sum(dim=(0, 3, 5)).sqrt().reshape(nf, height * width)
+
+
 def block_smooth(values: torch.Tensor, grid: sel.Grid) -> torch.Tensor:
     """step0-explore: values [Kf, D] smoothed by a 3 x 3 box mean inside every (future frame, camera) 7 x 7 block (edges:
     the mean of the cells present)."""
@@ -613,5 +629,5 @@ def make_plan(method: str, k: int, grid: sel.Grid, av: torch.Tensor, diff: torch
 
 __all__ = ["INTERLACE", "METHODS", "PROBE_CORNERS", "PROBE_SINK", "Plan", "STEP0", "add_last_extra", "fill_map", "grid_regions",
            "ht_frequencies", "ht_schedule", "interlace_slices", "interp_tokens", "kmeans", "make_plan", "probe_index",
-           "roll_blocks", "rope_freqs_at", "step0_slices", "tube_mask", "nearest_sources", "idw_fill", "align_frames", "memory_map",
+           "roll_blocks", "rope_freqs_at", "step0_slices", "token_latent_mask", "token_norms", "tube_mask", "nearest_sources", "idw_fill", "align_frames", "memory_map",
            "select_core", "reselect"]

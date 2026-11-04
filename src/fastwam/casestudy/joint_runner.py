@@ -2658,11 +2658,17 @@ class JointCaseStudyRunner:
         future_latents: torch.Tensor,
         sigma_shift: Optional[float] = None,
         rand_device: str = "cpu",
+        _attn_capture: Optional[dict] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """inject_future: the two future latent frames fixed to ``future_latents`` [1, z, 2, h, w], clean (timestep 0 for
         every video token); frame 0 and its prefill as on the normal path. Only the action stream is denoised, with the
         normal path's schedule, noise (the action generator of ``seed``), text and proprio. The video tokens' inputs never
-        change, so their per-layer K/V are computed once (the same numbers as resetting them after every step)."""
+        change, so their per-layer K/V are computed once (the same numbers as resetting them after every step).
+
+        ``_attn_capture`` (region-attrib): a dict that receives ``av`` [steps, layers, future tokens] (fp32, cpu), the action
+        rows' attention on every future key (explicit fp32 softmax over [frame 0 | future | action] keys, mean over heads and
+        action queries), and ``f0`` [steps, layers], their frame-0 share. Side computation only: the action stream still
+        goes through ``flash_attention``, so the chunk is the same with or without it."""
         model = self.model
         steps = int(self.cfg.num_inference_steps)
         model.eval()
@@ -2720,6 +2726,9 @@ class JointCaseStudyRunner:
             xv = self._post(bv, io_v, out_v, payload_v)
         n_fut = int(xv.shape[1])
         cost_steps = [[n_fut, f0 + n_fut, 0, 0]]  # the one video pass of the clean future
+        if _attn_capture is not None:
+            av_buf = torch.zeros(steps, self.num_layers, n_fut)
+            f0_buf = torch.zeros(steps, self.num_layers)
         for s in range(steps):
             ts_a = t_action[s].unsqueeze(0).to(dtype=latents_action.dtype, device=model.device)
             pre_a = self.action.pre_dit(action_tokens=latents_action, timestep=ts_a, context=context, context_mask=context_mask)
@@ -2733,11 +2742,17 @@ class JointCaseStudyRunner:
                 k_all = torch.cat([kv0[layer]["k"], kv_fut[layer][0], io_a[1]], dim=1)
                 v_all = torch.cat([kv0[layer]["v"], kv_fut[layer][1], io_a[2]], dim=1)
                 out_a = flash_attention(q=io_a[0], k=k_all, v=v_all, num_heads=self.num_heads)
+                if _attn_capture is not None:
+                    p = torch.softmax(self._head_logits(io_a[0], k_all), dim=-1).mean(dim=(0, 1))  # [keys]
+                    av_buf[s, layer] = p[f0:f0 + n_fut].cpu()
+                    f0_buf[s, layer] = float(p[:f0].sum())
                 if layer == 0:
                     cost_steps.append([0, 0, int(io_a[0].shape[1]), int(k_all.shape[1])])
                 xa = self._post(ba, io_a, out_a, payload_a)
             pred_action = self.action.post_dit(xa, pre_a)
             latents_action = model.infer_action_scheduler.step(pred_action, d_action[s], latents_action)
+        if _attn_capture is not None:
+            _attn_capture["av"], _attn_capture["f0"] = av_buf, f0_buf
         diag = {"path": "inject_future", "seed": int(seed), "steps": steps, "grid": [int(grid.frames), int(grid.height), int(grid.width)],
                 "cost": {**self._cost_model(), "attn_dim": int(io_a[0].shape[-1]), "ctx": int(context.shape[1]), "f0": int(f0),
                          "steps": cost_steps, "oracle_pass": False}}
