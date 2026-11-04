@@ -233,6 +233,64 @@ def reselect(plan: "Plan", av: torch.Tensor, diff: torch.Tensor) -> "Plan":
     return Plan(plan.method, plan.sinks, core, plan.periphery, fixed, slices=slices, truncated=plan.truncated, slice_bias=bias)
 
 
+def neighbours(j: int, grid: sel.Grid) -> list[int]:
+    """step0-explore: the token and its 8-neighbourhood inside its (future frame, camera) 7 x 7 block (ascending)."""
+    half = grid.width // 2
+    f, rem = divmod(int(j), grid.per_frame)
+    r, w = divmod(rem, grid.width)
+    cam, c = divmod(w, half)
+    return sorted(f * grid.per_frame + rr * grid.width + cam * half + cc
+                  for rr in range(max(0, r - 1), min(grid.height, r + 2)) for cc in range(max(0, c - 1), min(half, c + 2)))
+
+
+def c2f_survey(probes: torch.Tensor, av: torch.Tensor, diff: torch.Tensor, sinks: torch.Tensor, k: int, grid: sel.Grid,
+               budget: int) -> torch.Tensor:
+    """step0-explore C2F step 1: the sinks, then the neighbourhoods of the probes ranked 1..k by A->V and by Diff (taken in turn:
+    A->V #1, Diff #1, A->V #2, ...; sinks excluded from the ranking) until ``budget`` tokens (sorted)."""
+    sk = set(int(x) for x in sinks.tolist())
+    cand = [int(p) for p in probes.tolist() if int(p) not in sk]
+    by_av = sorted(cand, key=lambda p: (-float(av[p]), p))[:k]
+    by_df = sorted(cand, key=lambda p: (-float(diff[p]), p))[:k]
+    order = [x for pair in zip(by_av, by_df) for x in pair]
+    out = list(sk)
+    for p in order:
+        for j in neighbours(p, grid):
+            if len(out) >= budget:
+                break
+            if j not in out:
+                out.append(j)
+    return torch.sort(torch.tensor(out[:budget], dtype=torch.long)).values
+
+
+def c2f_plan(measured: torch.Tensor, av: torch.Tensor, diff: torch.Tensor, sinks: torch.Tensor, grid: sel.Grid, k: int,
+             first: int = 2, n_steps: int = 10, quota: int = R_SLOTS) -> "Plan":
+    """step0-explore C2F plan of steps ``first``..n_steps-1, from the scores of the ``measured`` tokens (unmeasured: 0): sinks as
+    given; the core by ``make_plan``'s rule (A->V top 10 + Diff top 10, filled by A->V) to k - sinks - quota; the measured
+    periphery tokens (best A->V first) fill the last two slices, the rest of the periphery the earlier ones by raster interlace
+    (``step0_slices``); slice key bias log(N / n_s). real(s) for s >= first reads the slice of step s."""
+    kf = grid.num_future
+    m = torch.zeros(kf, dtype=torch.bool)
+    m[measured.cpu()] = True
+    av_m, df_m = torch.where(m, av.float(), torch.zeros(kf)), torch.where(m, diff.float(), torch.zeros(kf))
+    c = max(0, k - int(sinks.numel()) - quota)
+    core = select_core(av_m, df_m, sinks.cpu(), c)
+    mask = torch.ones(kf, dtype=torch.bool)
+    mask[sinks.cpu()] = False
+    mask[core] = False
+    periphery = torch.nonzero(mask).flatten()
+    n = n_steps - first
+    pm = periphery[m[periphery]]
+    best = pm[torch.argsort(-av_m[pm], stable=True)][:2 * quota]
+    sl, cut = step0_slices(periphery, best, av_m, n=n, quota=quota)
+    # real(s) reads slices[(s - 1) % n]: step s (first..n_steps-1) must read sl[s - first]
+    slices = [None] * n
+    for s in range(first, n_steps):
+        slices[(s - 1) % n] = sl[s - first]
+    bias = [math.log(int(periphery.numel()) / int(x.numel())) if x.numel() else 0.0 for x in slices]
+    fixed = torch.sort(torch.cat([sinks.cpu(), core])).values
+    return Plan("interlace_w", sinks.cpu(), core, periphery, fixed, slices=slices, truncated=cut, slice_bias=bias)
+
+
 def tube_mask(cells: dict, grid: sel.Grid, wrist_rows: bool = False, dilate: int = 1) -> torch.Tensor:
     """Plan D: [Kf] bool, the agentview cells (row, column) of every future frame (``cells[f]``, f = 1..F-1) dilated by
     ``dilate`` within the block; ``wrist_rows`` adds the two bottom rows of every wrist block."""

@@ -225,6 +225,9 @@ class PruneConfig:
     #: step0-explore: the probes' change from the current frame scaled by this gain before it drafts the other tokens (step0 b / d
     #: and the side0 video / draft / both outputs; 1 = off).
     step0_gain: float = 1.0
+    #: step0-explore C2F (step0 b): step 1 computes the sinks + the neighbourhoods of the c2f hottest probes by A->V and by Diff;
+    #: the plan of steps 2-9 comes from the scores measured at steps 0 and 1.
+    c2f: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -433,6 +436,7 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             draft_mod=None if block.get("draft_mod") is None else str(block["draft_mod"]),
             draft_mod_scale=float(block.get("draft_mod_scale", 0.5)),
             step0_gain=float(block.get("step0_gain", 1.0)),
+            c2f=None if block.get("c2f") is None else int(block["c2f"]),
         )
         if prune.fovea is not None or prune.fovea_off:
             _require(prune.fovea in FOVEA_METHODS, f"prune.fovea must be one of {FOVEA_METHODS} (fovea_off needs a method)")
@@ -471,6 +475,7 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
                  f"prune.draft_mod must be one of {DRAFT_MODS} on plain interlace_w")
         _require(prune.step0_gain == 1.0 or (prune.step0_gain > 0 and (prune.step0 is not None or prune.side0_use in ("draft", "both", "video"))),
                  "prune.step0_gain (> 0) is for step0 or the side0 video / draft / both outputs")
+        _require(prune.c2f is None or (prune.step0 == "b" and not prune.step0_all and prune.c2f >= 1), "prune.c2f (>= 1) needs prune.step0 b")
         _require(prune.draft_from is None or 0 <= prune.draft_from <= 10, "prune.draft_from must be in [0, 10]")
         _require(not (prune.mem_route or prune.mem_direct) or prune.mem, "prune.mem_route / mem_direct need prune.mem")
         _require(prune.reselect_step is None or (prune.mem_route and 1 <= prune.reselect_step < 10),

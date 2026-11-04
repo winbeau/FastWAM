@@ -944,6 +944,10 @@ class JointCaseStudyRunner:
         # step0-explore: the dense step-0 hidden states (explore_track), D1's draft modification of M4w (step 0's update redone).
         explore_h: Optional[list] = [] if cfg.explore_track else None
         dmod = prune.draft_mod if prune is not None else None
+        # step0-explore C2F: the raw step-0 x^0 of the probes, their A->V / Diff, then step 1's measurements (the plan of steps 2-9).
+        c2f: Optional[dict] = {} if prune is not None and prune.c2f is not None else None
+        z_c2f = rearrange(latents_video[0, :, 0:int(patch[0])].float(), "c (f a) (h b) (w e) -> f (h w) (c a b e)", a=int(patch[0]),
+                          b=int(patch[1]), e=int(patch[2]))[0] if c2f is not None else None
         # step0-sparse-r2: R1 / R3b side forward on step 0 (its plan inputs / outputs), R5 / R7 step-by-step drafts, the call's
         # imagination (prune.mem: A->V of every token's last computed step, step-9 recv), R7's plan / drafts from the previous
         # call (plan known before step 0, step 0 pruned), R7b's latest clean estimates; R2 / R3 side records (dense).
@@ -1375,6 +1379,11 @@ class JointCaseStudyRunner:
                         # tokens on this full step) and the action rows, head mean, summed over rows.
                         recv_acc += self._attention_probs(io_v[0], k_vid)[:, f0:].sum(dim=0)
                         recv_acc += self._attention_probs(io_a[0], k_all)[:, f0:f0 + num_future].sum(dim=0)
+                    if c2f is not None and s == 1 and layer == self._layers["act"]:
+                        # C2F: step 1's A->V on its computed future keys (softmax with the step's key bias), normalized.
+                        nf_ = int(k_all.shape[1]) - f0 - int(io_a[1].shape[1])
+                        av_s = self._masked_probs(io_a[0], k_all, amask)[:, f0:f0 + nf_].sum(dim=0)
+                        c2f.update(rows1=idx_rel.clone(), av1=av_s / av_s.sum())
                     if mem_on and layer == int(cfg.score_layer):
                         # step0-sparse-r2 memory: this step's A->V on its computed future keys (softmax with the step's key
                         # bias), normalized over them; every token keeps the value of its last computed step.
@@ -1501,6 +1510,8 @@ class JointCaseStudyRunner:
                     # step0-sparse draft (DECISIONS B.4): the probes' clean estimate interpolated over every block; the
                     # uncomputed future tokens move along (x - x0) / sigma_0 until computed. Plan b's Diff reads it.
                     sigma0_v = t_video[0].float() / float(model.infer_video_scheduler.num_train_timesteps)
+                    if c2f is not None:  # C2F: the probes' raw x^0 (before the gain), for their Diff
+                        c2f["x0_raw"] = self._clean_future(latents_video, vel_tokens, pre_v["meta"]["grid_size"], sigma0_v, (pt, ph, pw))
                     v_draft, s0_zf = self._probe_draft(latents_video, vel_tokens, pre_v["meta"]["grid_size"], grid,
                                                        idx_rel, sigma0_v, (pt, ph, pw), gain=float(prune.step0_gain))
                     rest = torch.ones(num_future, dtype=torch.bool, device=idx_rel.device)
@@ -1620,6 +1631,9 @@ class JointCaseStudyRunner:
                 rest[idx_rel] = False
                 rest_abs = torch.nonzero(rest).flatten() + f0
                 vel_tokens[:, rest_abs] = self._map_draft(latents_video, route_map, grid, sig_s, (pt, ph, pw))[:, rest_abs].to(vel_tokens.dtype)
+            if c2f is not None and s == 1 and "av1" in c2f:  # C2F: step 1's own x^0 Diff
+                zf1 = self._clean_future(latents_video, vel_tokens, gsz, sig_s, (pt, ph, pw))[idx_rel]
+                c2f["df1"] = (zf1 - z_c2f[grid.future_obs_index(z_c2f.device)][idx_rel]).norm(dim=-1)
             draft_now = (draft_from is not None and fv_step and s >= draft_from and fplan.slices
                          and (route_plan or not prune.mem_route))
             if draft_now or x0_est is not None:
@@ -1728,6 +1742,16 @@ class JointCaseStudyRunner:
                     }
                 else:
                     self._layers = {"act": -1, "inst": -1}
+            if c2f is not None and s == 1 and "df1" in c2f:
+                # C2F: the plan of steps 2-9 from the scores measured at steps 0 and 1 (the latest for every token).
+                av_m, df_m = c2f["av"].clone(), c2f["diff"].clone()
+                av_m[c2f["rows1"]], df_m[c2f["rows1"]] = c2f["av1"], c2f["df1"]
+                measured = torch.unique(torch.cat([c2f["measured"], c2f["rows1"]]))
+                fplan = fv.c2f_plan(measured.cpu(), av_m.cpu(), df_m.cpu(), c2f["sinks"].cpu(), grid,
+                                    max(1, int(round(prune.keep_ratio * num_future)))).to(kept.device)
+                kept = fplan.fixed
+                diag["c2f"].update(measured=int(measured.numel()), core=fplan.core.tolist(), sinks=fplan.sinks.tolist(),
+                                   slices=[int(x.numel()) for x in fplan.slices], truncated=int(fplan.truncated.numel()))
             if prune is not None and not route_plan and (s == prune.warmup_steps - 1 or (mode == "pruned" and prune.reselect_every_step)):
                 k = 0 if prune.keep_ratio == 0.0 else max(1, int(round(prune.keep_ratio * num_future)))
                 if prune.kept_index is not None:
@@ -1809,11 +1833,26 @@ class JointCaseStudyRunner:
                     if side0_inputs is not None:  # step0-sparse-r2 R1-plan / R3b: B's plan from the side forward
                         av_plan, diff_plan, recv = side0_inputs["av"], side0_inputs["diff"], side0_inputs["recv"]
                         s0_sinks, plan_probes = side0_inputs["sinks"], side0_inputs["probes"].cpu()
-                    fplan = fv.make_plan(fovea_m, k, grid, av_plan.float().cpu(), diff_plan.float().cpu(), recv.float().cpu(),
-                                         None if x0_fut is None else x0_fut.cpu(), gen, off=prune.fovea_off,
-                                         wzero=prune.fovea_wzero, nofar=prune.fovea_nofar,
-                                         singleton=prune.fovea_singleton,
-                                         sinks=None if s0_sinks is None else s0_sinks.cpu(), probes=plan_probes).to(kept.device)
+                    if c2f is not None:
+                        # step0-explore C2F: step 1 computes the sinks + the neighbourhoods of the hottest probes (A->V, Diff
+                        # measured at the probes themselves), every key + log(Kf / n); the plan of steps 2-9 comes after it.
+                        zfo = z_c2f[grid.future_obs_index(z_c2f.device)]
+                        df0 = (c2f["x0_raw"] - zfo).norm(dim=-1)
+                        av0 = torch.zeros(num_future, device=av_all.device)
+                        av0[s0_probes] = av_all[s0_probes] / av_all[s0_probes].sum()
+                        survey = fv.c2f_survey(s0_probes.cpu(), av0.cpu(), df0.cpu(), s0_sinks.cpu(), int(prune.c2f), grid, k)
+                        lg = math.log(num_future / int(survey.numel()))
+                        empty_ = survey[:0]
+                        fplan = fv.Plan(fovea_m, s0_sinks.cpu(), empty_, empty_, survey,
+                                        bias_real={int(j): lg for j in survey.tolist()}).to(kept.device)
+                        c2f.update(av=av0, diff=df0, measured=s0_probes.clone(), sinks=s0_sinks.clone())
+                        diag["c2f"] = {"survey": survey.tolist()}
+                    else:
+                        fplan = fv.make_plan(fovea_m, k, grid, av_plan.float().cpu(), diff_plan.float().cpu(), recv.float().cpu(),
+                                             None if x0_fut is None else x0_fut.cpu(), gen, off=prune.fovea_off,
+                                             wzero=prune.fovea_wzero, nofar=prune.fovea_nofar,
+                                             singleton=prune.fovea_singleton,
+                                             sinks=None if s0_sinks is None else s0_sinks.cpu(), probes=plan_probes).to(kept.device)
                     if s0_mode is not None and fplan.slices:
                         # Runner check (DECISIONS C.3): the slices and the truncated tokens partition the periphery.
                         parts = torch.cat(fplan.slices + [fplan.truncated])
@@ -2055,7 +2094,7 @@ class JointCaseStudyRunner:
                 diag["fovea"]["ht_counts_ok"] = ok
                 if not ok and len(fv_rows) == len(fplan.slices):
                     raise RuntimeError("fovea interlace_ht: a token was not computed f_j times, or the rows differ by step")
-            elif fplan.slices and not reselected:
+            elif fplan.slices and not reselected and c2f is None:
                 # Interlace: every periphery token not cut by the quota computed exactly once on the pruned steps.
                 cut = set(fplan.truncated.tolist())
                 cnt = fv_count[fplan.periphery].tolist()
