@@ -399,10 +399,6 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             _require(prune.e9 is None or (prune.e9 in ("early", "late") and prune.fovea == "interlace_w"
                                           and not prune.fovea_off and not prune.fovea_wzero and prune.step0 is None),
                      "prune.e9 is early or late on interlace_w (dense step 0)")
-        _require(not (prune.step0_nobias or prune.step0_all) or prune.step0 is not None,
-                 "prune.step0_nobias / step0_all need prune.step0")
-        _require(not prune.step0_all or prune.step0 == "b", "prune.step0_all is the plan-b self-check")
-        _require(prune.e9 is None or prune.fovea is not None, "prune.e9 needs prune.fovea interlace_w")
             _require(prune.selection == "av" and prune.warmup_steps == 1 and prune.keep_ratio > 0.0 and not (
                 prune.action_full_kv or prune.video_full_kv or prune.summary_grid or prune.oracle_kv or prune.recon is not None
                 or prune.steer is not None or prune.steer_video is not None or prune.dense_bias or prune.video_eager
@@ -410,6 +406,11 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
                 or prune.kept_index is not None or prune.score_frames is not None or prune.score_step is not None
                 or prune.action_no_future or prune.extrapolate_w is not None),
                 "prune.fovea is S0 (selection av, warm-up 1, keep > 0) plus the fovea plan only")
+        _require(not (prune.step0_nobias or prune.step0_all) or prune.step0 is not None,
+                 "prune.step0_nobias / step0_all need prune.step0")
+        _require(not prune.step0_all or prune.step0 == "b", "prune.step0_all is the plan-b self-check")
+        _require((prune.e9 is None and prune.step0 is None) or prune.fovea is not None,
+                 "prune.step0 / prune.e9 need prune.fovea interlace_w")
         _require(prune.selection in SELECTIONS, f"prune.selection must be one of {SELECTIONS}")
         if prune.selection in ("diff", "diff_global"):
             _require(prune.warmup_steps == 1 and prune.score_step is None and prune.kept_index is None
