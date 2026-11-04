@@ -31,5 +31,7 @@ tools are in `scripts/casestudy/`. FastWAM-IDM (official Optional-IDM) has its o
 | fovea | `fovea sink / rep / fov_grid / fov_cluster / interlace`, `fovea_off`, `record_sinks` |
 | fovea-w | `fovea interlace_w / interlace_wfar`, `fovea_wzero`, `fovea_nofar`, `video_freeze` |
 | n1-4 | `fovea interlace_cal / interlace_fill / merge / interlace_ht`, `fovea_singleton` |
+| share-sparsity | `steer.const` |
+| step0-sparse | `prune.step0 b / d`, `step0_nobias`, `step0_all`, `e9`, `record_step0_x0`; adapter `step0_tube` |
 
 Tests: `tests/test_casestudy_*.py` (CPU; run on the server, not locally).
