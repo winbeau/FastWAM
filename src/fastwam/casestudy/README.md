@@ -41,5 +41,6 @@ tools are in `scripts/casestudy/`. FastWAM-IDM (official Optional-IDM) has its o
 | region-attrib | `infer_inject(_attn_capture)` (the action rows' attention on every future key, side computation), `fovea.token_latent_mask` / `token_norms`; adapter option `region_attrib` (planned calls: F_real(1), static future, token-masked conditions with static / half-speed / fade sources, per-token latent change) |
 | step-marginal | `prune.step_delta` / `step_delta_seed` on the late anchor (step 1's set or step s's slice: n more tokens, stratified random, or |n| fewer, lowest plan A->V), `fovea.stratified_pick` / `lowest_av` / `apply_step_delta`, `Plan.drop` |
 | role-select | `prune.role_select` (rs / notip / wdiff / aav / nofar), `role_tips`, `role_seed`: the late anchor's plan of steps 2-9 by region roles (`fovea.role_plan`, `spread_order`, `role_strata`), `Plan.step_bias` |
+| cam-split (branch `cam-split`) | `prune.cs_order` / `cs_n` / `cs_k` / `cs_bias` / `cs_gain_w` / `cs_gain_a` / `cs_seed`: the late anchor over steps 1-2 by camera (per-camera drafts, context rows lend keys only, plan of steps 3-9 from per-step normalized scores); `fovea.cs_rows` / `cs_bias` / `step_normalized` / `camera_tokens`; dense records its step-2 estimate |
 
 Tests: `tests/test_casestudy_*.py` (CPU; run on the server, not locally).
