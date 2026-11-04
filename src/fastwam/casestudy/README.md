@@ -36,5 +36,6 @@ tools are in `scripts/casestudy/`. FastWAM-IDM (official Optional-IDM) has its o
 | step0-sparse-r2 | `prune.side0_m / side0_use`, `draft_from`, `mem / mem_route / mem_direct / reselect_step`; dense `record_r2_steps / record_r2_all / record_r3_ms`; adapter `_memory_key` |
 | step0-explore | `explore` / `explore_track` (dense), `draft_mod`, `step0_gain`, `c2f`, `step0_rows`, `step0_draft` (grid / idw / near), `step0_far_lambda`, `late`, `late_extra` (the late anchor) |
 | late-anchor-confirm | `late_step` (0 = X-early: the late set computed on step 0), `late_extra` on plain interlace_w (`fovea.add_last_extra`, M4w + step-9 extra reads); IDM-L on the `optional-idm` branch (`idm_runner.py`, `prune.late`) |
+| late-anchor-c4 | `late_oracle` (attribution: a dense step 0 beside the late anchor), `record_drafts`, far rows `f2w` / `f2a` / `f2s` and unions `a+b`, `step0_draft: nearres`, `step0_far_lambda_wrist`, `late_plan_far_av` / `late_plan_far_diff` / `late_plan_core` (the fix L84-meas = `late_plan_core: measured`); IDM (`optional-idm`) has the `late_plan_*` switches too |
 
 Tests: `tests/test_casestudy_*.py` (CPU; run on the server, not locally).
