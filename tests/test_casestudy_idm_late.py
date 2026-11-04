@@ -108,3 +108,13 @@ def test_plan_steps_2_to_9_and_extra():
 
 def test_add_last_extra_present():
     assert callable(fv.add_last_extra) and fv.N_SINKS == 3 and fv.PROBE_SINK == 182
+
+
+def test_late_plan_options():
+    """late-anchor-c4 (as main): the IDM-L plan switches parse on the late anchor only."""
+    p = parse_config({**LATE, "prune": {**LATE["prune"], "late_plan_core": "measured", "late_plan_far_av": 0.5, "late_plan_far_diff": 0.5}}).prune
+    assert (p.late_plan_core, p.late_plan_far_av, p.late_plan_far_diff) == ("measured", 0.5, 0.5)
+    assert parse_config(LATE).prune.late_plan_core is None
+    for bad in ({"late_plan_core": "all"}, {"late_plan_far_av": -0.1}, {"late": None, "late_extra": 0, "late_plan_core": "measured"}):
+        with pytest.raises(ValueError):
+            parse_config({**LATE, "prune": {**LATE["prune"], **bad}})

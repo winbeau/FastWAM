@@ -81,6 +81,11 @@ class PruneConfig:
     step0_gain: float = 1.0
     step0_far_lambda: float = 0.5
     late_extra: int = 0
+    #: late-anchor-c4 (as main): the plan of steps 2-9 with the uncomputed far tokens' A->V / Diff scaled, or its core from the
+    #: computed tokens only (``late_plan_core: measured``).
+    late_plan_far_av: Optional[float] = None
+    late_plan_far_diff: Optional[float] = None
+    late_plan_core: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -175,6 +180,9 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             step0_gain=float(block.get("step0_gain", 1.0)),
             step0_far_lambda=float(block.get("step0_far_lambda", 0.5)),
             late_extra=int(block.get("late_extra", 0)),
+            late_plan_far_av=None if block.get("late_plan_far_av") is None else float(block["late_plan_far_av"]),
+            late_plan_far_diff=None if block.get("late_plan_far_diff") is None else float(block["late_plan_far_diff"]),
+            late_plan_core=None if block.get("late_plan_core") is None else str(block["late_plan_core"]),
         )
         if prune.fovea is not None or prune.fovea_off:
             _require(prune.fovea in ("interlace", "interlace_w"), "prune.fovea on IDM is interlace or interlace_w")
@@ -186,6 +194,10 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
                                         and prune.step0_draft in ("idw", "near") and prune.step0_gain > 0),
                  "prune.late (f1s<n> / strat<n>) needs fovea interlace / interlace_w with idw / near drafts and a gain > 0")
         _require(prune.late_extra >= 0 and (prune.late_extra == 0 or prune.late is not None), "prune.late_extra (>= 0) needs prune.late")
+        _require((prune.late_plan_far_av is None and prune.late_plan_far_diff is None and prune.late_plan_core is None) or (
+            prune.late is not None and prune.late_plan_core in (None, "measured")
+            and all(x is None or x >= 0 for x in (prune.late_plan_far_av, prune.late_plan_far_diff))),
+                 "prune.late_plan_far_av / far_diff (>= 0) / late_plan_core (measured) are options of IDM-L's plan")
         _require(prune.selection in SELECTIONS, f"prune.selection must be one of {SELECTIONS}")
         _require(0.0 < prune.keep_ratio <= 1.0 or (prune.reuse_step0_kv and prune.keep_ratio == 0.0),
                  "prune.keep_ratio must be in (0, 1] (0 only with reuse_step0_kv)")

@@ -458,7 +458,18 @@ class IDMCaseStudyRunner:
                 r_[out_] = float("-inf")
                 sinks_l = torch.cat([torch.tensor([fv.PROBE_SINK], device=r_.device), torch.topk(r_, fv.N_SINKS - 1).indices])
                 k = max(1, int(round(prune.keep_ratio * num_future)))
-                fplan = fv.c2f_plan(rows1.cpu(), av_full.cpu(), df_full.cpu(), sinks_l.cpu(), grid, k, core_all=True,
+                # late-anchor-c4 (as main): the uncomputed far tokens' copied A->V / Diff scaled before the core is chosen; or
+                # the core from the computed tokens' scores only
+                pf_ = grid.per_frame
+                far_unm = torch.arange(num_future, device=rows1.device) >= pf_
+                far_unm[rows1] = False
+                if prune.late_plan_far_diff is not None:
+                    df_near = df_full[torch.arange(num_future, device=rows1.device) % pf_]
+                    df_full = torch.where(far_unm, df_near * float(prune.late_plan_far_diff), df_full)
+                if prune.late_plan_far_av is not None:
+                    av_full = torch.where(far_unm, av_full * float(prune.late_plan_far_av), av_full)
+                fplan = fv.c2f_plan(rows1.cpu(), av_full.cpu(), df_full.cpu(), sinks_l.cpu(), grid, k,
+                                    core_all=prune.late_plan_core != "measured",
                                     last_extra=int(prune.late_extra)).to(model.device)
                 kept = fplan.fixed
                 diag["late"].update(core=fplan.core.tolist(), sinks=fplan.sinks.tolist(), slices=[int(x.numel()) for x in fplan.slices],
