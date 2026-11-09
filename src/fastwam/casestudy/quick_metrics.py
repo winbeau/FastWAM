@@ -275,6 +275,7 @@ def c_block(r, rec: list, kv_cap: dict, kv0: list, f0: int, sig_a: list, a0: Opt
         base = _continue(r, rec, kv_cap, kv0, f0, s, x0s, sig_a[s], context, context_mask)
         if a0 is not None:
             a0_dev = a0.to(xa_s.device)
+            actions.setdefault(f"d@{s}", x0s[0])  # step s's clean estimate (only_c has no other record of it)
             actions[f"c0@{s}"] = base[0]
             for e in eps:
                 xh = x0s.clone()
