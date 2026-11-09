@@ -468,15 +468,46 @@ class FastWAMJointPolicy:
                 action, d = runner.infer_action(
                     prompt=prompt, input_image=image, proprio=proprio,
                     action_horizon=self.action_horizon, num_video_frames=self.num_video_frames,
-                    seed=seed, sigma_shift=self.sigma_shift, rand_device=self.rand_device,
+                    seed=seed, sigma_shift=self.sigma_shift, rand_device=self.rand_device, **self._gen_kwargs(runner),
                 )
                 entry = {"seed": int(seed), **self._chunk_logs(action)}
                 for key in ("kept_index", "kept_count", "layer_act", "modes", "av_scores_f16", "gate_score", "future_token_steps",
-                            "future_token_steps_dense", "reuse_step0_kv", "path", "fovea"):
+                            "future_token_steps_dense", "reuse_step0_kv", "path", "fovea", "late", "late_read", "action_steps_run",
+                            "computed_steps", "gen"):
                     if d.get(key) is not None:
                         entry[key] = d[key]
+                if entry.get("gen") is not None:
+                    self._gen_units(entry["gen"])
                 out[f"{name}@{offset}"] = entry
         return out
+
+    def _gen_kwargs(self, runner) -> dict:
+        """generality (``casestudy.gen``): ``_qm_zero``, the normalized action of zero simulator translation per xyz dimension (as
+        main's ``_qm_kwargs``: the de-normalization is affine per dimension, a0 = -cont(0) / (cont(1) - cont(0))); {} otherwise."""
+        if getattr(runner.cfg, "gen", None) is None:
+            return {}
+        if getattr(self, "_qm_zero", None) is None:
+            torch = self._torch
+            dim = int(runner.action.action_dim)
+            c0 = self._continuous(torch.zeros(self.action_horizon, dim))[0, :3].astype(np.float64)
+            c1 = self._continuous(torch.ones(self.action_horizon, dim))[0, :3].astype(np.float64)
+            self._qm_zero = torch.tensor(-c0 / (c1 - c0), dtype=torch.float32, device=self.device)
+        return {"_qm_zero": self._qm_zero}
+
+    def _gen_units(self, gen: dict) -> None:
+        """generality: the normalized chunks of ``gen["actions"]`` -> per name the executed displacement ``D`` and rotation ``R`` (the
+        first ``n_exec`` actions summed, simulator units), in place; ``a0`` logged (as main's ``_qm_units``)."""
+        import base64
+
+        n = int(gen.get("n_exec", 10))
+        D, R = {}, {}
+        for name, b64 in (gen.pop("actions", None) or {}).items():
+            a = np.frombuffer(base64.b64decode(b64), dtype=np.float32).reshape(-1, 7)
+            c = self._continuous(self._torch.from_numpy(a.copy())).astype(np.float64)[:n]
+            D[name], R[name] = [float(x) for x in c[:, 0:3].sum(0)], [float(x) for x in c[:, 3:6].sum(0)]
+        gen["D"], gen["R"] = D, R
+        if getattr(self, "_qm_zero", None) is not None:
+            gen["a0"] = [float(x) for x in self._qm_zero.cpu().tolist()]
 
     def _continuous(self, action) -> np.ndarray:
         """De-normalized chunk [T, 7] before gripper binarisation (float32)."""

@@ -476,12 +476,14 @@ class Plan:
     region_pos: torch.Tensor | None = None  # fov: [G, 3] (frame, mean h, mean w)
     slice_bias: list = field(default_factory=list)  # interlace_w: log(N / n_k) per slice
     freq: torch.Tensor | None = None  # interlace_ht: computations f_j of every future token over the pruned steps
+    step_bias: dict = field(default_factory=dict)  # generality (as main): step -> {token: key bias}, read by bias_at when set
 
     def to(self, dev) -> "Plan":
         mv = lambda t: None if t is None else t.to(dev)  # noqa: E731
         return Plan(self.method, mv(self.sinks), mv(self.core), mv(self.periphery), mv(self.fixed),
                     [x.to(dev) for x in self.slices], mv(self.truncated), dict(self.bias_real),
-                    [(g.to(dev), lg) for g, lg in self.regions], self.region_pos, list(self.slice_bias), mv(self.freq))
+                    [(g.to(dev), lg) for g, lg in self.regions], self.region_pos, list(self.slice_bias), mv(self.freq),
+                    {s: dict(b) for s, b in self.step_bias.items()})
 
     def real(self, s: int) -> torch.Tensor:
         if self.slices:
@@ -491,6 +493,8 @@ class Plan:
     def bias_at(self, s: int) -> dict:
         """Future index -> key logit bias on pruned step s: the representatives' log n (rep), this step's slice
         log(N / n_k) (interlace_w) or log(n / f_j) of this step's tokens computed fewer than n times (interlace_ht)."""
+        if self.step_bias:
+            return dict(self.step_bias.get(s, {}))
         if self.freq is not None and self.slices:
             k = (s - 1) % len(self.slices)
             return {int(j): math.log(len(self.slices) / int(self.freq[j])) for j in self.slices[k].tolist()}
@@ -498,6 +502,53 @@ class Plan:
             k = (s - 1) % len(self.slices)
             return {int(j): self.slice_bias[k] for j in self.slices[k].tolist()}
         return self.bias_real
+
+
+def stratified_pick(pool: torch.Tensor, n: int, grid: sel.Grid, seed: int) -> torch.Tensor:
+    """main's step-marginal ``stratified_pick``: ``n`` tokens of ``pool`` stratified by (future frame, camera) in proportion to the
+    pool's strata (largest remainder, ties to the earlier stratum), uniform within a stratum (torch generator ``seed``); sorted."""
+    pool = pool.cpu()
+    n = min(int(n), int(pool.numel()))
+    if n <= 0:
+        return pool[:0]
+    half = grid.width // 2
+    key = (pool // grid.per_frame) * 2 + ((pool % grid.per_frame) % grid.width) // half
+    strata = [pool[key == k] for k in range(2 * (grid.frames - 1))]
+    quota = torch.tensor([float(x.numel()) for x in strata]) * n / float(pool.numel())
+    take = torch.floor(quota).long()
+    rest = n - int(take.sum())
+    for k in sorted(range(len(strata)), key=lambda k: (-float(quota[k] - take[k]), k))[:rest]:
+        take[k] += 1
+    g = torch.Generator().manual_seed(int(seed))
+    picks = [x[torch.randperm(int(x.numel()), generator=g)[:int(t)]] for x, t in zip(strata, take)]
+    return torch.sort(torch.cat(picks)).values
+
+
+def late_read_plan(plan: "Plan", last: str, grid: sel.Grid, first: int = 2, n_steps: int = 10, seed: int = 0) -> "Plan":
+    """generality (main's late-read): the late anchor's plan with nothing computed on steps ``first`` .. n_steps-2; the last step
+    computes ``last``: plan (its own last-step tokens and bias), near (every near-frame token, key + log(Kf / pf)), all (every
+    future token, no bias) or near_half (half the near frame, stratified by camera with ``seed``, key + log(Kf / n))."""
+    s9 = n_steps - 1
+    if last == "plan":
+        rows, bias = plan.real(s9).cpu(), {int(j): float(v) for j, v in plan.bias_at(s9).items()}
+    elif last == "near":
+        rows = torch.arange(grid.per_frame)
+        bias = {int(j): math.log(grid.num_future / grid.per_frame) for j in rows.tolist()}
+    elif last == "all":
+        rows, bias = torch.arange(grid.num_future), {}
+    elif last == "near_half":
+        rows = stratified_pick(torch.arange(grid.per_frame), grid.per_frame // 2, grid, seed)
+        bias = {int(j): math.log(grid.num_future / int(rows.numel())) for j in rows.tolist()}
+    else:
+        raise ValueError(f"late_read_plan: last must be plan / near / all / near_half, got {last!r}")
+    n = n_steps - first
+    empty = torch.zeros(0, dtype=torch.long)
+    slices = [empty] * n
+    slices[(s9 - 1) % n] = torch.sort(rows.long()).values  # real(s) reads slices[(s - 1) % n]
+    step_bias = {s: {} for s in range(first, s9)}
+    step_bias[s9] = bias
+    return Plan(plan.method, plan.sinks.cpu(), plan.core.cpu(), plan.periphery.cpu(), empty, slices=slices,
+                truncated=None if plan.truncated is None else plan.truncated.cpu(), step_bias=step_bias)
 
 
 def make_plan(method: str, k: int, grid: sel.Grid, av: torch.Tensor, diff: torch.Tensor, recv: torch.Tensor,

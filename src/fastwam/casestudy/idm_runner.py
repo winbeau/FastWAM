@@ -38,6 +38,7 @@ from fastwam.models.wan22.wan_video_dit import flash_attention, modulate
 
 from .config import CaseStudyConfig
 from . import fovea as fv
+from . import idm_gen
 from . import selection as sel
 
 
@@ -203,7 +204,7 @@ class IDMCaseStudyRunner:
 
     @torch.no_grad()
     def infer_action(self, prompt, input_image, proprio, action_horizon, num_video_frames, seed,
-                     sigma_shift=None, rand_device="cpu") -> tuple[torch.Tensor, dict[str, Any]]:
+                     sigma_shift=None, rand_device="cpu", _qm_zero=None) -> tuple[torch.Tensor, dict[str, Any]]:
         cfg, model = self.cfg, self.model
         steps = int(cfg.num_inference_steps)
         if not cfg.frame0_cache or cfg.action_infer_mode == "first_frame":
@@ -305,6 +306,11 @@ class IDMCaseStudyRunner:
         late_sched: dict[int, tuple] = {}
         z_late = rearrange(latents_video[0, :, 0:pt].float(), "c (f a) (h b) (w e) -> f (h w) (c a b e)", a=pt, b=ph,
                            e=pw)[0] if late is not None else None
+        # generality: late_read (stage-1 steps 2 .. steps-2 empty; jump also skips those action steps) and the dense diagnostics
+        late_read = prune.late_read if late is not None else None
+        jump_pred, action_run = None, []
+        gen = cfg.gen if prune is None else None
+        grec_v, grec_a, prep1 = [], [], None
         for s in range(steps):
             ts_v = t_video[s].unsqueeze(0).to(dtype=latents_video.dtype, device=model.device)
             xt, tt, tmodt, ctxt, ctxmt, freqst, f, h, w, _tpf = self.video.prepare(
@@ -409,6 +415,10 @@ class IDMCaseStudyRunner:
                 rest[idx_rel] = False
                 upd_abs = torch.nonzero(rest).flatten() + f0 if float(prune.step0_gain) == 1.0 else all_future + f0
                 vel[:, upd_abs] = v_draft[:, upd_abs].to(vel.dtype)
+            if gen is not None:  # generality: this step's latents and velocity (the pass is unchanged)
+                if s == 1:
+                    prep1 = (xt, tt, tmodt, ctxt, ctxmt, freqst)
+                grec_v.append({"lat_v": latents_video.clone(), "vel": vel.clone(), "ts_v": ts_v})
             if s == 0 and fovea_m is not None and late is None:
                 # Diff (as on main): step 0's clean estimate x - sigma_0 v of every future token against the current frame.
                 sigma_v = t_video[0].float() / float(model.infer_video_scheduler.num_train_timesteps)
@@ -479,6 +489,16 @@ class IDMCaseStudyRunner:
                                  "truncated": int(fplan.truncated.numel()), "slice_bias": [round(x, 6) for x in fplan.slice_bias]}
                 diag["kept_count"] = int(kept.numel())
                 diag["kept_index"] = kept.tolist()
+                if late_read is not None:
+                    # generality: nothing on stage-1 steps 2 .. steps-2, the last step computes late_read_last
+                    plan_last = fplan.real(steps - 1).cpu()
+                    fplan = fv.late_read_plan(fplan, prune.late_read_last, grid, n_steps=steps, seed=int(prune.late_read_seed)).to(model.device)
+                    kept = fplan.fixed
+                    rows_last = fplan.real(steps - 1).cpu()
+                    diag["late_read"] = {"mode": late_read, "last": prune.late_read_last, "rows_last": rows_last.tolist(),
+                                         "rows_last_equal_plan": bool(torch.equal(rows_last, plan_last)),
+                                         "bias_last": sorted({round(v, 6) for v in fplan.bias_at(steps - 1).values()}),
+                                         "mid_rows": [int(fplan.real(s_).numel()) for s_ in range(2, steps - 1)]}
             if prune is not None and s == prune.warmup_steps - 1 and late is None:
                 k = 0 if v2k0 else max(1, int(round(prune.keep_ratio * num_future)))
                 if v2k0:
@@ -582,11 +602,24 @@ class IDMCaseStudyRunner:
                     for j, lg in bias_s.items():
                         amask[..., f0 + torch.nonzero(vis == j).flatten()] = lg
                     amask = amask.to(latents_action.dtype)
-            pred, _ = self._action_layers(latents_action, ts_a, context, context_mask, cache_s, set(), noise_gen, mask=amask)
+            if late_read == "jump" and 2 <= s <= steps - 2:
+                pred = jump_pred  # generality JUMP: no network, step 1's action velocity
+            else:
+                pred, _ = self._action_layers(latents_action, ts_a, context, context_mask, cache_s, set(), noise_gen, mask=amask)
+                action_run.append(int(s))
+                if late_read == "jump" and s == 1:
+                    jump_pred = pred
+            if gen is not None:
+                grec_a.append({"lat_a": latents_action.clone(), "pred": pred.clone(), "ts_a": ts_a, "d_a": d_action[s]})
             latents_action = model.infer_action_scheduler.step(pred, d_action[s], latents_action)
 
         diag["modes"] = modes
         diag["computed_steps"] = sum(1 for m in modes if m != "skip")
+        diag["action_steps_run"] = action_run
+        if late_read is not None:
+            diag["late_read"]["stage2_reencoded"] = int(keep2.numel())
+        if gen is not None:
+            diag["gen"] = idm_gen.run(self, grec_v, prep1, grec_a, kv0, cache, grid, f0, _qm_zero, context, context_mask, (pt, ph, pw))
         if prune is not None:
             pruned = sum(1 for m in modes if m == "pruned")
             rows = sum(fv_rows) if fplan is not None else pruned * int(kept.numel())

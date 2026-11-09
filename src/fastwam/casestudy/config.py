@@ -37,6 +37,8 @@ SELECTIONS = ("av", "cf", "random")
 LAYER_RULES = ("min_entropy", "fixed")
 SEED_MODES = ("episode_call_hash", "native_fixed")
 ACTION_INFER_MODES = ("idm", "first_frame")
+LATE_READS, LATE_READ_LAST = ("lr", "jump"), ("plan", "near", "all", "near_half")  # generality (fovea.late_read_plan)
+GEN_KEYS = {"eps", "grip_eps", "sets", "late_layers", "executed"}  # generality: the dense diagnostics
 
 
 @dataclass(frozen=True)
@@ -86,6 +88,13 @@ class PruneConfig:
     late_plan_far_av: Optional[float] = None
     late_plan_far_diff: Optional[float] = None
     late_plan_core: Optional[str] = None
+    #: generality (as main's late-read): stage-1 steps 2 .. steps-2 compute no future token; ``jump`` also skips the action stage's
+    #: steps 2 .. steps-2 (step 1's action velocity kept), ``lr`` runs them on frame 0 alone. The last stage-1 step computes
+    #: ``late_read_last``: plan, near (key + log(Kf / pf)), all, or near_half (half the near frame, stratified by camera with
+    #: ``late_read_seed``, key + log(Kf / n)).
+    late_read: Optional[str] = None
+    late_read_last: str = "plan"
+    late_read_seed: int = 0
 
 
 @dataclass(frozen=True)
@@ -120,6 +129,9 @@ class CaseStudyConfig:
     record_attention: bool = True
     #: Optional-IDM inference mode (see the module docstring).
     action_infer_mode: str = "idm"
+    #: generality (dense only): F(s) on stage 1, c(s) / c_grip(s) on the action stage and the step-1 sparse forwards of ``sets``
+    #: (kappa_1, late-layer neighbour / self shares), beside the pass (keys ``GEN_KEYS``).
+    gen: Optional[dict] = None
 
     def describe(self) -> dict[str, Any]:
         return asdict(self)
@@ -183,6 +195,9 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             late_plan_far_av=None if block.get("late_plan_far_av") is None else float(block["late_plan_far_av"]),
             late_plan_far_diff=None if block.get("late_plan_far_diff") is None else float(block["late_plan_far_diff"]),
             late_plan_core=None if block.get("late_plan_core") is None else str(block["late_plan_core"]),
+            late_read=None if block.get("late_read") is None else str(block["late_read"]),
+            late_read_last=str(block.get("late_read_last", "plan")),
+            late_read_seed=int(block.get("late_read_seed", 0)),
         )
         if prune.fovea is not None or prune.fovea_off:
             _require(prune.fovea in ("interlace", "interlace_w"), "prune.fovea on IDM is interlace or interlace_w")
@@ -198,6 +213,10 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             prune.late is not None and prune.late_plan_core in (None, "measured")
             and all(x is None or x >= 0 for x in (prune.late_plan_far_av, prune.late_plan_far_diff))),
                  "prune.late_plan_far_av / far_diff (>= 0) / late_plan_core (measured) are options of IDM-L's plan")
+        _require(prune.late_read is None or (prune.late_read in LATE_READS and prune.late is not None and steps >= 4),
+                 f"prune.late_read ({LATE_READS}) needs IDM-L (prune.late)")
+        _require(prune.late_read_last in LATE_READ_LAST and (prune.late_read is not None or prune.late_read_last == "plan"),
+                 f"prune.late_read_last ({LATE_READ_LAST}) needs late_read")
         _require(prune.selection in SELECTIONS, f"prune.selection must be one of {SELECTIONS}")
         _require(0.0 < prune.keep_ratio <= 1.0 or (prune.reuse_step0_kv and prune.keep_ratio == 0.0),
                  "prune.keep_ratio must be in (0, 1] (0 only with reuse_step0_kv)")
@@ -241,6 +260,9 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
     mode = str(raw.get("action_infer_mode", "idm"))
     _require(mode in ACTION_INFER_MODES, f"action_infer_mode must be one of {ACTION_INFER_MODES}, got {mode!r}")
     _require(mode == "idm" or method == "dense", "action_infer_mode=first_frame runs the native path: method=dense only")
+    _require(raw.get("gen") is None or (method == "dense" and bool(raw.get("frame0_cache", True)) and mode == "idm"
+                                        and set(dict(raw["gen"])) <= GEN_KEYS),
+             f"casestudy.gen is a dense diagnostic (frame-0 cache, idm) with keys {sorted(GEN_KEYS)}")
 
     return CaseStudyConfig(
         method=method,
@@ -254,6 +276,7 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
         noise=noise,
         record_attention=bool(raw.get("record_attention", True)),
         action_infer_mode=mode,
+        gen=None if raw.get("gen") is None else dict(raw["gen"]),
     )
 
 
