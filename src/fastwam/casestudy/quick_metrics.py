@@ -249,6 +249,45 @@ def ratios(sums: dict) -> dict:
     return {"R": _r6(R), "M": _r6(M), "rho": _r6(rho), "M_rho": _r6(M * rho)}
 
 
+def _continue(r, rec: list, kv_cap: dict, kv0: list, f0: int, s: int, xh: torch.Tensor, sig: float, context: torch.Tensor,
+              context_mask: torch.Tensor) -> torch.Tensor:
+    """The fp32 action latents after the last step, when step ``s``'s action clean estimate is ``xh`` [1, T, A] and the dense action
+    stream runs the rest (every later step reads the dense future K/V: video rows never see action keys)."""
+    xa_s = rec[s]["lat_a"].float()
+    x = xa_s + rec[s]["d_a"].float() * (xa_s - xh) / sig
+    for s2 in range(s + 1, len(rec)):
+        pa2 = r.action.pre_dit(action_tokens=x.to(rec[s2]["lat_a"].dtype), timestep=rec[s2]["ts_a"], context=context,
+                               context_mask=context_mask)
+        pred2 = action_forward(r, pa2, kv0, [kv_cap[(s2, l)] for l in range(r.num_layers)], None, None, f0, share=False)["pred"]
+        x = x + rec[s2]["d_a"].float() * pred2.float()
+    return x
+
+
+def c_block(r, rec: list, kv_cap: dict, kv0: list, f0: int, sig_a: list, a0: Optional[torch.Tensor], eps: tuple, grip_eps: tuple,
+            n_exec: int, context: torch.Tensor, context_mask: torch.Tensor, actions: dict) -> dict:
+    """c(s) (needs ``a0``): per step and eps the final action with step s's executed displacement scaled by 1 + eps about a0, into
+    ``actions["c{eps:g}@{s}"]`` (eps 0 the baseline). jump-tune c_grip(s): the gripper channel (normalized, last dim) of the executed
+    rows of step s's clean estimate + g -> {g: [per step: mean over those rows of (final - final at g = 0) / g]}."""
+    c_grip: dict = {f"{g:g}": [] for g in grip_eps}
+    for s in range(len(rec)):
+        xa_s = rec[s]["lat_a"].float()
+        x0s = xa_s - sig_a[s] * rec[s]["pred_a"].float()
+        base = _continue(r, rec, kv_cap, kv0, f0, s, x0s, sig_a[s], context, context_mask)
+        if a0 is not None:
+            a0_dev = a0.to(xa_s.device)
+            actions[f"c0@{s}"] = base[0]
+            for e in eps:
+                xh = x0s.clone()
+                xh[0, :n_exec, :3] = a0_dev + (1.0 + e) * (x0s[0, :n_exec, :3] - a0_dev)
+                actions[f"c{e:g}@{s}"] = _continue(r, rec, kv_cap, kv0, f0, s, xh, sig_a[s], context, context_mask)[0]
+        for g in grip_eps:
+            xh = x0s.clone()
+            xh[0, :n_exec, -1] = x0s[0, :n_exec, -1] + g
+            fin = _continue(r, rec, kv_cap, kv0, f0, s, xh, sig_a[s], context, context_mask)
+            c_grip[f"{g:g}"].append(_r6(float((fin[0, :n_exec, -1] - base[0, :n_exec, -1]).mean() / g)))
+    return c_grip
+
+
 def run_call(r, rec: list, kv_cap: dict, kv0: list, grid: sel.Grid, f0: int, seed: int,
              a0: Optional[torch.Tensor], context: torch.Tensor, context_mask: torch.Tensor,
              patch: tuple[int, int, int]) -> dict:
@@ -261,6 +300,8 @@ def run_call(r, rec: list, kv_cap: dict, kv0: list, grid: sel.Grid, f0: int, see
     tips = tuple(int(x) for x in qm.get("tips", (78, 82)))
     check_enabled = bool(qm.get("check", True))
     late = str(qm.get("late", "f1s84"))
+    grip_eps = tuple(float(x) for x in qm.get("grip_eps", ()))
+    only_c = bool(qm.get("only_c", False))
 
     L, S = r.num_layers, len(rec)
     kf, pf, half = grid.num_future, grid.per_frame, grid.width // 2
@@ -313,6 +354,14 @@ def run_call(r, rec: list, kv_cap: dict, kv0: list, grid: sel.Grid, f0: int, see
             num = (dd[s] * dd_last).sum(dim=-1)[mask].sum()
             rows_f.append(_r6(float(num / den)) if den != 0.0 else None)
         F[gname] = rows_f
+
+    if only_c:  # jump-tune: c(s) and c_grip(s) only, none of the side forwards
+        actions_c: dict[str, torch.Tensor] = {}
+        c_grip = c_block(r, rec, kv_cap, kv0, f0, sig_a, a0, eps, grip_eps, n_exec, context, context_mask, actions_c)
+        return {"only_c": True, "n_exec": n_exec, "eps": list(eps), "grip_eps": list(grip_eps),
+                "sigma_v": [_r6(x) for x in sig_v], "sigma_a": [_r6(x) for x in sig_a],
+                "dsigma_a": [_r6(-float(rec[s]["d_a"])) for s in range(S)], "F": F,
+                "actions": {name: _f32_b64(t) for name, t in actions_c.items()}, "c_grip": c_grip, "c_skipped": a0 is None}
 
     # Plans from the state of step 1, measured with a sparse forward (L84-meas).
     rows1 = r._explore_rows(late, grid, None).to(dev)
@@ -416,27 +465,8 @@ def run_call(r, rec: list, kv_cap: dict, kv0: list, grid: sel.Grid, f0: int, see
     actions[f"b:rs@{last_s}"] = aa_rs
     share["b"]["rs"].append(_r6(float(sum(ab_rs["share"]) / len(ab_rs["share"]))))
 
-    # c(s): dense action stream with an epsilon-scaled first-step displacement, continued in fp32.
-    if a0 is not None:
-        for s in range(S):
-            xa_s = rec[s]["lat_a"].float()
-            x0s = xa_s - sig_a[s] * rec[s]["pred_a"].float()
-            a0_dev = a0.to(xa_s.device)
-            for e in (0.0,) + eps:
-                xh = x0s.clone()
-                xh[0, :n_exec, :3] = a0_dev + (1.0 + e) * (x0s[0, :n_exec, :3] - a0_dev)
-                v = (xa_s - xh) / sig_a[s]
-                x = xa_s + rec[s]["d_a"].float() * v
-                for s2 in range(s + 1, S):
-                    pa2 = r.action.pre_dit(
-                        action_tokens=x.to(rec[s2]["lat_a"].dtype),
-                        timestep=rec[s2]["ts_a"],
-                        context=context,
-                        context_mask=context_mask,
-                    )
-                    pred2 = action_forward(r, pa2, kv0, [kv_cap[(s2, l)] for l in range(L)], None, None, f0, share=False)["pred"]
-                    x = x + rec[s2]["d_a"].float() * pred2.float()
-                actions[f"c{e:g}@{s}"] = x[0]
+    # c(s): dense action stream with an epsilon-scaled first-step displacement, continued in fp32; c_grip(s) (jump-tune).
+    c_grip = c_block(r, rec, kv_cap, kv0, f0, sig_a, a0, eps, grip_eps, n_exec, context, context_mask, actions)
 
     # Last-step readout.
     kv_last = [kv_cap[(last_s, l)] for l in range(L)]
@@ -529,4 +559,5 @@ def run_call(r, rec: list, kv_cap: dict, kv0: list, grid: sel.Grid, f0: int, see
             "sparse196_steps": [bool(x) for x in checks_sparse] if check_enabled else None,
         },
         "c_skipped": a0 is None,
+        "c_grip": c_grip,
     }

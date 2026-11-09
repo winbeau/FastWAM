@@ -531,11 +531,30 @@ def role_plan(measured: torch.Tensor, av: torch.Tensor, diff: torch.Tensor, sink
                 truncated=truncated, step_bias=step_bias)
 
 
-def late_read_plan(plan: "Plan", last: str, grid: sel.Grid, first: int = 2, n_steps: int = 10) -> "Plan":
+def late_read_plan(plan: "Plan", last: str, grid: sel.Grid, first: int = 2, n_steps: int = 10, land: int | None = None,
+                   mid: str | None = None, seed: int = 0) -> "Plan":
     """late-read: the late anchor's plan with nothing computed on steps ``first`` .. n_steps-2; the last step computes ``last``:
     plan (the plan's own last-step tokens and key bias), near (every near-frame token, key + log(Kf / pf)) or all (every future
-    token, no bias). Steps without a token keep an empty bias, so ``bias_at`` reads ``step_bias``."""
+    token, no bias). Steps without a token keep an empty bias, so ``bias_at`` reads ``step_bias``.
+    jump-tune: ``land`` (< n_steps-1) also computes ``mid``: plus10 (the plan's own set on that step + 10 near-frame tokens it does not
+    compute, ``stratified_pick`` with ``seed``, joining the slice: slice key bias log(N / n) of its new size) or core (the plan's
+    sinks + core, no bias)."""
     s9 = n_steps - 1
+    mid_rows, mid_bias = None, {}
+    if land is not None and land < s9:
+        own = plan.real(land).cpu()
+        if mid == "plus10":
+            near = torch.arange(grid.per_frame)
+            extra = stratified_pick(near[~torch.isin(near, own)], 10, grid, seed)
+            fixed = plan.fixed.cpu()
+            slc = torch.cat([own[~torch.isin(own, fixed)], extra])
+            mid_rows = torch.sort(torch.cat([own, extra])).values
+            lg = math.log(int(plan.periphery.numel()) / int(slc.numel()))
+            mid_bias = {int(j): lg for j in slc.tolist()}
+        elif mid == "core":
+            mid_rows = torch.sort(plan.fixed.cpu()).values
+        else:
+            raise ValueError(f"late_read_plan: mid must be plus10 / core, got {mid!r}")
     if last == "plan":
         rows, bias = plan.real(s9).cpu(), {int(j): float(v) for j, v in plan.bias_at(s9).items()}
     elif last == "near":
@@ -551,6 +570,9 @@ def late_read_plan(plan: "Plan", last: str, grid: sel.Grid, first: int = 2, n_st
     slices[(s9 - 1) % n] = torch.sort(rows.long()).values  # real(s) reads slices[(s - 1) % n]
     step_bias = {s: {} for s in range(first, s9)}
     step_bias[s9] = bias
+    if mid_rows is not None:
+        slices[(land - 1) % n] = mid_rows.long()
+        step_bias[land] = mid_bias
     return Plan(plan.method, plan.sinks.cpu(), plan.core.cpu(), plan.periphery.cpu(), empty, slices=slices,
                 truncated=None if plan.truncated is None else plan.truncated.cpu(), step_bias=step_bias)
 

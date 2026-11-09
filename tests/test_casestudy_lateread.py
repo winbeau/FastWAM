@@ -64,3 +64,34 @@ def test_late_read_plan(last):
     assert torch.equal(moved.real(9), rows) and moved.bias_at(9) == bias and moved.fixed.numel() == 0
     with pytest.raises(ValueError):
         fv.late_read_plan(plan, "far", GRID)
+
+
+def test_jump_land_config():
+    p = parse_config(_arm(late_read="jump", late_read_last="all", late_read_land=8, late_read_mid="plus10", late_read_seed=3)).prune
+    assert p.late_read_land == 8 and p.late_read_mid == "plus10" and p.late_read_seed == 3
+    assert parse_config({"method": "dense", "num_inference_steps": 10, "qm": {"grip_eps": [0.2, -0.2], "only_c": True}}).qm["only_c"]
+    for bad in (_arm(late_read="lr", late_read_land=8, late_read_mid="core"), _arm(late_read="jump", late_read_land=8),
+                _arm(late_read="jump", late_read_land=9, late_read_mid="core"), _arm(late_read="jump", late_read_land=2, late_read_mid="core"),
+                _arm(late_read="jump", late_read_land=8, late_read_mid="xx"), _arm(late_read="jump", late_read_mid="core")):
+        with pytest.raises(ValueError):
+            parse_config(bad)
+
+
+@pytest.mark.parametrize("mid", ("plus10", "core"))
+def test_late_read_plan_land(mid):
+    plan = _plan()
+    p = fv.late_read_plan(plan, "all", GRID, land=8, mid=mid, seed=0)
+    for s in range(2, 8):
+        assert p.real(s).numel() == 0 and p.bias_at(s) == {}
+    assert torch.equal(p.real(9), torch.arange(196)) and p.bias_at(9) == {}
+    rows, bias, own = p.real(8), p.bias_at(8), plan.real(8)
+    if mid == "core":
+        assert torch.equal(rows, torch.sort(plan.fixed).values) and rows.numel() == 23 and bias == {}
+    else:
+        extra = sorted(set(rows.tolist()) - set(own.tolist()))
+        assert rows.numel() == 49 and set(own.tolist()) <= set(rows.tolist()) and len(extra) == 10 and all(j < 98 for j in extra)
+        assert sum(1 for j in extra if (j % 14) >= 7) == 5  # stratified over the two near-frame cameras
+        slc = [j for j in rows.tolist() if j not in set(plan.fixed.tolist())]
+        assert set(bias) == set(slc) and len(slc) == 26
+        assert all(v == pytest.approx(math.log(plan.periphery.numel() / 26)) for v in bias.values())
+        assert torch.equal(fv.late_read_plan(plan, "all", GRID, land=8, mid=mid, seed=0).real(8), rows)

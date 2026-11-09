@@ -94,6 +94,8 @@ LATE_ORACLES = ("far", "near", "wrist", "agent", "plan", "all")
 ROLE_VARIANTS = ("rs", "notip", "wdiff", "aav", "nofar", "wdiffb")  # role-select (fovea.role_plan); wdiffb: quick-metrics
 QM_KEYS = {"k", "layer", "executed", "eps", "tips", "check", "late"}
 LATE_READS, LATE_READ_LAST = ("lr", "jump"), ("plan", "near", "all")  # late-read (fovea.late_read_plan)
+LATE_READ_MID = ("plus10", "core")  # jump-tune: what the landing step computes
+QM_KEYS = QM_KEYS | {"grip_eps", "only_c"}  # jump-tune: the gripper channel's retention c_grip(s); c(s) / c_grip(s) only
 FOVEA_METHODS = ("sink", "rep", "fov_grid", "fov_cluster", "interlace", "interlace_w", "interlace_wfar",
                  "interlace_cal", "interlace_fill", "merge", "interlace_ht")
 LAYER_RULES = ("min_entropy", "fixed")
@@ -280,6 +282,12 @@ class PruneConfig:
     late_read: Optional[str] = None
     late_read_last: str = "plan"
     late_record_z: bool = False
+    #: jump-tune: jump lands on ``late_read_land`` (steps 2 .. land-1 skipped) instead of the last step; the landing step computes
+    #: ``late_read_mid``: plus10 (the plan's own set + 10 stratified near-frame tokens joining the slice, slice bias log(N / n) of
+    #: its new size; ``late_read_seed``) or core (the plan's sinks + core, no bias).
+    late_read_land: Optional[int] = None
+    late_read_mid: Optional[str] = None
+    late_read_seed: int = 0
 
 
 @dataclass(frozen=True)
@@ -519,6 +527,9 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             late_read=None if block.get("late_read") is None else str(block["late_read"]),
             late_read_last=str(block.get("late_read_last", "plan")),
             late_record_z=bool(block.get("late_record_z", False)),
+            late_read_land=None if block.get("late_read_land") is None else int(block["late_read_land"]),
+            late_read_mid=None if block.get("late_read_mid") is None else str(block["late_read_mid"]),
+            late_read_seed=int(block.get("late_read_seed", 0)),
         )
         if prune.fovea is not None or prune.fovea_off:
             _require(prune.fovea in FOVEA_METHODS, f"prune.fovea must be one of {FOVEA_METHODS} (fovea_off needs a method)")
@@ -580,6 +591,9 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
         _require(prune.late_read_last in LATE_READ_LAST and (prune.late_read is not None or prune.late_read_last == "plan"),
                  f"prune.late_read_last ({LATE_READ_LAST}) needs late_read")
         _require(not prune.late_record_z or (prune.late is not None and prune.late_step == 1), "prune.late_record_z needs the late anchor")
+        _require((prune.late_read_land is None and prune.late_read_mid is None) or (
+            prune.late_read == "jump" and prune.late_read_land is not None and 3 <= prune.late_read_land <= steps - 2
+            and prune.late_read_mid in LATE_READ_MID), f"prune.late_read_land (3 .. steps-2) with late_read_mid {LATE_READ_MID} needs late_read jump")
         _require(not prune.step_delta or (prune.late is not None and prune.late_step == 1 and prune.late_oracle is None
                                           and all(1 <= s_ <= 9 for s_, _ in prune.step_delta)
                                           and len({s_ for s_, _ in prune.step_delta}) == len(prune.step_delta)),

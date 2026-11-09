@@ -1265,6 +1265,8 @@ class JointCaseStudyRunner:
         # late-read: steps 2 .. steps-2 compute no future token (lr: action rows only; jump: nothing, step 1's action velocity kept)
         late_read = prune.late_read if late is not None else None
         late_jump_pred: Optional[torch.Tensor] = None
+        # jump-tune: the step the jump lands on (steps 2 .. land-1 run no network); the last step unless late_read_land
+        late_land = int(prune.late_read_land) if late_read is not None and prune.late_read_land is not None else steps - 1
         late_st: dict = {"recv": torch.zeros(num_future, device=model.device)} if late is not None else {}
         z_late = rearrange(latents_video[0, :, 0:int(patch[0])].float(), "c (f a) (h b) (w e) -> f (h w) (c a b e)", a=int(patch[0]),
                            b=int(patch[1]), e=int(patch[2]))[0] if late is not None else None
@@ -1404,7 +1406,7 @@ class JointCaseStudyRunner:
             fv_step = fplan is not None and mode == "pruned"
             # late-read JUMP: steps 2 .. steps-2 run no network; every velocity is kept (the video drafts, step 1's action velocity),
             # so the latents follow the merged straight-line ODE in the pass's own arithmetic.
-            jump_now = late_read == "jump" and 2 <= s <= steps - 2
+            jump_now = late_read == "jump" and 2 <= s < late_land
             p0_step = s0_probes is not None and s == 0
             idx_rel = (fplan.real(s) if fv_step else kept) if mode == "pruned" else (s0_probes if p0_step else all_future)
             idx_abs = idx_rel + f0
@@ -1652,7 +1654,7 @@ class JointCaseStudyRunner:
                         amask = cal_a if cal_a is not None else fv_mask_a
                         if n_fk != (num_future if fill_now else n_q) or int(k_all.shape[1]) != f0 + n_fk + int(io_a[1].shape[1]):
                             raise RuntimeError("fovea: the action rows see keys that were not computed on this step")
-                        if late_read is not None and 2 <= s <= steps - 2 and int(k_all.shape[1]) != f0 + int(io_a[1].shape[1]):
+                        if late_read is not None and 2 <= s <= steps - 2 and s != late_land and int(k_all.shape[1]) != f0 + int(io_a[1].shape[1]):
                             raise RuntimeError("late-read: the action rows see future keys on an empty step")
                     elif no_future and mode == "pruned":
                         # S0-noF: the action rows see frame 0 and themselves, no future token.
@@ -2238,13 +2240,14 @@ class JointCaseStudyRunner:
                 if late_read is not None:
                     # late-read: nothing on steps 2 .. steps-2, the last step computes late_read_last (plan: the plan's own set)
                     plan_last = fplan.real(steps - 1).cpu()
-                    fplan = fv.late_read_plan(fplan, prune.late_read_last, grid, n_steps=steps).to(kept.device)
+                    fplan = fv.late_read_plan(fplan, prune.late_read_last, grid, n_steps=steps, land=late_land, mid=prune.late_read_mid,
+                                              seed=int(prune.late_read_seed)).to(kept.device)
                     kept = fplan.fixed
                     rows_last = fplan.real(steps - 1).cpu()
                     diag["late_read"] = {"mode": late_read, "last": prune.late_read_last, "rows_last": rows_last.tolist(),
                                          "rows_last_equal_plan": bool(torch.equal(rows_last, plan_last)),
                                          "bias_last": sorted({round(v, 6) for v in fplan.bias_at(steps - 1).values()}),
-                                         "mid_rows": [int(fplan.real(s_).numel()) for s_ in range(2, steps - 1)]}
+                                         "mid_rows": [int(fplan.real(s_).numel()) for s_ in range(2, steps - 1)], "land": int(late_land)}
             if c2f is not None and s == 1 and "df1" in c2f:
                 # C2F: the plan of steps 2-9 from the scores measured at steps 0 and 1 (the latest for every token).
                 av_m, df_m = c2f["av"].clone(), c2f["diff"].clone()
