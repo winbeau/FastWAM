@@ -91,6 +91,9 @@ Options (``policy.options``):
                          [calls, 7, 7] (action-eval ``scripts/casestudy/body_masks.py``): ``fk_body`` / ``fk_cover`` from the
                          joint values and the calibration only, ``seg_body`` from the segmentation render. Arms whose
                          ``prune.late_read_last`` is a body read (``fovea.BODY_READS``) get them as ``body_rows``.
+                         ``online: true``: computed every call from the observation's ``extra.robot_joints``
+                         (benchmark.joint_state) and ``<dir>/calib-<episode>.json`` with ``fastwam.casestudy.body_fk``
+                         (no seg mask); logged in ``diagnostics.body_online``.
 
 ``step0_tube``           optional {file, suite} for arms with ``prune.step0: d`` (step0-sparse plan D): a JSON with ``M``
                          (3 x 3, summed simulator action xyz -> end-effector displacement in m) and ``cameras``
@@ -374,10 +377,14 @@ class FastWAMJointPolicy:
             # body-select: per episode <dir>/<episode>.npz of the agentview body masks of every call (scripts/casestudy/body_masks.py
             # in action-eval: fk_body / fk_cover from the joint values + calibration, seg_body from the segmentation render)
             f = dict(options["body_masks"])
-            unknown = sorted(set(f) - {"dir"})
+            unknown = sorted(set(f) - {"dir", "online"})
             if unknown or not f.get("dir"):
                 raise ValueError(f"body_masks needs dir (unknown keys: {unknown})")
-            self.body_masks = {"dir": Path(str(f["dir"]))}
+            # online: the masks of every call from the observation's joint values (benchmark.joint_state) and the scene's
+            # calibration <dir>/calib-<episode>.json, with fastwam.casestudy.body_fk (the same code as action-eval's); no seg
+            self.body_masks = {"dir": Path(str(f["dir"])), "online": bool(f.get("online", False))}
+        self._body_calib = None
+        self._body_now = None
         self._repeat_offset = 0
         self.episode_plans = {}
         self.episode_plans_sha256 = None
@@ -509,7 +516,16 @@ class FastWAMJointPolicy:
                 self._inject_frames = {k: z[k] for k in ("agentview", "wrist", "deltas", "call_ok", "valid")}
             if [float(x) for x in self._inject_frames["deltas"]] != self.inject["deltas"]:
                 raise ValueError(f"inject_future: {path} has deltas {self._inject_frames['deltas']}, not {self.inject['deltas']}")
-        if self.body_masks is not None:
+        if self.body_masks is not None and self.body_masks["online"]:
+            import json as _json
+
+            path = self.body_masks["dir"] / f"calib-{_re.sub(r'-r[0-9]+.*$', '', episode_id)}.json"
+            if not path.is_file():
+                raise FileNotFoundError(f"body_masks online: no calibration {path}")
+            self._body_calib = _json.loads(path.read_text())
+            if not self._body_calib.get("q_obs"):
+                raise ValueError(f"body_masks online: {path} has no q_obs (regenerate it with body_masks.py)")
+        elif self.body_masks is not None:
             path = self.body_masks["dir"] / f"{_re.sub(r'-r[0-9]+.*$', '', episode_id)}.npz"
             if not path.is_file():
                 raise FileNotFoundError(f"body_masks: no masks {path}")
@@ -540,6 +556,16 @@ class FastWAMJointPolicy:
             raise ValueError(f"expected cameras ['agentview', 'wrist'], got {sorted(images)}")
         if state.shape != (8,) or not np.isfinite(state).all():
             raise ValueError(f"expected a finite 8-dim proprio vector, got {state.shape}")
+        if self.body_masks is not None and self.body_masks["online"]:
+            # body-select online: this call's agentview body mask from the joint values and the calibration only
+            from fastwam.casestudy import body_fk as _bf
+
+            joints = (observation.get("extra") or {}).get("robot_joints")
+            if joints is None:
+                raise ValueError("body_masks online needs observation extra robot_joints (benchmark.joint_state: true)")
+            q = np.asarray(joints, dtype=np.float64)[np.asarray(self._body_calib["q_obs"])]
+            cover, body = _bf.body_mask(q, self._body_calib)
+            self._body_now = {"fk": _bf.near_rows(body), "fk_cover": _bf.near_rows(cover)}
 
         started = time.perf_counter()
         rgb = self._io.compose_model_image(
@@ -582,6 +608,8 @@ class FastWAMJointPolicy:
             raise ValueError("FastWAM produced non-finite actions")
         self.predict_calls += 1
         diag.update({"call_index": call_index, "model_seconds": round(model_seconds, 6)})
+        if self._body_now is not None:  # body-select online: the mask this call used (checked against the offline masks)
+            diag["body_online"] = {k: list(v) for k, v in self._body_now.items()}
         diag.update(self._chunk_logs(action, cont))
         diag.update(agc_log)
         if hybrid_log is not None:
@@ -1061,6 +1089,8 @@ class FastWAMJointPolicy:
         body_masks option is set (body reads, the f1body49 anchor, mech sets); {} otherwise (a body read then fails in the runner)."""
         if self.body_masks is None:
             return {}
+        if self.body_masks["online"]:
+            return {"body_rows": dict(self._body_now)}
         if self._body is None or call_index >= len(self._body["fk_body"]):
             raise ValueError(f"body_masks: no mask for call {call_index} of {self._episode_id}")
         width = 2 * int(self._body["fk_body"].shape[-1])
