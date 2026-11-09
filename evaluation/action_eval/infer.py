@@ -87,6 +87,10 @@ Options (``policy.options``):
                          and every ok condition: the masked future tokens of F_real(1) replaced by the static future, the
                          delta = 0.5 future (half) or static + 0.5 (real - static) (fade). Also each future token's latent change
                          against the frame-0 latent and against the static future. Logged in ``diagnostics.region_attrib``.
+``body_masks``           optional {dir}: body-select. ``<dir>/<episode>.npz`` holds the agentview body masks of every call
+                         [calls, 7, 7] (action-eval ``scripts/casestudy/body_masks.py``): ``fk_body`` / ``fk_cover`` from the
+                         joint values and the calibration only, ``seg_body`` from the segmentation render. Arms whose
+                         ``prune.late_read_last`` is a body read (``fovea.BODY_READS``) get them as ``body_rows``.
 
 ``step0_tube``           optional {file, suite} for arms with ``prune.step0: d`` (step0-sparse plan D): a JSON with ``M``
                          (3 x 3, summed simulator action xyz -> end-effector displacement in m) and ``cameras``
@@ -364,6 +368,16 @@ class FastWAMJointPolicy:
                            "seeds": [int(x) for x in f.get("seeds") or [0]]}
             if self.casestudy.seed_mode != "episode_call_hash" or self.casestudy.method != "dense":
                 raise ValueError("region_attrib needs a dense executed arm with seed_mode=episode_call_hash")
+        self.body_masks = None
+        self._body = None
+        if options.get("body_masks") is not None:
+            # body-select: per episode <dir>/<episode>.npz of the agentview body masks of every call (scripts/casestudy/body_masks.py
+            # in action-eval: fk_body / fk_cover from the joint values + calibration, seg_body from the segmentation render)
+            f = dict(options["body_masks"])
+            unknown = sorted(set(f) - {"dir"})
+            if unknown or not f.get("dir"):
+                raise ValueError(f"body_masks needs dir (unknown keys: {unknown})")
+            self.body_masks = {"dir": Path(str(f["dir"]))}
         self._repeat_offset = 0
         self.episode_plans = {}
         self.episode_plans_sha256 = None
@@ -495,6 +509,12 @@ class FastWAMJointPolicy:
                 self._inject_frames = {k: z[k] for k in ("agentview", "wrist", "deltas", "call_ok", "valid")}
             if [float(x) for x in self._inject_frames["deltas"]] != self.inject["deltas"]:
                 raise ValueError(f"inject_future: {path} has deltas {self._inject_frames['deltas']}, not {self.inject['deltas']}")
+        if self.body_masks is not None:
+            path = self.body_masks["dir"] / f"{_re.sub(r'-r[0-9]+.*$', '', episode_id)}.npz"
+            if not path.is_file():
+                raise FileNotFoundError(f"body_masks: no masks {path}")
+            with np.load(path) as z:
+                self._body = {k: z[k].astype(bool) for k in ("fk_body", "fk_cover", "seg_body")}
         if self.region is not None:
             ep = _re.sub(r'-r[0-9]+.*$', '', episode_id)
             fpath, ppath = self.region["frames_dir"] / f"{ep}.npz", self.region["plan_dir"] / f"{ep}.npz"
@@ -547,7 +567,7 @@ class FastWAMJointPolicy:
             action_horizon=self.action_horizon, num_video_frames=self.num_video_frames,
             seed=seed, sigma_shift=self.sigma_shift, rand_device=self.rand_device,
             **({"_capture_video": video_cap} if video_cap is not None else {}), **self._tube_kwargs(runner),
-            **self._mem_kwargs(runner, "exec"),
+            **self._mem_kwargs(runner, "exec"), **self._body_kwargs(runner, call_index),
         )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -823,7 +843,7 @@ class FastWAMJointPolicy:
                     prompt=prompt, input_image=image, proprio=proprio,
                     action_horizon=self.action_horizon, num_video_frames=self.num_video_frames,
                     seed=seed, sigma_shift=self.sigma_shift, rand_device=self.rand_device, **self._tube_kwargs(runner),
-                    **self._mem_kwargs(runner, offset), **real, **self._qm_kwargs(runner),
+                    **self._mem_kwargs(runner, offset), **real, **self._qm_kwargs(runner), **self._body_kwargs(runner, call_index),
                 )
                 cont, _, agc_log = self._agc(runner.cfg, d, self._continuous(action))
                 entry = {"seed": int(seed), **self._chunk_logs(action, cont), **agc_log}
@@ -1035,6 +1055,25 @@ class FastWAMJointPolicy:
             return cells, switch, info
 
         return tube
+
+    def _body_kwargs(self, runner, call_index: int) -> dict:
+        """body-select: ``body_rows`` {fk, fk_cover, seg} of this call (near-frame agentview token indices r * 14 + c) for a runner
+        whose last step reads the body mask; {} for other runners."""
+        from fastwam.casestudy import fovea as _fv
+
+        prune = getattr(runner.cfg, "prune", None)
+        if prune is None or prune.late_read_last not in _fv.BODY_READS:
+            return {}
+        if self._body is None or call_index >= len(self._body["fk_body"]):
+            raise ValueError(f"body_masks: no mask for call {call_index} of {self._episode_id}")
+        width = 2 * int(self._body["fk_body"].shape[-1])
+
+        def rows(m):
+            rr, cc = np.nonzero(m)
+            return sorted(int(r) * width + int(c) for r, c in zip(rr, cc))
+
+        return {"body_rows": {"fk": rows(self._body["fk_body"][call_index]), "fk_cover": rows(self._body["fk_cover"][call_index]),
+                              "seg": rows(self._body["seg_body"][call_index])}}
 
     def _qm_kwargs(self, runner) -> dict:
         """quick-metrics (``casestudy.qm``): ``_qm_zero``, the normalized action of zero simulator translation per xyz dimension

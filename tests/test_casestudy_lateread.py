@@ -129,3 +129,40 @@ def test_read49(last):
     with pytest.raises(ValueError):
         fv.late_read_plan(plan, last, GRID)
     assert parse_config(_arm(late_read="jump", late_read_last=last)).prune.late_read_tips == (78, 82)
+
+
+@pytest.mark.parametrize("last", ("bw20", "bw30", "br30", "bwseg30", "bwc30"))
+@pytest.mark.parametrize("with_sink", (False, True))
+def test_read_body(last, with_sink):
+    plan = _plan()
+    lg2 = math.log(2.0)
+    ag = [j for j in range(98) if j % 14 < 7]
+    wr = [j for j in range(98) if j % 14 >= 7]
+    fk = [r * 14 + c for r in range(2, 6) for c in range(1, 6)] + ([84] if with_sink else [])  # 20 (+ the sink) agentview tokens
+    body = {"fk": fk, "fk_cover": [r * 14 + c for r in range(3, 5) for c in range(2, 5)], "seg": [r * 14 + c for r in range(1, 5) for c in range(0, 4)]}
+    p = fv.late_read_plan(plan, last, GRID, body=body, tips=(78, 82), seed=0)
+    rows, bias = p.real(9), p.bias_at(9)
+    r = set(rows.tolist())
+    b = set(body[fv.BODY_SOURCE.get(last, "fk")])
+    n_w = 20 if last == "bw20" else 30
+    assert bool((rows < 98).all()) and set(bias) == r and torch.unique(rows).numel() == rows.numel()
+    assert b <= r and {78, 82, 84} <= r
+    w_sampled = (r & set(wr)) - {78, 82}
+    assert len(w_sampled) == n_w and all(bias[j] == pytest.approx(lg2 + math.log(47 / n_w)) for j in w_sampled)
+    assert bias[78] == pytest.approx(lg2) and bias[82] == pytest.approx(lg2)
+    if 84 not in b:
+        assert bias[84] == pytest.approx(lg2)
+    a_other = (r & set(ag)) - b - {84}
+    if last == "br30":
+        pool = len(ag) - len(b) - (0 if 84 in b else 1)
+        assert all(bias[j] == pytest.approx(lg2) for j in b)
+        assert len(a_other) == 6 and all(bias[j] == pytest.approx(lg2 + math.log(pool / 6)) for j in a_other)
+    else:
+        assert not a_other and all(bias[j] == pytest.approx(lg2 + math.log(49 / len(b))) for j in b)
+    assert rows.numel() == len(b) + (0 if 84 in b else 1) + 2 + n_w + (6 if last == "br30" else 0)
+    assert torch.equal(fv.late_read_plan(plan, last, GRID, body=body, tips=(78, 82), seed=0).real(9), rows)
+    with pytest.raises(ValueError):
+        fv.late_read_plan(plan, last, GRID, tips=(78, 82))
+    with pytest.raises(ValueError):
+        fv.late_read_plan(plan, last, GRID, body={**body, "fk": [7], "seg": [7], "fk_cover": [7]}, tips=(78, 82))  # a wrist token
+    assert parse_config(_arm(late_read="jump", late_read_last=last)).prune.late_read_last == last

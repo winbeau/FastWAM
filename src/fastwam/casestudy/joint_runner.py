@@ -1006,10 +1006,14 @@ class JointCaseStudyRunner:
         _memory_key: Any = None,
         _real_future: Optional[torch.Tensor] = None,
         _qm_zero: Optional[torch.Tensor] = None,
+        body_rows: Optional[dict] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         cfg = self.cfg
         model = self.model
         steps = int(cfg.num_inference_steps)
+        if cfg.prune is not None and cfg.prune.late_read_last in fv.BODY_READS and body_rows is None:
+            # body-select: the last step reads the agentview body mask of this call (the adapter's body_masks option)
+            raise ValueError(f"prune.late_read_last {cfg.prune.late_read_last} needs body_rows")
         if cfg.prune is not None and (cfg.prune.side0_use is not None or cfg.prune.mem_route):
             # step0-sparse-r2: R1 / R3b / R7 score on casestudy.score_layer (B's layer; R7 has no dense step 0 from call 1 on).
             self._layers = {"act": int(cfg.score_layer), "inst": -1}
@@ -2248,13 +2252,17 @@ class JointCaseStudyRunner:
                     d_meas[rows1.cpu()] = d_anchor.cpu()
                     fplan = fv.late_read_plan(fplan, prune.late_read_last, grid, n_steps=steps, land=late_land, mid=prune.late_read_mid,
                                               seed=int(prune.late_read_seed), d_meas=d_meas,
-                                              tips=prune.late_read_tips).to(kept.device)
+                                              tips=prune.late_read_tips, body=body_rows).to(kept.device)
                     kept = fplan.fixed
                     rows_last = fplan.real(steps - 1).cpu()
                     diag["late_read"] = {"mode": late_read, "last": prune.late_read_last, "rows_last": rows_last.tolist(),
                                          "rows_last_equal_plan": bool(torch.equal(rows_last, plan_last)),
                                          "bias_last": sorted({round(v, 6) for v in fplan.bias_at(steps - 1).values()}),
-                                         "mid_rows": [int(fplan.real(s_).numel()) for s_ in range(2, steps - 1)], "land": int(late_land)}
+                                         "mid_rows": [int(fplan.real(s_).numel()) for s_ in range(2, steps - 1)], "land": int(late_land),
+                                         "n_last": int(rows_last.numel())}
+                    if prune.late_read_last in fv.BODY_READS:  # body-select: the body set the last step read
+                        src = fv.BODY_SOURCE.get(prune.late_read_last, "fk")
+                        diag["late_read"]["body"] = sorted(int(j) for j in body_rows[src])
             if c2f is not None and s == 1 and "df1" in c2f:
                 # C2F: the plan of steps 2-9 from the scores measured at steps 0 and 1 (the latest for every token).
                 av_m, df_m = c2f["av"].clone(), c2f["diff"].clone()

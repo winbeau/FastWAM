@@ -93,7 +93,8 @@ MECH_KEYS = {"steps", "calls", "sets", "noise", "patch_set", "patch_ranges", "se
 LATE_ORACLES = ("far", "near", "wrist", "agent", "plan", "all")
 ROLE_VARIANTS = ("rs", "notip", "wdiff", "aav", "nofar", "wdiffb")  # role-select (fovea.role_plan); wdiffb: quick-metrics
 QM_KEYS = {"k", "layer", "executed", "eps", "tips", "check", "late"}
-LATE_READS, LATE_READ_LAST = ("lr", "jump"), ("plan", "near", "all", "u49", "n49", "flip49")  # late-read (fovea.late_read_plan)
+LATE_READS, LATE_READ_LAST = ("lr", "jump"), ("plan", "near", "all", "u49", "n49", "flip49",  # late-read (fovea.late_read_plan)
+                                               "bw20", "bw30", "br30", "bwseg30", "bwc30")  # body-select (fovea.read_body)
 LATE_READ_MID = ("plus10", "core")  # jump-tune: what the landing step computes
 QM_KEYS = QM_KEYS | {"grip_eps", "only_c"}  # jump-tune: the gripper channel's retention c_grip(s); c(s) / c_grip(s) only
 FOVEA_METHODS = ("sink", "rep", "fov_grid", "fov_cluster", "interlace", "interlace_w", "interlace_wfar",
