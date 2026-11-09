@@ -43,5 +43,6 @@ tools are in `scripts/casestudy/`. FastWAM-IDM (official Optional-IDM) has its o
 | step-marginal | `prune.step_delta` / `step_delta_seed` on the late anchor (step 1's set or step s's slice: n more tokens, stratified random, or |n| fewer, lowest plan A->V), `fovea.stratified_pick` / `lowest_av` / `apply_step_delta`, `Plan.drop` |
 | role-select | `prune.role_select` (rs / notip / wdiff / aav / nofar), `role_tips`, `role_seed`: the late anchor's plan of steps 2-9 by region roles (`fovea.role_plan`, `spread_order`, `role_strata`), `Plan.step_bias` |
 | quick-metrics | `casestudy.qm` (dense; keys k / layer / executed / eps / tips / check / late; `quick_metrics.run_call`, adapter `_qm_kwargs` / `_qm_units`: D / R per logged chunk), `prune.role_select: wdiffb` (RS-wDiff with the wrist group's key bias log(N_wrist / n)) |
+| late-read | `prune.late_read` (lr: steps 2-8 run the action rows only, no future key; jump: no network on steps 2-8, every velocity kept), `late_read_last` (plan / near / all: what step 9 computes), `late_record_z` (the future latents entering step 9, the tokens computed on steps 2-8); `fovea.late_read_plan` |
 
 Tests: `tests/test_casestudy_*.py` (CPU; run on the server, not locally).

@@ -531,6 +531,30 @@ def role_plan(measured: torch.Tensor, av: torch.Tensor, diff: torch.Tensor, sink
                 truncated=truncated, step_bias=step_bias)
 
 
+def late_read_plan(plan: "Plan", last: str, grid: sel.Grid, first: int = 2, n_steps: int = 10) -> "Plan":
+    """late-read: the late anchor's plan with nothing computed on steps ``first`` .. n_steps-2; the last step computes ``last``:
+    plan (the plan's own last-step tokens and key bias), near (every near-frame token, key + log(Kf / pf)) or all (every future
+    token, no bias). Steps without a token keep an empty bias, so ``bias_at`` reads ``step_bias``."""
+    s9 = n_steps - 1
+    if last == "plan":
+        rows, bias = plan.real(s9).cpu(), {int(j): float(v) for j, v in plan.bias_at(s9).items()}
+    elif last == "near":
+        rows = torch.arange(grid.per_frame)
+        bias = {int(j): math.log(grid.num_future / grid.per_frame) for j in rows.tolist()}
+    elif last == "all":
+        rows, bias = torch.arange(grid.num_future), {}
+    else:
+        raise ValueError(f"late_read_plan: last must be plan / near / all, got {last!r}")
+    n = n_steps - first
+    empty = torch.zeros(0, dtype=torch.long)
+    slices = [empty] * n
+    slices[(s9 - 1) % n] = torch.sort(rows.long()).values  # real(s) reads slices[(s - 1) % n]
+    step_bias = {s: {} for s in range(first, s9)}
+    step_bias[s9] = bias
+    return Plan(plan.method, plan.sinks.cpu(), plan.core.cpu(), plan.periphery.cpu(), empty, slices=slices,
+                truncated=None if plan.truncated is None else plan.truncated.cpu(), step_bias=step_bias)
+
+
 def tube_mask(cells: dict, grid: sel.Grid, wrist_rows: bool = False, dilate: int = 1) -> torch.Tensor:
     """Plan D: [Kf] bool, the agentview cells (row, column) of every future frame (``cells[f]``, f = 1..F-1) dilated by
     ``dilate`` within the block; ``wrist_rows`` adds the two bottom rows of every wrist block."""

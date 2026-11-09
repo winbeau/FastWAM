@@ -42,7 +42,8 @@ interpolated A->V and Diff, plan d with the frame-0 attention and the pilot's en
 adapter); the leftover probes go to the last slices. ``prune.e9`` (E9) redoes step 0's update of M4w with the interpolated
 draft on slices 1-6 or 8-9.
 quick-metrics (``casestudy.qm``, dense): the pass records its states and future K/V; ``quick_metrics.run_call`` runs the
-diagnostics on them afterwards (``diag["qm"]``).
+diagnostics on them afterwards (``diag["qm"]``). late-read (``prune.late_read``): the late anchor computes no future token on
+steps 2 .. steps-2 (lr: action rows only; jump: no network, every velocity kept) and ``late_read_last`` on the last step.
 ``frame0_cache=false`` (dense only) calls the model's native
 ``infer_action`` unchanged, as the reference for equivalence checks. ``cfg.dump`` writes
 one call's attention, action hidden states and decoded video to an ``.npz``.
@@ -1261,6 +1262,9 @@ class JointCaseStudyRunner:
         # step0-explore late anchor: step 0 computes no future token, step 1 computes the set ``prune.late`` and forms the
         # imagination (drafts spread from it), the plan of steps 2-9 comes from step 1.
         late = prune.late if prune is not None and not early else None
+        # late-read: steps 2 .. steps-2 compute no future token (lr: action rows only; jump: nothing, step 1's action velocity kept)
+        late_read = prune.late_read if late is not None else None
+        late_jump_pred: Optional[torch.Tensor] = None
         late_st: dict = {"recv": torch.zeros(num_future, device=model.device)} if late is not None else {}
         z_late = rearrange(latents_video[0, :, 0:int(patch[0])].float(), "c (f a) (h b) (w e) -> f (h w) (c a b e)", a=int(patch[0]),
                            b=int(patch[1]), e=int(patch[2]))[0] if late is not None else None
@@ -1398,6 +1402,9 @@ class JointCaseStudyRunner:
                                         "left": sorted(old_core - set(fplan.core.tolist())),
                                         "slice_sizes": [int(x.numel()) for x in fplan.slices]}
             fv_step = fplan is not None and mode == "pruned"
+            # late-read JUMP: steps 2 .. steps-2 run no network; every velocity is kept (the video drafts, step 1's action velocity),
+            # so the latents follow the merged straight-line ODE in the pass's own arithmetic.
+            jump_now = late_read == "jump" and 2 <= s <= steps - 2
             p0_step = s0_probes is not None and s == 0
             idx_rel = (fplan.real(s) if fv_step else kept) if mode == "pruned" else (s0_probes if p0_step else all_future)
             idx_abs = idx_rel + f0
@@ -1426,6 +1433,8 @@ class JointCaseStudyRunner:
                 xv = xv_in + tea_res_v
                 xa = xa_in + tea_res_a
                 tea_consecutive += 1
+            elif jump_now:
+                pass  # late-read JUMP: nothing is computed on this step (no cost row either)
             else:
                 capture_layers = act_layers if (s == 0 and capture_first_step and not route_plan) else set()
                 if mode == "pruned" and prune.reselect_every_step:
@@ -1643,6 +1652,8 @@ class JointCaseStudyRunner:
                         amask = cal_a if cal_a is not None else fv_mask_a
                         if n_fk != (num_future if fill_now else n_q) or int(k_all.shape[1]) != f0 + n_fk + int(io_a[1].shape[1]):
                             raise RuntimeError("fovea: the action rows see keys that were not computed on this step")
+                        if late_read is not None and 2 <= s <= steps - 2 and int(k_all.shape[1]) != f0 + int(io_a[1].shape[1]):
+                            raise RuntimeError("late-read: the action rows see future keys on an empty step")
                     elif no_future and mode == "pruned":
                         # S0-noF: the action rows see frame 0 and themselves, no future token.
                         k_all = torch.cat([kv0[layer]["k"], io_a[1]], dim=1)
@@ -2117,13 +2128,21 @@ class JointCaseStudyRunner:
                 # step0-sparse plan d: the pilot of the probe step (normalized), for the adapter's end-effector tube.
                 sigma0_a = t_action[0].float() / float(model.infer_action_scheduler.num_train_timesteps)
                 s0_pilot = (latents_action[0].float() - sigma0_a * pred_action[0].float()).cpu()
+            if jump_now:
+                pred_action = late_jump_pred  # late-read JUMP: step 1's action velocity (one Euler step from sigma_1 to the last step)
+            elif late_read == "jump" and s == 1:
+                late_jump_pred = pred_action
+            if late is not None and prune.late_record_z and s == steps - 1:
+                # late-read self-check: the future video latents entering the last step (token layout)
+                diag["late_z9_f32"] = _f32_b64(rearrange(latents_video, "b c (f x) (h y) (w z) -> b (f h w) (x y z c)", x=pt, y=ph,
+                                                         z=pw)[0, f0:])
             if qm_rec is not None:
                 qm_rec.append({"pre_v": pre_v, "pre_a": pre_a, "lat_v": latents_video.clone(), "lat_a": latents_action.clone(),
                                "vel": vel_tokens.clone(), "pred_a": pred_action.clone(), "ts_v": ts_v, "ts_a": ts_a, "d_a": d_action[s]})
             latents_video = model.infer_video_scheduler.step(pred_video, d_video[s], latents_video)
             latents_action = model.infer_action_scheduler.step(pred_action, d_action[s], latents_action)
             latents_video[:, :, 0:1] = first.clone()
-            modes.append("probe" if p0_step and idx_rel.numel() != num_future else mode)
+            modes.append("probe" if p0_step and idx_rel.numel() != num_future else ("jump" if jump_now else mode))
             if dump is not None:
                 d_latents.append(latents_action[0].float().cpu())
 
@@ -2213,6 +2232,19 @@ class JointCaseStudyRunner:
                 kept = fplan.fixed
                 diag["late"].update(core=fplan.core.tolist(), sinks=fplan.sinks.tolist(), slices=[int(x.numel()) for x in fplan.slices],
                                     truncated=int(fplan.truncated.numel()), step1_rows=int(rows1.numel()))
+                if prune.late_record_z:  # the tokens the plan computes on steps 2 .. steps-2 (their latents leave the drafts)
+                    mid = [fplan.real(s_) for s_ in range(2, steps - 1)]
+                    diag["late"]["computed_mid"] = torch.unique(torch.cat(mid)).tolist() if mid else []
+                if late_read is not None:
+                    # late-read: nothing on steps 2 .. steps-2, the last step computes late_read_last (plan: the plan's own set)
+                    plan_last = fplan.real(steps - 1).cpu()
+                    fplan = fv.late_read_plan(fplan, prune.late_read_last, grid, n_steps=steps).to(kept.device)
+                    kept = fplan.fixed
+                    rows_last = fplan.real(steps - 1).cpu()
+                    diag["late_read"] = {"mode": late_read, "last": prune.late_read_last, "rows_last": rows_last.tolist(),
+                                         "rows_last_equal_plan": bool(torch.equal(rows_last, plan_last)),
+                                         "bias_last": sorted({round(v, 6) for v in fplan.bias_at(steps - 1).values()}),
+                                         "mid_rows": [int(fplan.real(s_).numel()) for s_ in range(2, steps - 1)]}
             if c2f is not None and s == 1 and "df1" in c2f:
                 # C2F: the plan of steps 2-9 from the scores measured at steps 0 and 1 (the latest for every token).
                 av_m, df_m = c2f["av"].clone(), c2f["diff"].clone()

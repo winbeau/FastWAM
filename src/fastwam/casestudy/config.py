@@ -93,6 +93,7 @@ MECH_KEYS = {"steps", "calls", "sets", "noise", "patch_set", "patch_ranges", "se
 LATE_ORACLES = ("far", "near", "wrist", "agent", "plan", "all")
 ROLE_VARIANTS = ("rs", "notip", "wdiff", "aav", "nofar", "wdiffb")  # role-select (fovea.role_plan); wdiffb: quick-metrics
 QM_KEYS = {"k", "layer", "executed", "eps", "tips", "check", "late"}
+LATE_READS, LATE_READ_LAST = ("lr", "jump"), ("plan", "near", "all")  # late-read (fovea.late_read_plan)
 FOVEA_METHODS = ("sink", "rep", "fov_grid", "fov_cluster", "interlace", "interlace_w", "interlace_wfar",
                  "interlace_cal", "interlace_fill", "merge", "interlace_ht")
 LAYER_RULES = ("min_entropy", "fixed")
@@ -272,6 +273,13 @@ class PruneConfig:
     role_select: Optional[str] = None
     role_tips: tuple = ()
     role_seed: int = 0
+    #: late-read: the late anchor's steps 2 .. steps-2 compute no future token. ``lr``: the action rows still run, seeing frame 0 and
+    #: themselves; ``jump``: no network at all on those steps, every velocity (video drafts, step 1's action velocity) kept. The last
+    #: step computes ``late_read_last``: plan (the plan's own last-step set and bias), near (the near frame, key + log(Kf / pf)), all.
+    #: ``late_record_z`` logs the future video latents entering the last step and the tokens computed on steps 2 .. steps-2.
+    late_read: Optional[str] = None
+    late_read_last: str = "plan"
+    late_record_z: bool = False
 
 
 @dataclass(frozen=True)
@@ -508,6 +516,9 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             role_select=None if block.get("role_select") is None else str(block["role_select"]),
             role_tips=tuple(int(x) for x in (block.get("role_tips") or ())),
             role_seed=int(block.get("role_seed", 0)),
+            late_read=None if block.get("late_read") is None else str(block["late_read"]),
+            late_read_last=str(block.get("late_read_last", "plan")),
+            late_record_z=bool(block.get("late_record_z", False)),
         )
         if prune.fovea is not None or prune.fovea_off:
             _require(prune.fovea in FOVEA_METHODS, f"prune.fovea must be one of {FOVEA_METHODS} (fovea_off needs a method)")
@@ -563,6 +574,12 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
                  and prune.late_oracle is None and not prune.step_delta and prune.late_plan_far_av is None and prune.late_plan_far_diff is None
                  and (prune.role_select == "notip" or len(prune.role_tips) == 2)), f"prune.role_select ({ROLE_VARIANTS}, 2 role_tips but for notip) "
                  "replaces the late anchor's plan of steps 2-9 (late_step 1, no oracle, no step_delta, no far scaling)")
+        _require(prune.late_read is None or (prune.late_read in LATE_READS and prune.late is not None and prune.late_step == 1
+                 and prune.late_oracle is None and not prune.step_delta and prune.role_select is None and steps >= 4),
+                 f"prune.late_read ({LATE_READS}) empties the late anchor's steps 2 .. steps-2 (late_step 1, no oracle / step_delta / role_select)")
+        _require(prune.late_read_last in LATE_READ_LAST and (prune.late_read is not None or prune.late_read_last == "plan"),
+                 f"prune.late_read_last ({LATE_READ_LAST}) needs late_read")
+        _require(not prune.late_record_z or (prune.late is not None and prune.late_step == 1), "prune.late_record_z needs the late anchor")
         _require(not prune.step_delta or (prune.late is not None and prune.late_step == 1 and prune.late_oracle is None
                                           and all(1 <= s_ <= 9 for s_, _ in prune.step_delta)
                                           and len({s_ for s_, _ in prune.step_delta}) == len(prune.step_delta)),
