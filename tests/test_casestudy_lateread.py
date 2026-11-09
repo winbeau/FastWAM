@@ -90,7 +90,8 @@ def test_late_read_plan_land(mid):
     else:
         extra = sorted(set(rows.tolist()) - set(own.tolist()))
         assert rows.numel() == 49 and set(own.tolist()) <= set(rows.tolist()) and len(extra) == 10 and all(j < 98 for j in extra)
-        assert sum(1 for j in extra if (j % 14) >= 7) == 5  # stratified over the two near-frame cameras
+        pool = torch.tensor([j for j in range(98) if j not in set(own.tolist())])  # stratified over the near frame's two cameras
+        assert extra == fv.stratified_pick(pool, 10, GRID, 0).tolist()
         slc = [j for j in rows.tolist() if j not in set(plan.fixed.tolist())]
         assert set(bias) == set(slc) and len(slc) == 26
         assert all(v == pytest.approx(math.log(plan.periphery.numel() / 26)) for v in bias.values())
