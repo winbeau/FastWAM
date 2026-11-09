@@ -682,6 +682,31 @@ class JointCaseStudyRunner:
                 rec["stats"] = r["stats"]
             if name == "noise0":
                 rec["equal_dense"] = bool(torch.equal(r["x0"], y))
+            if mc.get("fill") and name in mc.get("sets", ()) and name != "all":
+                # body-select chain 3: the near frame's formation ratio, computed tokens at their measured change, the others
+                # inverse-distance filled from the computed near-frame ones (the late anchor's draft of the near frame, gain 1)
+                pf_ = grid.per_frame
+                dv = torch.zeros_like(y)
+                dv[rows] = r["x0"].float() - z[rows]
+                src = rows[rows < pf_]
+                filled, upd = fv.idw_fill(dv, src, grid)
+                dh = torch.zeros_like(y)
+                dh[src] = dv[src]
+                dh[upd] = filled[upd]
+                d = y.float() - z
+                near = torch.arange(pf_, device=y.device)
+                agent = (near % grid.width) < grid.width // 2
+                comp = torch.isin(near, src)
+
+                def kfrac(m):
+                    idx = near[m]
+                    den = float((d[idx] * d[idx]).sum())
+                    return float((dh[idx] * d[idx]).sum()) / den if den > 0 else float("nan")
+
+                cos = float((dh[near] * d[near]).sum() / (dh[near].norm() * d[near].norm()).clamp_min(1e-12))
+                rec["near_fill"] = {"kappa_near": kfrac(torch.ones_like(comp)), "kappa_agent": kfrac(agent), "kappa_wrist": kfrac(~agent),
+                                    "kappa_computed": kfrac(comp), "kappa_filled": kfrac(~comp), "cos_near": cos,
+                                    "n_computed": int(comp.sum()), "n_filled": int((~comp).sum())}
             if name == f"patch_all0_{self.num_layers}":
                 rec["equal_dense"] = bool(torch.equal(r["x0"], y[rows]))
             if lens is not None:

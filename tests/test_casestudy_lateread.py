@@ -131,7 +131,7 @@ def test_read49(last):
     assert parse_config(_arm(late_read="jump", late_read_last=last)).prune.late_read_tips == (78, 82)
 
 
-@pytest.mark.parametrize("last", ("bw20", "bw30", "br30", "bwseg30", "bwc30"))
+@pytest.mark.parametrize("last", ("bw20", "bw30", "br30", "bwseg30", "bwc30", "bwmid30"))
 @pytest.mark.parametrize("with_sink", (False, True))
 def test_read_body(last, with_sink):
     plan = _plan()
@@ -144,12 +144,14 @@ def test_read_body(last, with_sink):
     rows, bias = p.real(9), p.bias_at(9)
     r = set(rows.tolist())
     b = set(body[fv.BODY_SOURCE.get(last, "fk")])
-    n_w = 20 if last == "bw20" else 30
+    n_w = {"bw20": 20, "bwmid30": 24}.get(last, 30)
+    fixed_w = {78, 82} | (set(fv.WRIST_MID) if last == "bwmid30" else set())
     assert bool((rows < 98).all()) and set(bias) == r and torch.unique(rows).numel() == rows.numel()
-    assert b <= r and {78, 82, 84} <= r
-    w_sampled = (r & set(wr)) - {78, 82}
-    assert len(w_sampled) == n_w and all(bias[j] == pytest.approx(lg2 + math.log(47 / n_w)) for j in w_sampled)
-    assert bias[78] == pytest.approx(lg2) and bias[82] == pytest.approx(lg2)
+    assert b <= r and fixed_w | {84} <= r
+    w_sampled = (r & set(wr)) - fixed_w
+    pool_w = 49 - len(fixed_w)
+    assert len(w_sampled) == n_w and all(bias[j] == pytest.approx(lg2 + math.log(pool_w / n_w)) for j in w_sampled)
+    assert all(bias[j] == pytest.approx(lg2) for j in fixed_w)
     if 84 not in b:
         assert bias[84] == pytest.approx(lg2)
     a_other = (r & set(ag)) - b - {84}
@@ -159,7 +161,9 @@ def test_read_body(last, with_sink):
         assert len(a_other) == 6 and all(bias[j] == pytest.approx(lg2 + math.log(pool / 6)) for j in a_other)
     else:
         assert not a_other and all(bias[j] == pytest.approx(lg2 + math.log(49 / len(b))) for j in b)
-    assert rows.numel() == len(b) + (0 if 84 in b else 1) + 2 + n_w + (6 if last == "br30" else 0)
+    assert rows.numel() == len(b) + (0 if 84 in b else 1) + len(fixed_w) + n_w + (6 if last == "br30" else 0)
+    if last == "bwmid30":  # the same total as bw30
+        assert rows.numel() == fv.late_read_plan(plan, "bw30", GRID, body=body, tips=(78, 82), seed=0).real(9).numel()
     assert torch.equal(fv.late_read_plan(plan, last, GRID, body=body, tips=(78, 82), seed=0).real(9), rows)
     with pytest.raises(ValueError):
         fv.late_read_plan(plan, last, GRID, tips=(78, 82))

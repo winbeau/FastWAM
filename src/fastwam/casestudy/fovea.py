@@ -591,7 +591,8 @@ def read49(last: str, grid: sel.Grid, d_meas: torch.Tensor, tips, seed: int) -> 
     return rows, bias, sizes
 
 
-BODY_READS = ("bw20", "bw30", "br30", "bwseg30", "bwc30")  # body-select: the last step's reads from the agentview body mask
+BODY_READS = ("bw20", "bw30", "br30", "bwseg30", "bwc30", "bwmid30")  # body-select: the last step's reads from the agentview body mask
+WRIST_MID = (65, 66, 67, 79, 80, 81)  # body-select bwmid30: wrist rows 4-5, columns 2-4 (between and above the fingertips 78 / 82)
 BODY_SOURCE = {"bwseg30": "seg", "bwc30": "fk_cover"}  # the mask each read uses (else "fk": the FK body set, dilated)
 SINKS_NEAR = (84,)  # body-select: the near-frame sink of diag.late.sinks in >= 50 % of the quick-metrics samples (58 / 60)
 
@@ -601,7 +602,8 @@ def read_body(last: str, grid: sel.Grid, body: dict, tips, seed: int, sinks=SINK
     agentview token indices, from the robot's joint values + calibration (fk / fk_cover) or the segmentation render (seg)).
     bw20 / bw30 / bwseg30 / bwc30: the body, key + log(agentview tokens / body tokens) (it stands for the whole camera); br30: the
     body without a group weight + 6 sampled from the other agentview tokens (not the sinks), key + log(pool / 6). Then the sinks and
-    the fingertips (fixed) and 20 / 30 wrist tokens sampled from the rest, key + log(pool / n). Sampling by ``quad_pick`` (agentview
+    the fingertips (fixed) and 20 / 30 wrist tokens sampled from the rest, key + log(pool / n); bwmid30: as bw30 with the six
+    ``WRIST_MID`` tokens fixed as well and 24 sampled. Sampling by ``quad_pick`` (agentview
     ``seed``, wrist ``seed`` + 1); every key + log(Kf / pf) (the far frame). -> (rows, bias, group sizes)."""
     pf, half = grid.per_frame, grid.width // 2
     near = torch.arange(pf)
@@ -614,9 +616,11 @@ def read_body(last: str, grid: sel.Grid, body: dict, tips, seed: int, sinks=SINK
     if b.numel() == 0 or not bool(torch.isin(b, ag).all()):
         raise ValueError(f"read_body {last}: the body mask must be a non-empty set of near-frame agentview tokens, got {b.tolist()}")
     tip = torch.tensor([int(x) for x in tips], dtype=torch.long)
+    if last == "bwmid30":  # the six tokens between and above the fingertips are read every call too
+        tip = torch.cat([tip, torch.tensor(WRIST_MID, dtype=torch.long)])
     sink = torch.tensor([int(x) for x in sinks if int(x) not in set(b.tolist())], dtype=torch.long)
     w_rest = wr[~torch.isin(wr, tip)]
-    n_w = 20 if last == "bw20" else 30
+    n_w = {"bw20": 20, "bwmid30": 24}.get(last, 30)
     if last == "br30":
         pool = ag[~torch.isin(ag, b) & ~torch.isin(ag, sink)]
         pick = quad_pick(pool, 6, grid, seed)
@@ -1013,5 +1017,5 @@ __all__ = ["INTERLACE", "METHODS", "PROBE_CORNERS", "PROBE_SINK", "Plan", "STEP0
            "ht_frequencies", "ht_schedule", "interlace_slices", "interp_tokens", "kmeans", "make_plan", "probe_index",
            "roll_blocks", "rope_freqs_at", "step0_slices", "token_latent_mask", "token_norms", "tube_mask", "stratified_pick",
            "lowest_av", "apply_step_delta", "ROLE_VARIANTS", "role_strata", "spread_order", "role_plan", "BODY_READS", "BODY_SOURCE",
-           "SINKS_NEAR", "read_body", "body_anchor", "nearest_sources", "idw_fill", "align_frames", "memory_map",
+           "SINKS_NEAR", "WRIST_MID", "read_body", "body_anchor", "nearest_sources", "idw_fill", "align_frames", "memory_map",
            "select_core", "reselect"]

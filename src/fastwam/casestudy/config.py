@@ -89,12 +89,13 @@ METHODS = ("dense", "prune", "teacache", "noise")
 SELECTIONS = ("av", "vv", "cf", "random", "diff", "diff_global")
 STEP0 = ("b", "d")
 DRAFT_MODS = ("prior", "atten", "white", "low", "high", "wrist", "agent", "far", "near", "shift", "real")
-MECH_KEYS = {"steps", "calls", "sets", "noise", "patch_set", "patch_ranges", "selfkey", "lens_fit", "lens_apply"}
+MECH_KEYS = {"steps", "calls", "sets", "noise", "patch_set", "patch_ranges", "selfkey", "lens_fit", "lens_apply",
+             "fill"}  # fill: body-select's near-frame formation ratio of every set (computed + idw-filled)
 LATE_ORACLES = ("far", "near", "wrist", "agent", "plan", "all")
 ROLE_VARIANTS = ("rs", "notip", "wdiff", "aav", "nofar", "wdiffb")  # role-select (fovea.role_plan); wdiffb: quick-metrics
 QM_KEYS = {"k", "layer", "executed", "eps", "tips", "check", "late"}
 LATE_READS, LATE_READ_LAST = ("lr", "jump"), ("plan", "near", "all", "u49", "n49", "flip49",  # late-read (fovea.late_read_plan)
-                                               "bw20", "bw30", "br30", "bwseg30", "bwc30")  # body-select (fovea.read_body)
+                                               "bw20", "bw30", "br30", "bwseg30", "bwc30", "bwmid30")  # body-select (fovea.read_body)
 LATE_READ_MID = ("plus10", "core")  # jump-tune: what the landing step computes
 QM_KEYS = QM_KEYS | {"grip_eps", "only_c"}  # jump-tune: the gripper channel's retention c_grip(s); c(s) / c_grip(s) only
 FOVEA_METHODS = ("sink", "rep", "fov_grid", "fov_cluster", "interlace", "interlace_w", "interlace_wfar",
