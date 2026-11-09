@@ -166,3 +166,21 @@ def test_read_body(last, with_sink):
     with pytest.raises(ValueError):
         fv.late_read_plan(plan, last, GRID, body={**body, "fk": [7], "seg": [7], "fk_cover": [7]}, tips=(78, 82))  # a wrist token
     assert parse_config(_arm(late_read="jump", late_read_last=last)).prune.late_read_last == last
+
+
+def test_body_anchor():
+    body = {"fk": [r * 14 + c for r in range(2, 6) for c in range(1, 6)]}  # 20 agentview tokens
+    rows = fv.body_anchor(body, GRID, 49, seed=1)
+    r = set(rows.tolist())
+    wr = r - set(body["fk"])
+    assert rows.numel() == 49 and set(body["fk"]) <= r and len(wr) == 29
+    assert all(j < 98 and j % 14 >= 7 for j in wr)  # the rest is the wrist's near frame
+    assert torch.equal(fv.body_anchor(body, GRID, 49, seed=1), rows)  # fixed seed
+    # the blocks are 2 x 2 windows: every wrist token but at most 1 (the cut block) has a chosen 4-neighbour inside its block
+    lone = [j for j in wr if not any(k in wr for k in (j - 1, j + 1, j - 14, j + 14) if (k % 14 >= 7) == (j % 14 >= 7))]
+    assert len(lone) <= 1
+    for bad in (None, {"fk": []}, {"fk": [7]}):  # no mask, empty, a wrist token
+        with pytest.raises(ValueError):
+            fv.body_anchor(bad, GRID, 49, seed=1)
+    with pytest.raises(ValueError):  # the body alone exceeds the budget
+        fv.body_anchor(body, GRID, 10, seed=1)

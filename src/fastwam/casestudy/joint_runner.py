@@ -86,6 +86,7 @@ class JointCaseStudyRunner:
         #: (``scripts/casestudy/precompute_prompts.py``); lets the model run without its
         #: text encoder. A prompt missing from the store is an error, never a fallback.
         self.prompt_store = prompt_store
+        self._body_rows: Optional[dict] = None  # body-select: this call's body mask (infer_action's body_rows)
         self.mot = model.mot
         self.video = model.video_expert
         self.action = model.action_expert
@@ -405,6 +406,8 @@ class JointCaseStudyRunner:
             n = int(spec[3:])
             parts = {"f2w": ((blocks[3], n),), "f2a": ((blocks[2], n),), "f2s": ((blocks[2], n - n // 2), (blocks[3], n // 2))}[spec[:3]]
             out = torch.cat([torch.tensor(b)[torch.randperm(len(b), generator=gen)[:k]] for b, k in parts])
+        elif spec == "f1body49":  # body-select A-B: the agentview body set (joint values + calibration) + random wrist 2 x 2 blocks
+            out = fv.body_anchor(self._body_rows, grid, 49, seed=1)
         elif spec == "f1g32":  # the near frame on rows / columns {0, 2, 4, 6} of both cameras
             out = torch.tensor([r * grid.width + cam * half + c for cam in (0, 1) for r in (0, 2, 4, 6) for c in (0, 2, 4, 6)])
         elif spec == "agf1":
@@ -1014,6 +1017,7 @@ class JointCaseStudyRunner:
         if cfg.prune is not None and cfg.prune.late_read_last in fv.BODY_READS and body_rows is None:
             # body-select: the last step reads the agentview body mask of this call (the adapter's body_masks option)
             raise ValueError(f"prune.late_read_last {cfg.prune.late_read_last} needs body_rows")
+        self._body_rows = body_rows  # body-select: the anchor set f1body49 (_explore_rows) reads this call's body mask
         if cfg.prune is not None and (cfg.prune.side0_use is not None or cfg.prune.mem_route):
             # step0-sparse-r2: R1 / R3b / R7 score on casestudy.score_layer (B's layer; R7 has no dense step 0 from call 1 on).
             self._layers = {"act": int(cfg.score_layer), "inst": -1}

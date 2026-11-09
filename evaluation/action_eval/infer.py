@@ -1057,12 +1057,9 @@ class FastWAMJointPolicy:
         return tube
 
     def _body_kwargs(self, runner, call_index: int) -> dict:
-        """body-select: ``body_rows`` {fk, fk_cover, seg} of this call (near-frame agentview token indices r * 14 + c) for a runner
-        whose last step reads the body mask; {} for other runners."""
-        from fastwam.casestudy import fovea as _fv
-
-        prune = getattr(runner.cfg, "prune", None)
-        if prune is None or prune.late_read_last not in _fv.BODY_READS:
+        """body-select: ``body_rows`` {fk, fk_cover, seg} of this call (near-frame agentview token indices r * 14 + c) whenever the
+        body_masks option is set (body reads, the f1body49 anchor, mech sets); {} otherwise (a body read then fails in the runner)."""
+        if self.body_masks is None:
             return {}
         if self._body is None or call_index >= len(self._body["fk_body"]):
             raise ValueError(f"body_masks: no mask for call {call_index} of {self._episode_id}")

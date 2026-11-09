@@ -638,6 +638,33 @@ def read_body(last: str, grid: sel.Grid, body: dict, tips, seed: int, sinks=SINK
     return rows, bias, sizes
 
 
+def body_anchor(body: dict | None, grid: sel.Grid, n: int, seed: int) -> torch.Tensor:
+    """body-select A-B: the anchor's ``n`` near-frame tokens, the agentview body set (``body["fk"]``, from the joint values +
+    calibration) and random non-overlapping wrist 2 x 2 blocks (windows of the wrist's near-frame grid in a torch-generator ``seed``
+    order, skipping any that touches a chosen token) until n; the last block is cut to fit. Sorted."""
+    if body is None or "fk" not in body:
+        raise ValueError("body_anchor needs the body mask (body_rows['fk'])")
+    half = grid.width // 2
+    b = sorted({int(j) for j in body["fk"]})
+    if not b or any(j >= grid.per_frame or j % grid.width >= half for j in b) or len(b) > n:
+        raise ValueError(f"body_anchor: the body set must be 1 .. {n} near-frame agentview tokens, got {b}")
+    wins = [[(r + dr) * grid.width + half + c + dc for dr in (0, 1) for dc in (0, 1)]
+            for r in range(grid.height - 1) for c in range(half - 1)]
+    g = torch.Generator().manual_seed(int(seed))
+    chosen, have = list(b), set(b)
+    for i in torch.randperm(len(wins), generator=g).tolist():
+        if len(chosen) >= n:
+            break
+        if have & set(wins[i]):
+            continue
+        take = wins[i][:n - len(chosen)]
+        chosen += take
+        have |= set(take)
+    if len(chosen) != n:
+        raise RuntimeError(f"body_anchor: only {len(chosen)} tokens from the body and the wrist blocks, not {n}")
+    return torch.sort(torch.tensor(chosen, dtype=torch.long)).values
+
+
 def late_read_plan(plan: "Plan", last: str, grid: sel.Grid, first: int = 2, n_steps: int = 10, land: int | None = None,
                    mid: str | None = None, seed: int = 0, d_meas: torch.Tensor | None = None, tips=(78, 82),
                    body: dict | None = None) -> "Plan":
@@ -986,5 +1013,5 @@ __all__ = ["INTERLACE", "METHODS", "PROBE_CORNERS", "PROBE_SINK", "Plan", "STEP0
            "ht_frequencies", "ht_schedule", "interlace_slices", "interp_tokens", "kmeans", "make_plan", "probe_index",
            "roll_blocks", "rope_freqs_at", "step0_slices", "token_latent_mask", "token_norms", "tube_mask", "stratified_pick",
            "lowest_av", "apply_step_delta", "ROLE_VARIANTS", "role_strata", "spread_order", "role_plan", "BODY_READS", "BODY_SOURCE",
-           "SINKS_NEAR", "read_body", "nearest_sources", "idw_fill", "align_frames", "memory_map",
+           "SINKS_NEAR", "read_body", "body_anchor", "nearest_sources", "idw_fill", "align_frames", "memory_map",
            "select_core", "reselect"]
