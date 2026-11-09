@@ -16,6 +16,7 @@ tools are in `scripts/casestudy/`. FastWAM-IDM (official Optional-IDM) has its o
 | `hybrid.py` | component / along-cross hybrid execution (dense chunk with one component of a partner chunk). |
 | `along.py` | along-cross geometry: a chunk endpoint projected on the dense path (pure numpy). |
 | `agc.py` | AGC round: pilot + automatic gain of the output chunk. |
+| `quick_metrics.py` | quick-metrics round: dense diagnostics run after the pass on its recorded states (sparse / action-only side forwards, F(s), kappa_s, read variants, c(s), g_j, rho). |
 
 ## Arms by round (`casestudy` / `prune` keys)
 
@@ -41,5 +42,6 @@ tools are in `scripts/casestudy/`. FastWAM-IDM (official Optional-IDM) has its o
 | region-attrib | `infer_inject(_attn_capture)` (the action rows' attention on every future key, side computation), `fovea.token_latent_mask` / `token_norms`; adapter option `region_attrib` (planned calls: F_real(1), static future, token-masked conditions with static / half-speed / fade sources, per-token latent change) |
 | step-marginal | `prune.step_delta` / `step_delta_seed` on the late anchor (step 1's set or step s's slice: n more tokens, stratified random, or |n| fewer, lowest plan A->V), `fovea.stratified_pick` / `lowest_av` / `apply_step_delta`, `Plan.drop` |
 | role-select | `prune.role_select` (rs / notip / wdiff / aav / nofar), `role_tips`, `role_seed`: the late anchor's plan of steps 2-9 by region roles (`fovea.role_plan`, `spread_order`, `role_strata`), `Plan.step_bias` |
+| quick-metrics | `casestudy.qm` (dense; keys k / layer / executed / eps / tips / check / late; `quick_metrics.run_call`, adapter `_qm_kwargs` / `_qm_units`: D / R per logged chunk), `prune.role_select: wdiffb` (RS-wDiff with the wrist group's key bias log(N_wrist / n)) |
 
 Tests: `tests/test_casestudy_*.py` (CPU; run on the server, not locally).

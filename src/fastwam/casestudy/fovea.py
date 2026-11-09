@@ -402,7 +402,7 @@ def apply_step_delta(plan: "Plan", deltas, av: torch.Tensor, grid: sel.Grid, see
                 freq=plan.freq, drop=drop)
 
 
-ROLE_VARIANTS = ("rs", "notip", "wdiff", "aav", "nofar")
+ROLE_VARIANTS = ("rs", "notip", "wdiff", "aav", "nofar", "wdiffb")
 ROLE_ARM, ROLE_AGENT, ROLE_FAR = 12, 8, 4
 
 
@@ -451,7 +451,8 @@ def role_plan(measured: torch.Tensor, av: torch.Tensor, diff: torch.Tensor, sink
       arm     the 12 measured agentview near-frame tokens with the largest Diff (aav: A->V), sinks excepted, every step;
       tips    the 2 fixed wrist near-frame tokens ``tips`` (notip: none), sinks excepted, every step;
       wrist   the other wrist near-frame tokens, rotating (``spread_order``), as many as the rest of the budget leaves (10; notip 12,
-              nofar 14); wdiff: the measured ones with the largest Diff, every step, no rotation;
+              nofar 14); wdiff: the measured ones with the largest Diff, every step, no rotation; wdiffb (quick-metrics): wdiff, its
+              wrist tokens' keys + log(N_wrist / n) on every step (n = 10, on the last step with the extra Diff ranks);
       agent   the other agentview near-frame tokens (not sinks, not arm), 8 rotating;
       far     the far-frame tokens of both cameras (not sinks), 4 rotating (nofar: none).
     A rotating group starts step i (0, 1, ...) at position i x its size in its order and skips tokens the step already computes; its
@@ -483,7 +484,8 @@ def role_plan(measured: torch.Tensor, av: torch.Tensor, diff: torch.Tensor, sink
     w_extra = extra - extra // 2
     w_pool = j[w_near & not_sink & ~torch.isin(j, tip)]
     wrist_fixed, wrist_extra = j[:0], j[:0]
-    if variant == "wdiff":
+    wdiff = variant in ("wdiff", "wdiffb")
+    if wdiff:
         wm = w_pool[meas[w_pool]]
         wr = wm[torch.argsort(-diff.float().cpu()[wm], stable=True)]
         wrist_fixed, wrist_extra = wr[:n_w], wr[n_w:n_w + w_extra]
@@ -491,7 +493,7 @@ def role_plan(measured: torch.Tensor, av: torch.Tensor, diff: torch.Tensor, sink
     seqs = {"agent": spread_order(j[a_near & not_sink & ~torch.isin(j, arm)], grid, seed + 1),
             "far": spread_order(j[~near & not_sink], grid, seed + 2)}
     sizes = {"agent": ROLE_AGENT, "far": n_far}
-    if variant != "wdiff":
+    if not wdiff:
         seqs["wrist"], sizes["wrist"] = spread_order(w_pool, grid, seed), n_w
     n = n_steps - first
     slices, step_bias, seen = [None] * n, {}, set()
@@ -513,6 +515,10 @@ def role_plan(measured: torch.Tensor, av: torch.Tensor, diff: torch.Tensor, sink
             rows += got
             if lg != 0.0:
                 bias.update({x: lg for x in got})
+        if variant == "wdiffb":  # the Diff wrist group stands for every wrist near-frame token (as the rotating group of rs)
+            wt = wrist_fixed.tolist() + (wrist_extra.tolist() if last else [])
+            if wt:
+                bias.update({x: math.log(int(w_pool.numel()) / len(wt)) for x in wt})
         slices[(s - 1) % n] = torch.sort(torch.tensor(rows, dtype=torch.long)).values
         step_bias[s] = bias
         seen |= set(rows)

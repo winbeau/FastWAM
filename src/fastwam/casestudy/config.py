@@ -91,7 +91,8 @@ STEP0 = ("b", "d")
 DRAFT_MODS = ("prior", "atten", "white", "low", "high", "wrist", "agent", "far", "near", "shift", "real")
 MECH_KEYS = {"steps", "calls", "sets", "noise", "patch_set", "patch_ranges", "selfkey", "lens_fit", "lens_apply"}
 LATE_ORACLES = ("far", "near", "wrist", "agent", "plan", "all")
-ROLE_VARIANTS = ("rs", "notip", "wdiff", "aav", "nofar")  # role-select (fovea.role_plan)
+ROLE_VARIANTS = ("rs", "notip", "wdiff", "aav", "nofar", "wdiffb")  # role-select (fovea.role_plan); wdiffb: quick-metrics
+QM_KEYS = {"k", "layer", "executed", "eps", "tips", "check", "late"}
 FOVEA_METHODS = ("sink", "rep", "fov_grid", "fov_cluster", "interlace", "interlace_w", "interlace_wfar",
                  "interlace_cal", "interlace_fill", "merge", "interlace_ht")
 LAYER_RULES = ("min_entropy", "fixed")
@@ -267,7 +268,7 @@ class PruneConfig:
     step_delta: tuple = ()
     step_delta_seed: int = 0
     #: role-select: the late anchor's plan of steps 2-9 by region roles instead of A->V / Diff (``fovea.role_plan``): rs, notip, wdiff,
-    #: aav, nofar; ``role_tips`` the 2 fixed wrist near-frame fingertip tokens, ``role_seed`` the rotating groups' order.
+    #: aav, nofar (quick-metrics: wdiffb = wdiff with the wrist group's key bias log(N_wrist / n)); ``role_tips`` the 2 fixed wrist near-frame fingertip tokens, ``role_seed`` the rotating groups' order.
     role_select: Optional[str] = None
     role_tips: tuple = ()
     role_seed: int = 0
@@ -393,6 +394,9 @@ class CaseStudyConfig:
     #: of an episode: visible ``sets`` (stats), dense ``noise`` injection layer ranges, ``patch_set`` x ``patch_ranges`` path
     #: patching, ``selfkey`` sets; tuned lens ``lens_fit`` / ``lens_apply`` (a path; relative to the FastWAM checkout).
     mech: Optional[dict] = None
+    #: quick-metrics (dense only): diagnostics beside the pass on every step, run after it from the recorded states
+    #: (``quick_metrics.run_call``): F(s), kappa_s, c(s), the action's read variants, g_j and rho (keys ``QM_KEYS``).
+    qm: Optional[dict] = None
 
     def describe(self) -> dict[str, Any]:
         return asdict(self)
@@ -739,7 +743,10 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
         record_drafts=bool(raw.get("record_drafts", False)),
         record_kval=bool(raw.get("record_kval", False)),
         mech=None if raw.get("mech") is None else dict(raw["mech"]),
+        qm=None if raw.get("qm") is None else dict(raw["qm"]),
     )
+    _require(cfg.qm is None or (cfg.method == "dense" and cfg.prune is None and cfg.frame0_cache and set(cfg.qm) <= QM_KEYS
+                                and steps >= 3), f"casestudy.qm is a dense diagnostic (frame-0 cache, >= 3 steps) with keys {sorted(QM_KEYS)}")
     _require(cfg.mech is None or (cfg.method == "dense" and cfg.frame0_cache and set(cfg.mech) <= MECH_KEYS
                                   and not (cfg.mech.get("lens_fit") and cfg.mech.get("lens_apply"))),
              f"casestudy.mech is a dense diagnostic with keys {sorted(MECH_KEYS)} (lens_fit or lens_apply, not both)")

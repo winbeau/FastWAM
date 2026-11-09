@@ -41,6 +41,8 @@ the other future tokens move along the interpolated draft (``_probe_draft``) unt
 interpolated A->V and Diff, plan d with the frame-0 attention and the pilot's end-effector tube (``_step0_tube`` from the
 adapter); the leftover probes go to the last slices. ``prune.e9`` (E9) redoes step 0's update of M4w with the interpolated
 draft on slices 1-6 or 8-9.
+quick-metrics (``casestudy.qm``, dense): the pass records its states and future K/V; ``quick_metrics.run_call`` runs the
+diagnostics on them afterwards (``diag["qm"]``).
 ``frame0_cache=false`` (dense only) calls the model's native
 ``infer_action`` unchanged, as the reference for equivalence checks. ``cfg.dump`` writes
 one call's attention, action hidden states and decoded video to an ``.npz``.
@@ -63,6 +65,7 @@ from fastwam.models.wan22.wan_video_dit import flash_attention, modulate, rope_a
 
 from .config import CaseStudyConfig
 from . import fovea as fv
+from . import quick_metrics as qmm
 from . import selection as sel
 
 
@@ -1001,6 +1004,7 @@ class JointCaseStudyRunner:
         _step0_tube: Optional[Callable] = None,
         _memory_key: Any = None,
         _real_future: Optional[torch.Tensor] = None,
+        _qm_zero: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         cfg = self.cfg
         model = self.model
@@ -1340,6 +1344,11 @@ class JointCaseStudyRunner:
         kval_buf = ((torch.zeros(steps, (self.num_layers + 1) // 2, self.KVAL_DIM), torch.zeros(steps, (self.num_layers + 1) // 2))
                     if cfg.record_kval else None)
         pre_v_freeze: Optional[dict] = None
+        # quick-metrics (dense): every step's inputs, latents and outputs, and the future K/V per (step, layer), for
+        # quick_metrics.run_call after the pass (nothing of it feeds back into the pass).
+        qm_rec: Optional[list] = [] if cfg.qm is not None else None
+        if qm_rec is not None and _capture_kv is None:
+            _capture_kv = {}
 
         for s in range(steps):
             ts_v = t_video[s].unsqueeze(0).to(dtype=latents_video.dtype, device=model.device)
@@ -2108,6 +2117,9 @@ class JointCaseStudyRunner:
                 # step0-sparse plan d: the pilot of the probe step (normalized), for the adapter's end-effector tube.
                 sigma0_a = t_action[0].float() / float(model.infer_action_scheduler.num_train_timesteps)
                 s0_pilot = (latents_action[0].float() - sigma0_a * pred_action[0].float()).cpu()
+            if qm_rec is not None:
+                qm_rec.append({"pre_v": pre_v, "pre_a": pre_a, "lat_v": latents_video.clone(), "lat_a": latents_action.clone(),
+                               "vel": vel_tokens.clone(), "pred_a": pred_action.clone(), "ts_v": ts_v, "ts_a": ts_a, "d_a": d_action[s]})
             latents_video = model.infer_video_scheduler.step(pred_video, d_video[s], latents_video)
             latents_action = model.infer_action_scheduler.step(pred_action, d_action[s], latents_action)
             latents_video[:, :, 0:1] = first.clone()
@@ -2636,6 +2648,8 @@ class JointCaseStudyRunner:
             diag["kval_shape"] = list(kval_buf[0].shape)
         if cfg.mech is not None:
             self._mech_call = getattr(self, "_mech_call", 0) + 1
+        if qm_rec is not None:
+            diag["qm"] = qmm.run_call(self, qm_rec, _capture_kv, kv0, grid, f0, seed, _qm_zero, context, context_mask, (pt, ph, pw))
         diag["cost"] = {**self._cost_model(), "attn_dim": cost_dim, "ctx": int(context.shape[1]), "f0": int(f0),
                         "steps": cost_steps, "oracle_pass": oracle is not None}
         if side0 == "both":  # R3b: step 0 as the side forward computed it (its per-block rows), not the dense main pass

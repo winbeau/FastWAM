@@ -823,7 +823,7 @@ class FastWAMJointPolicy:
                     prompt=prompt, input_image=image, proprio=proprio,
                     action_horizon=self.action_horizon, num_video_frames=self.num_video_frames,
                     seed=seed, sigma_shift=self.sigma_shift, rand_device=self.rand_device, **self._tube_kwargs(runner),
-                    **self._mem_kwargs(runner, offset), **real,
+                    **self._mem_kwargs(runner, offset), **real, **self._qm_kwargs(runner),
                 )
                 cont, _, agc_log = self._agc(runner.cfg, d, self._continuous(action))
                 entry = {"seed": int(seed), **self._chunk_logs(action, cont), **agc_log}
@@ -835,9 +835,11 @@ class FastWAMJointPolicy:
                             "sink_recv_f16", "step0", "step0_x0_f32", "e9", "r2", "r3", "mem", "mem_rec", "side0",
                             "terminal_x0_f32", "draft", "reselect", "explore", "explore_plan", "x0d_f16", "zcur_f16",
                             "draft_mod", "late", "drafts_f32", "drafts_step", "drafts_y0_f32", "drafts_y1_f32", "zcur_f32",
-                            "kval_f16", "kval_m", "kval_shape"):
+                            "kval_f16", "kval_m", "kval_shape", "qm"):
                     if d.get(key) is not None:
                         entry[key] = d[key]
+                if entry.get("qm") is not None:
+                    self._qm_units(entry["qm"])
                 for row in list((entry.get("r3") or {}).values()) + list((entry.get("explore") or {}).values()):  # R3 / explore pilots, simulator units
                     p = np.frombuffer(base64.b64decode(row["pilot_f32"]), dtype=np.float32).reshape(-1, 7)
                     row["pilot_cont_f32"] = base64.b64encode(
@@ -1033,6 +1035,35 @@ class FastWAMJointPolicy:
             return cells, switch, info
 
         return tube
+
+    def _qm_kwargs(self, runner) -> dict:
+        """quick-metrics (``casestudy.qm``): ``_qm_zero``, the normalized action of zero simulator translation per xyz dimension
+        (the de-normalization is affine per dimension: a0 = -cont(0) / (cont(1) - cont(0))), for c(s)'s scaling of the executed
+        displacement; {} for other runners."""
+        if getattr(runner.cfg, "qm", None) is None:
+            return {}
+        if getattr(self, "_qm_zero", None) is None:
+            torch = self._torch
+            dim = int(runner.action.action_dim)
+            c0 = self._continuous(torch.zeros(self.action_horizon, dim))[0, :3].astype(np.float64)
+            c1 = self._continuous(torch.ones(self.action_horizon, dim))[0, :3].astype(np.float64)
+            self._qm_zero = torch.tensor(-c0 / (c1 - c0), dtype=torch.float32, device=self.device)
+        return {"_qm_zero": self._qm_zero}
+
+    def _qm_units(self, qm: dict) -> None:
+        """quick-metrics: the runner's normalized action chunks (``qm["actions"]``) -> per name the executed displacement ``D`` and
+        rotation ``R`` (first ``n_exec`` actions summed, simulator units), in place; ``a0`` logged."""
+        import base64
+
+        n = int(qm.get("n_exec", 10))
+        D, R = {}, {}
+        for name, b64 in (qm.pop("actions", None) or {}).items():
+            a = np.frombuffer(base64.b64decode(b64), dtype=np.float32).reshape(-1, 7)
+            c = self._continuous(self._torch.from_numpy(a.copy())).astype(np.float64)[:n]
+            D[name], R[name] = [float(x) for x in c[:, 0:3].sum(0)], [float(x) for x in c[:, 3:6].sum(0)]
+        qm["D"], qm["R"] = D, R
+        if getattr(self, "_qm_zero", None) is not None:
+            qm["a0"] = [float(x) for x in self._qm_zero.cpu().tolist()]
 
     def _continuous(self, action) -> np.ndarray:
         """De-normalized chunk [T, 7] before gripper binarisation (float32)."""

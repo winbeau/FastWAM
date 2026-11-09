@@ -68,10 +68,11 @@ def test_role_plan_groups(variant):
         far = [j for j in r if j >= 98 and j not in sinks.tolist()]
         assert len(far) == (0 if variant == "nofar" else 4)
         b = p.bias_at(s)
-        assert not (set(b) & set(p.fixed.tolist()))  # every-step groups: no bias
+        if variant != "wdiffb":  # wdiffb's Diff wrist tokens (in the fixed core) do carry a bias
+            assert not (set(b) & set(p.fixed.tolist()))  # every-step groups: no bias
         assert all(v > 0 for v in b.values())
     assert set(ranked[12:17]) <= set(p.real(9).tolist())  # the last step's extra arm tokens
-    if variant == "wdiff":
+    if variant in ("wdiff", "wdiffb"):
         wm = [j for j in measured.tolist() if j in w_near and j not in sinks.tolist() and j not in TIPS]
         wr = sorted(wm, key=lambda j: (-float(df[j]), j))
         assert all(set(wr[:10]) <= set(p.real(s).tolist()) for s in range(2, 10)) and set(wr[10:15]) <= set(p.real(9).tolist())
