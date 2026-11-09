@@ -531,8 +531,68 @@ def role_plan(measured: torch.Tensor, av: torch.Tensor, diff: torch.Tensor, sink
                 truncated=truncated, step_bias=step_bias)
 
 
+def quad_pick(pool: torch.Tensor, n: int, grid: sel.Grid, seed: int) -> torch.Tensor:
+    """anchor-neff: ``n`` tokens of ``pool`` stratified by ``role_strata`` ((frame, camera, quadrant)) in proportion to the pool
+    (largest remainder, ties to the earlier stratum), uniform within a stratum (torch generator ``seed``); sorted."""
+    pool = pool.cpu()
+    n = min(int(n), int(pool.numel()))
+    if n <= 0:
+        return pool[:0]
+    key = role_strata(pool, grid)
+    ks = torch.unique(key).tolist()
+    strata = [pool[key == k] for k in ks]
+    quota = torch.tensor([float(x.numel()) for x in strata]) * n / float(pool.numel())
+    take = torch.floor(quota).long()
+    for i in sorted(range(len(strata)), key=lambda i: (-float(quota[i] - take[i]), i))[:n - int(take.sum())]:
+        take[i] += 1
+    g = torch.Generator().manual_seed(int(seed))
+    return torch.sort(torch.cat([x[torch.randperm(int(x.numel()), generator=g)[:int(t)]] for x, t in zip(strata, take)])).values
+
+
+def read49(last: str, grid: sel.Grid, d_meas: torch.Tensor, tips, seed: int) -> tuple[torch.Tensor, dict, dict]:
+    """anchor-neff: the last step's 49 near-frame tokens and key biases. u49: each camera's near frame sampled (25 agentview, 24 wrist);
+    n49: agentview the 12 measured tokens with the largest anchor change d (fixed) + 8 sampled from the rest, wrist the fingertips
+    (fixed) + 27 sampled from the rest; flip49: agentview 20 sampled, wrist the fingertips + the 27 measured with the largest d (fixed).
+    Sampling by ``quad_pick``; a sampled token's key + log(group size / sampled), every key + log(Kf / pf) (the far frame).
+    -> (rows, bias, group sizes)."""
+    pf, half = grid.per_frame, grid.width // 2
+    near = torch.arange(pf)
+    ag, wr = near[(near % grid.width) < half], near[(near % grid.width) >= half]
+    tip = torch.tensor([int(x) for x in tips], dtype=torch.long)
+    lg2 = math.log(grid.num_future / pf)
+    d = d_meas.float().cpu()
+
+    def top(pool, k):
+        m = pool[torch.isfinite(d[pool])]
+        return m[torch.argsort(-d[m], stable=True)][:k]
+
+    if last == "u49":
+        groups = [(ag, quad_pick(ag, 25, grid, seed), True), (wr, quad_pick(wr, 24, grid, seed + 1), True)]
+    elif last == "n49":
+        a_fix = top(ag, 12)
+        a_rest = ag[~torch.isin(ag, a_fix)]
+        w_rest = wr[~torch.isin(wr, tip)]
+        groups = [(a_fix, a_fix, False), (a_rest, quad_pick(a_rest, 8, grid, seed), True), (tip, tip, False),
+                  (w_rest, quad_pick(w_rest, 27, grid, seed + 1), True)]
+    elif last == "flip49":
+        w_fix = top(wr[~torch.isin(wr, tip)], 27)
+        groups = [(ag, quad_pick(ag, 20, grid, seed), True), (tip, tip, False), (w_fix, w_fix, False)]
+    else:
+        raise ValueError(f"read49: {last!r}")
+    rows, bias, sizes = [], {}, {}
+    for i, (pool, chosen, sampled) in enumerate(groups):
+        lg = lg2 + (math.log(int(pool.numel()) / int(chosen.numel())) if sampled and chosen.numel() else 0.0)
+        rows.append(chosen)
+        bias.update({int(j): lg for j in chosen.tolist()})
+        sizes[str(i)] = [int(pool.numel()), int(chosen.numel()), bool(sampled)]
+    rows = torch.sort(torch.cat(rows)).values
+    if rows.numel() != 49 or torch.unique(rows).numel() != 49:
+        raise RuntimeError(f"read49 {last}: {int(torch.unique(rows).numel())} distinct tokens, not 49")
+    return rows, bias, sizes
+
+
 def late_read_plan(plan: "Plan", last: str, grid: sel.Grid, first: int = 2, n_steps: int = 10, land: int | None = None,
-                   mid: str | None = None, seed: int = 0) -> "Plan":
+                   mid: str | None = None, seed: int = 0, d_meas: torch.Tensor | None = None, tips=(78, 82)) -> "Plan":
     """late-read: the late anchor's plan with nothing computed on steps ``first`` .. n_steps-2; the last step computes ``last``:
     plan (the plan's own last-step tokens and key bias), near (every near-frame token, key + log(Kf / pf)) or all (every future
     token, no bias). Steps without a token keep an empty bias, so ``bias_at`` reads ``step_bias``.
@@ -562,8 +622,12 @@ def late_read_plan(plan: "Plan", last: str, grid: sel.Grid, first: int = 2, n_st
         bias = {int(j): math.log(grid.num_future / grid.per_frame) for j in rows.tolist()}
     elif last == "all":
         rows, bias = torch.arange(grid.num_future), {}
+    elif last in ("u49", "n49", "flip49"):
+        if d_meas is None:
+            raise ValueError(f"late_read_plan {last} needs the anchor's measured change d_meas")
+        rows, bias, _sizes = read49(last, grid, d_meas, tips, seed)
     else:
-        raise ValueError(f"late_read_plan: last must be plan / near / all, got {last!r}")
+        raise ValueError(f"late_read_plan: last must be plan / near / all / u49 / n49 / flip49, got {last!r}")
     n = n_steps - first
     empty = torch.zeros(0, dtype=torch.long)
     slices = [empty] * n

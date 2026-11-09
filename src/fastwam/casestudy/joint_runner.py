@@ -2234,14 +2234,21 @@ class JointCaseStudyRunner:
                 kept = fplan.fixed
                 diag["late"].update(core=fplan.core.tolist(), sinks=fplan.sinks.tolist(), slices=[int(x.numel()) for x in fplan.slices],
                                     truncated=int(fplan.truncated.numel()), step1_rows=int(rows1.numel()))
+                # anchor-neff: the anchor's own measured change d_j = |x^0_j - z_cur,j| of its computed tokens (drafts / gain)
+                d_anchor = df_full[rows1].float() / float(prune.step0_gain)
+                diag["late"]["anchor_rows"] = rows1.tolist()
+                diag["late"]["anchor_d"] = [round(float(x), 5) for x in d_anchor]
                 if prune.late_record_z:  # the tokens the plan computes on steps 2 .. steps-2 (their latents leave the drafts)
                     mid = [fplan.real(s_) for s_ in range(2, steps - 1)]
                     diag["late"]["computed_mid"] = torch.unique(torch.cat(mid)).tolist() if mid else []
                 if late_read is not None:
                     # late-read: nothing on steps 2 .. steps-2, the last step computes late_read_last (plan: the plan's own set)
                     plan_last = fplan.real(steps - 1).cpu()
+                    d_meas = torch.full((num_future,), float("nan"))
+                    d_meas[rows1.cpu()] = d_anchor.cpu()
                     fplan = fv.late_read_plan(fplan, prune.late_read_last, grid, n_steps=steps, land=late_land, mid=prune.late_read_mid,
-                                              seed=int(prune.late_read_seed)).to(kept.device)
+                                              seed=int(prune.late_read_seed), d_meas=d_meas,
+                                              tips=prune.late_read_tips).to(kept.device)
                     kept = fplan.fixed
                     rows_last = fplan.real(steps - 1).cpu()
                     diag["late_read"] = {"mode": late_read, "last": prune.late_read_last, "rows_last": rows_last.tolist(),

@@ -93,7 +93,7 @@ MECH_KEYS = {"steps", "calls", "sets", "noise", "patch_set", "patch_ranges", "se
 LATE_ORACLES = ("far", "near", "wrist", "agent", "plan", "all")
 ROLE_VARIANTS = ("rs", "notip", "wdiff", "aav", "nofar", "wdiffb")  # role-select (fovea.role_plan); wdiffb: quick-metrics
 QM_KEYS = {"k", "layer", "executed", "eps", "tips", "check", "late"}
-LATE_READS, LATE_READ_LAST = ("lr", "jump"), ("plan", "near", "all")  # late-read (fovea.late_read_plan)
+LATE_READS, LATE_READ_LAST = ("lr", "jump"), ("plan", "near", "all", "u49", "n49", "flip49")  # late-read (fovea.late_read_plan)
 LATE_READ_MID = ("plus10", "core")  # jump-tune: what the landing step computes
 QM_KEYS = QM_KEYS | {"grip_eps", "only_c"}  # jump-tune: the gripper channel's retention c_grip(s); c(s) / c_grip(s) only
 FOVEA_METHODS = ("sink", "rep", "fov_grid", "fov_cluster", "interlace", "interlace_w", "interlace_wfar",
@@ -288,6 +288,8 @@ class PruneConfig:
     late_read_land: Optional[int] = None
     late_read_mid: Optional[str] = None
     late_read_seed: int = 0
+    #: anchor-neff: the last step's 49 near-frame tokens (u49 / n49 / flip49, ``fovea.late_read_plan``) and the fixed wrist fingertips.
+    late_read_tips: tuple = (78, 82)
 
 
 @dataclass(frozen=True)
@@ -530,6 +532,7 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             late_read_land=None if block.get("late_read_land") is None else int(block["late_read_land"]),
             late_read_mid=None if block.get("late_read_mid") is None else str(block["late_read_mid"]),
             late_read_seed=int(block.get("late_read_seed", 0)),
+            late_read_tips=tuple(int(x) for x in block.get("late_read_tips", (78, 82))),
         )
         if prune.fovea is not None or prune.fovea_off:
             _require(prune.fovea in FOVEA_METHODS, f"prune.fovea must be one of {FOVEA_METHODS} (fovea_off needs a method)")

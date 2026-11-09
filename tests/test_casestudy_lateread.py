@@ -96,3 +96,36 @@ def test_late_read_plan_land(mid):
         assert set(bias) == set(slc) and len(slc) == 26
         assert all(v == pytest.approx(math.log(plan.periphery.numel() / 26)) for v in bias.values())
         assert torch.equal(fv.late_read_plan(plan, "all", GRID, land=8, mid=mid, seed=0).real(8), rows)
+
+
+@pytest.mark.parametrize("last", ("u49", "n49", "flip49"))
+def test_read49(last):
+    plan = _plan()
+    g = torch.Generator().manual_seed(3)
+    measured = torch.sort(torch.randperm(98, generator=g)[:84]).values
+    d = torch.full((196,), float("nan"))
+    d[measured] = torch.rand(84, generator=g)
+    p = fv.late_read_plan(plan, last, GRID, d_meas=d, tips=(78, 82), seed=0)
+    rows, bias = p.real(9), p.bias_at(9)
+    assert rows.numel() == 49 and bool((rows < 98).all()) and set(bias) == set(rows.tolist())
+    lg2 = math.log(2.0)
+    ag = [j for j in range(98) if j % 14 < 7]
+    wr = [j for j in range(98) if j % 14 >= 7]
+    r = set(rows.tolist())
+    if last == "u49":
+        assert len(r & set(ag)) == 25 and len(r & set(wr)) == 24
+        assert all(bias[j] == pytest.approx(lg2 + math.log(49 / 25)) for j in r & set(ag))
+    if last == "n49":
+        am = sorted((j for j in ag if j in set(measured.tolist())), key=lambda j: (-float(d[j]), j))[:12]
+        assert set(am) <= r and {78, 82} <= r and len(r & set(ag)) == 20 and len(r & set(wr)) == 29
+        assert all(bias[j] == pytest.approx(lg2) for j in am + [78, 82])
+        assert all(bias[j] == pytest.approx(lg2 + math.log(37 / 8)) for j in (r & set(ag)) - set(am))
+        assert all(bias[j] == pytest.approx(lg2 + math.log(47 / 27)) for j in (r & set(wr)) - {78, 82})
+    if last == "flip49":
+        wm = sorted((j for j in wr if j in set(measured.tolist()) and j not in (78, 82)), key=lambda j: (-float(d[j]), j))[:27]
+        assert set(wm) <= r and {78, 82} <= r and len(r & set(ag)) == 20
+        assert all(bias[j] == pytest.approx(lg2 + math.log(49 / 20)) for j in r & set(ag))
+        assert all(bias[j] == pytest.approx(lg2) for j in wm + [78, 82])
+    with pytest.raises(ValueError):
+        fv.late_read_plan(plan, last, GRID)
+    assert parse_config(_arm(late_read="jump", late_read_last=last)).prune.late_read_tips == (78, 82)
