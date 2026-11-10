@@ -44,6 +44,9 @@ draft on slices 1-6 or 8-9.
 quick-metrics (``casestudy.qm``, dense): the pass records its states and future K/V; ``quick_metrics.run_call`` runs the
 diagnostics on them afterwards (``diag["qm"]``). late-read (``prune.late_read``): the late anchor computes no future token on
 steps 2 .. steps-2 (lr: action rows only; jump: no network, every velocity kept) and ``late_read_last`` on the last step.
+sameset (``prune.late: sameset``): the think step (step 1, or step 0 with ``late_step`` 0 and the jump from step 1 on) computes exactly
+the last step's read set S, so no other future token is ever computed or visible; ``sameset_vbias`` pair gives the video rows the
+stand-in key bias of ``fovea.pair_bias`` (P3).
 ``frame0_cache=false`` (dense only) calls the model's native
 ``infer_action`` unchanged, as the reference for equivalence checks. ``cfg.dump`` writes
 one call's attention, action hidden states and decoded video to an ``.npz``.
@@ -408,6 +411,9 @@ class JointCaseStudyRunner:
             out = torch.cat([torch.tensor(b)[torch.randperm(len(b), generator=gen)[:k]] for b, k in parts])
         elif spec == "f1body49":  # body-select A-B: the agentview body set (joint values + calibration) + random wrist 2 x 2 blocks
             out = fv.body_anchor(self._body_rows, grid, 49, seed=1)
+        elif spec == "sameset":  # sameset: the last step's read set S (fovea.read_body on this call's body mask), known before thinking
+            p_ = self.cfg.prune
+            out = fv.read_body(p_.late_read_last, grid, self._body_rows, p_.late_read_tips, int(p_.late_read_seed))[0]
         elif spec == "f1g32":  # the near frame on rows / columns {0, 2, 4, 6} of both cameras
             out = torch.tensor([r * grid.width + cam * half + c for cam in (0, 1) for r in (0, 2, 4, 6) for c in (0, 2, 4, 6)])
         elif spec == "agf1":
@@ -1302,8 +1308,21 @@ class JointCaseStudyRunner:
         # step0-explore late anchor: step 0 computes no future token, step 1 computes the set ``prune.late`` and forms the
         # imagination (drafts spread from it), the plan of steps 2-9 comes from step 1.
         late = prune.late if prune is not None and not early else None
+        # sameset: the think step computes exactly the last step's read set S (late_step 1: step 1; late_step 0: step 0, no
+        # action-only step, steps 1 .. steps-2 jumped with step 0's velocities). P3 (sameset_vbias pair): the video rows' key bias of
+        # both computing steps from fovea.pair_bias (every absent future token's stand-in among frame 0 and S).
+        same = prune is not None and prune.late == "sameset"
+        same_rows: Optional[torch.Tensor] = None
+        pair_v: Optional[tuple] = None
+        if same:
+            same_rows = self._explore_rows("sameset", grid, None).to(model.device)
+            if prune.sameset_vbias == "pair":
+                b0_, bf_, cnt_ = fv.pair_bias(same_rows.cpu(), body_rows["fk"], grid)
+                pair_v = (b0_.to(model.device), bf_)
+                diag["sameset_pair"] = {"frame0_counts": cnt_["frame0"], "future_counts": {str(j): n for j, n in cnt_["future"].items()}}
         # late-read: steps 2 .. steps-2 compute no future token (lr: action rows only; jump: nothing, step 1's action velocity kept)
-        late_read = prune.late_read if late is not None else None
+        late_read = prune.late_read if (late is not None or (early and same)) else None
+        jump_first = 1 if early else 2  # the first jumped step (sameset at step 0: steps 1 .. steps-2)
         late_jump_pred: Optional[torch.Tensor] = None
         # jump-tune: the step the jump lands on (steps 2 .. land-1 run no network); the last step unless late_read_land
         late_land = int(prune.late_read_land) if late_read is not None and prune.late_read_land is not None else steps - 1
@@ -1449,7 +1468,7 @@ class JointCaseStudyRunner:
             fv_step = fplan is not None and mode == "pruned"
             # late-read JUMP: steps 2 .. steps-2 run no network; every velocity is kept (the video drafts, step 1's action velocity),
             # so the latents follow the merged straight-line ODE in the pass's own arithmetic.
-            jump_now = late_read == "jump" and 2 <= s < late_land
+            jump_now = late_read == "jump" and jump_first <= s < late_land
             p0_step = s0_probes is not None and s == 0
             idx_rel = (fplan.real(s) if fv_step else kept) if mode == "pruned" else (s0_probes if p0_step else all_future)
             idx_abs = idx_rel + f0
@@ -1499,6 +1518,16 @@ class JointCaseStudyRunner:
                 payload_a = {"context": pre_a["context"], "mask": pre_a["context_mask"]}
                 step_probs: dict[int, torch.Tensor] = {}
                 n_q = int(idx_rel.numel()) + n_syn  # 0 on the pruned steps of keep 0: no video rows at all
+                # sameset diagnostic (record_nbr, beside the pass): each computed video row's attention share on its same-frame 3 x 3
+                # neighbours (same camera block, not itself) among this step's visible future keys; dense on steps 0 and 1 only.
+                nbr_on = cfg.record_nbr and n_q > 0 and n_syn == 0 and (prune is not None or s in (0, 1))
+                if nbr_on:
+                    fr_, rem_ = idx_rel // grid.per_frame, idx_rel % grid.per_frame
+                    h_, w_ = rem_ // grid.width, rem_ % grid.width
+                    cam_ = w_ >= grid.width // 2
+                    nbr_mask = ((fr_[:, None] == fr_[None]) & (cam_[:, None] == cam_[None]) & ((h_[:, None] - h_[None]).abs() <= 1)
+                                & ((w_[:, None] - w_[None]).abs() <= 1) & (idx_rel[:, None] != idx_rel[None])).float()
+                    nbr_acc = torch.zeros(n_q, device=model.device)
                 fv_mask_v = fv_mask_a = None
                 if fv_step or p0_step:
                     # Key logit bias log(n_g) of representatives (rep) and region tokens (fov), for every row; no mask at
@@ -1518,6 +1547,16 @@ class JointCaseStudyRunner:
                         fv_mask_a = torch.zeros((1, 1, 1, f0 + n_q + n_act), device=model.device)
                         fv_mask_a[..., f0:f0 + n_q] = bias
                         fv_mask_v, fv_mask_a = fv_mask_v.to(xv.dtype), fv_mask_a.to(xv.dtype)
+                    if same and n_q:
+                        # sameset: every computing step (think and read) computes exactly S
+                        if not torch.equal(idx_rel, same_rows):
+                            raise RuntimeError(f"sameset: step {s} computes {idx_rel.tolist()}, not the read set S")
+                        if pair_v is not None:
+                            # P3: the video rows' keys [frame 0 | S] by the pairing rule; the action rows keep their mask
+                            pm_ = torch.zeros((1, 1, 1, f0 + n_q), device=model.device)
+                            pm_[..., :f0] = pair_v[0]
+                            pm_[..., f0:] = torch.tensor([pair_v[1][int(j)] for j in idx_rel.tolist()], device=model.device)
+                            fv_mask_v = pm_.to(xv.dtype)
                     if fv_step:
                         fv_rows.append(n_q)
                     elif int(idx_rel.numel()) != int(s0_probes.numel()):
@@ -1652,6 +1691,13 @@ class JointCaseStudyRunner:
                                 vmask = cal_v if cal_v is not None else fv_mask_v
                         out_v = flash_attention(q=io_v[0], k=kv_k, v=kv_v, num_heads=self.num_heads, ctx_mask=vmask)
                         n_vk = int(kv_k.shape[1])
+                        if nbr_on:
+                            if n_vk != f0 + n_q:
+                                raise RuntimeError("record_nbr: the video keys are not [frame 0 | this step's rows]")
+                            lg_n = self._head_logits(io_v[0], kv_k)
+                            if vmask is not None:
+                                lg_n = lg_n + vmask[0].float()
+                            nbr_acc = nbr_acc + (torch.softmax(lg_n, dim=-1).mean(dim=0)[:, f0:] * nbr_mask).sum(dim=-1)
                         steer_v_warm = steer_v is not None and s == 0
                         if want_vf0 or steer_v_warm:
                             # Beside the forward pass, as for the action rows below.
@@ -1697,7 +1743,7 @@ class JointCaseStudyRunner:
                         amask = cal_a if cal_a is not None else fv_mask_a
                         if n_fk != (num_future if fill_now else n_q) or int(k_all.shape[1]) != f0 + n_fk + int(io_a[1].shape[1]):
                             raise RuntimeError("fovea: the action rows see keys that were not computed on this step")
-                        if late_read is not None and 2 <= s <= steps - 2 and s != late_land and int(k_all.shape[1]) != f0 + int(io_a[1].shape[1]):
+                        if late_read is not None and jump_first <= s <= steps - 2 and s != late_land and int(k_all.shape[1]) != f0 + int(io_a[1].shape[1]):
                             raise RuntimeError("late-read: the action rows see future keys on an empty step")
                     elif no_future and mode == "pruned":
                         # S0-noF: the action rows see frame 0 and themselves, no future token.
@@ -1864,6 +1910,9 @@ class JointCaseStudyRunner:
                         if d_hidden is None:
                             d_hidden = torch.zeros((steps, self.num_layers) + tuple(xa.shape[1:]), dtype=torch.float16)
                         d_hidden[s, layer] = xa[0].half().cpu()
+                if nbr_on:
+                    diag.setdefault("nbr", {})[str(s)] = {"rows": idx_rel.tolist(),
+                                                          "share": [round(float(x), 5) for x in (nbr_acc / self.num_layers).tolist()]}
                 if tea is not None:
                     tea_res_v = xv - xv_in
                     tea_res_a = xa - xa_in
@@ -2184,7 +2233,7 @@ class JointCaseStudyRunner:
                 s0_pilot = (latents_action[0].float() - sigma0_a * pred_action[0].float()).cpu()
             if jump_now:
                 pred_action = late_jump_pred  # late-read JUMP: step 1's action velocity (one Euler step from sigma_1 to the last step)
-            elif late_read == "jump" and s == 1:
+            elif late_read == "jump" and s == jump_first - 1:
                 late_jump_pred = pred_action
             if late is not None and prune.late_record_z and s == steps - 1:
                 # late-read self-check: the future video latents entering the last step (token layout)
@@ -2314,6 +2363,12 @@ class JointCaseStudyRunner:
                         for k_ in ("tex", "draw_seed"):  # wrist-cover: what tex24 / block16 chose from
                             if k_ in body_rows:
                                 diag["late_read"][k_] = body_rows[k_]
+                    if same:  # sameset at step 1: the think set = the read set
+                        diag["sameset"] = {"think_step": 1, "think_rows": rows1.cpu().tolist(), "read_rows": rows_last.tolist(),
+                                           "equal": bool(torch.equal(rows1.cpu(), rows_last)), "vbias": prune.sameset_vbias}
+                    if cfg.record_read_drafts:  # the read rows' drafts (what their latents follow into the last step)
+                        zf_r = late_st["zf"]
+                        diag["read_drafts"] = {"rows": rows_last.tolist(), "step": 1, "zf_f16": _f16_b64(zf_r[rows_last.to(zf_r.device)])}
             if c2f is not None and s == 1 and "df1" in c2f:
                 # C2F: the plan of steps 2-9 from the scores measured at steps 0 and 1 (the latest for every token).
                 av_m, df_m = c2f["av"].clone(), c2f["diff"].clone()
@@ -2439,6 +2494,23 @@ class JointCaseStudyRunner:
                                         bias_real={int(j): lg for j in survey.tolist()}).to(kept.device)
                         c2f.update(av=av0, diff=df0, measured=s0_probes.clone(), sinks=s0_sinks.clone())
                         diag["c2f"] = {"survey": survey.tolist()}
+                    elif early and same:
+                        # sameset at step 0: nothing on steps 1 .. steps-2 (jumped), the last step reads S with the read's own bias
+                        empty_ = s0_probes[:0].cpu()
+                        fplan = fv.late_read_plan(fv.Plan(fovea_m, empty_, empty_, empty_, empty_, truncated=empty_), prune.late_read_last,
+                                                  grid, first=1, n_steps=steps, seed=int(prune.late_read_seed), tips=prune.late_read_tips,
+                                                  body=body_rows).to(kept.device)
+                        rows_last = fplan.real(steps - 1).cpu()
+                        diag["late"] = {"set": prune.late, "n": int(s0_probes.numel()), "step": 0}
+                        diag["late_read"] = {"mode": late_read, "last": prune.late_read_last, "rows_last": rows_last.tolist(),
+                                             "bias_last": sorted({round(v, 6) for v in fplan.bias_at(steps - 1).values()}),
+                                             "mid_rows": [int(fplan.real(s_).numel()) for s_ in range(1, steps - 1)], "land": int(late_land),
+                                             "n_last": int(rows_last.numel()),
+                                             "body": sorted(int(j) for j in body_rows[fv.BODY_SOURCE.get(prune.late_read_last, "fk")])}
+                        diag["sameset"] = {"think_step": 0, "think_rows": s0_probes.cpu().tolist(), "read_rows": rows_last.tolist(),
+                                           "equal": bool(torch.equal(s0_probes.cpu(), rows_last)), "vbias": prune.sameset_vbias}
+                        if cfg.record_read_drafts:
+                            diag["read_drafts"] = {"rows": rows_last.tolist(), "step": 0, "zf_f16": _f16_b64(s0_zf[rows_last.to(s0_zf.device)])}
                     elif early:
                         # late-anchor-confirm X-early: the plan of steps 1-9 from step 0 by the late anchor's rule (sinks above, core
                         # from the spread A->V and the Diff of the spread drafts, computed tokens in the last slices, 9 slices, step 9
@@ -2458,7 +2530,7 @@ class JointCaseStudyRunner:
                             # late-anchor-confirm (M4w + extra reads): step 9's slice also computes the best never-computed tokens
                             # by step 0's A->V.
                             fplan = fv.add_last_extra(fplan, av_plan, int(prune.late_extra))
-                    if s0_mode is not None and fplan.slices:
+                    if s0_mode is not None and fplan.slices and not same:
                         # Runner check (DECISIONS C.3): the slices and the truncated tokens partition the periphery.
                         parts = torch.cat(fplan.slices + [fplan.truncated])
                         if parts.numel() != fplan.periphery.numel() or not torch.equal(torch.sort(parts).values, fplan.periphery):
@@ -2680,6 +2752,11 @@ class JointCaseStudyRunner:
             # follows the patch embedding: (frame, row, column) of patches.
             z = rearrange(latents_video[0].float(), "c (f a) (h b) (w e) -> f (h w) (c a b e)", a=pt, b=ph, e=pw)
             diag["motion_f32"] = _f32_b64((z[1:] - z[:1]).norm(dim=-1).flatten())
+        if cfg.record_final_video:
+            # sameset diagnostic: the final future latents (the clean prediction) and the current frame, Diff layout (f16)
+            z = rearrange(latents_video[0].float(), "c (f a) (h b) (w e) -> f (h w) (c a b e)", a=pt, b=ph, e=pw)
+            diag["final_future_f16"] = _f16_b64(z[1:].reshape(num_future, -1))
+            diag["zcur_f16"] = _f16_b64(z[0])
         if want_vf0:
             diag["video_frame0_f32"] = _f32_b64(torch.stack(vf0_rows))  # [steps, Kf]
         if want_motion_steps:

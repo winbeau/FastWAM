@@ -593,6 +593,8 @@ def read49(last: str, grid: sel.Grid, d_meas: torch.Tensor, tips, seed: int) -> 
 
 BWM = ("bwm_s16", "bwm_s8", "bwm_all", "bwm_b16", "bwm_g24", "bwm_t24")  # wrist-cover: bwmid30 with another choice of the other 41
 BODY_READS = ("bw20", "bw30", "br30", "bwseg30", "bwc30", "bwmid30") + BWM  # body-select: the last step's reads from the body mask
+BODY_READS = BODY_READS + ("bw16", "bw8")  # sameset (2026-11-10): bw30 with 16 / 8 sampled wrist tokens (S44 / S36)
+BW_WRIST_N = {"bw20": 20, "bwmid30": 24, "bw16": 16, "bw8": 8}  # sampled wrist tokens of a body read (else 30)
 WRIST_MID = (65, 66, 67, 79, 80, 81)  # body-select bwmid30: wrist rows 4-5, columns 2-4 (between and above the fingertips 78 / 82)
 BODY_SOURCE = {"bwseg30": "seg", "bwc30": "fk_cover"}  # the mask each read uses (else "fk": the FK body set, dilated)
 SINKS_NEAR = (84,)  # body-select: the near-frame sink of diag.late.sinks in >= 50 % of the quick-metrics samples (58 / 60)
@@ -604,7 +606,7 @@ def read_body(last: str, grid: sel.Grid, body: dict, tips, seed: int, sinks=SINK
     bw20 / bw30 / bwseg30 / bwc30: the body, key + log(agentview tokens / body tokens) (it stands for the whole camera); br30: the
     body without a group weight + 6 sampled from the other agentview tokens (not the sinks), key + log(pool / 6). Then the sinks and
     the fingertips (fixed) and 20 / 30 wrist tokens sampled from the rest, key + log(pool / n); bwmid30: as bw30 with the six
-    ``WRIST_MID`` tokens fixed as well and 24 sampled. Sampling by ``quad_pick`` (agentview
+    ``WRIST_MID`` tokens fixed as well and 24 sampled; sameset bw16 / bw8: as bw30 with 16 / 8 sampled. Sampling by ``quad_pick`` (agentview
     ``seed``, wrist ``seed`` + 1); every key + log(Kf / pf) (the far frame). -> (rows, bias, group sizes)."""
     pf, half = grid.per_frame, grid.width // 2
     near = torch.arange(pf)
@@ -621,7 +623,7 @@ def read_body(last: str, grid: sel.Grid, body: dict, tips, seed: int, sinks=SINK
         tip = torch.cat([tip, torch.tensor(WRIST_MID, dtype=torch.long)])
     sink = torch.tensor([int(x) for x in sinks if int(x) not in set(b.tolist())], dtype=torch.long)
     w_rest = wr[~torch.isin(wr, tip)]
-    n_w = {"bw20": 20, "bwmid30": 24}.get(last, 30)
+    n_w = BW_WRIST_N.get(last, 30)
     if last == "br30":
         pool = ag[~torch.isin(ag, b) & ~torch.isin(ag, sink)]
         pick = quad_pick(pool, 6, grid, seed)
@@ -641,6 +643,43 @@ def read_body(last: str, grid: sel.Grid, body: dict, tips, seed: int, sinks=SINK
     if torch.unique(rows).numel() != rows.numel() or not bool((rows < pf).all()):
         raise RuntimeError(f"read_body {last}: overlapping groups or a far-frame token in {rows.tolist()}")
     return rows, bias, sizes
+
+
+def pair_bias(rows, body, grid: sel.Grid) -> tuple[torch.Tensor, dict, dict]:
+    """sameset P3: the video rows' key bias when the future tokens computed are only ``rows`` (near-frame tokens that include the
+    agentview body set ``body``). Every absent future token gets one stand-in among the present keys: an agentview token off the
+    body (near or far frame) -> the frame-0 token at the same (h, w); an agentview far-frame token at a body position -> the near-frame
+    body token there; a wrist token (the near-frame ones not read and the whole far frame) -> the nearest read near-frame wrist token
+    (squared Euclidean on (h, w), ties to the smaller index). Each present key gets + log(1 + the absentees it stands in for).
+    -> (frame-0 bias [pf] float32, future bias {token: bias}, counts {"frame0": [pf], "future": {token: n}})."""
+    pf, w, half = grid.per_frame, grid.width, grid.width // 2
+    present = sorted({int(j) for j in (rows.tolist() if hasattr(rows, "tolist") else rows)})
+    pset, b = set(present), {int(j) for j in body}
+    if not present or any(j >= pf for j in present):
+        raise ValueError(f"pair_bias: rows must be near-frame tokens, got {present}")
+    if not b or not b <= pset or any(j % w >= half for j in b):
+        raise ValueError("pair_bias: the body set must be non-empty agentview tokens, all of them read")
+    reads_w = [j for j in present if j % w >= half]
+    if not reads_w:
+        raise ValueError("pair_bias: no wrist token is read")
+    c0 = [0] * pf
+    cf = {j: 0 for j in present}
+    for t in range(grid.num_future):
+        if t in pset:
+            continue
+        p = t % pf
+        if p % w < half:
+            if t >= pf and p in b:
+                cf[p] += 1  # far-frame body position: the near-frame body token
+            else:
+                c0[p] += 1  # off the body: the current frame
+        else:
+            r, c = p // w, p % w
+            cf[min(reads_w, key=lambda j: ((j // w - r) ** 2 + (j % w - c) ** 2, j))] += 1
+    if sum(c0) + sum(cf.values()) != grid.num_future - len(present):
+        raise RuntimeError("pair_bias: every absent future token needs exactly one stand-in")
+    bias0 = torch.tensor([math.log(1.0 + n) for n in c0], dtype=torch.float32)
+    return bias0, {j: math.log(1.0 + n) for j, n in cf.items()}, {"frame0": c0, "future": cf}
 
 
 def wrist_cover_pick(last: str, pool: torch.Tensor, grid: sel.Grid, body: dict, seed: int) -> torch.Tensor:

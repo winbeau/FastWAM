@@ -96,7 +96,10 @@ ROLE_VARIANTS = ("rs", "notip", "wdiff", "aav", "nofar", "wdiffb")  # role-selec
 QM_KEYS = {"k", "layer", "executed", "eps", "tips", "check", "late"}
 LATE_READS, LATE_READ_LAST = ("lr", "jump"), ("plan", "near", "all", "u49", "n49", "flip49",  # late-read (fovea.late_read_plan)
                                                "bw20", "bw30", "br30", "bwseg30", "bwc30", "bwmid30",  # body-select (fovea.read_body)
-                                               "bwm_s16", "bwm_s8", "bwm_all", "bwm_b16", "bwm_g24", "bwm_t24")  # wrist-cover
+                                               "bwm_s16", "bwm_s8", "bwm_all", "bwm_b16", "bwm_g24", "bwm_t24",  # wrist-cover
+                                               "bw16", "bw8")  # sameset: bw30 with 16 / 8 sampled wrist tokens
+SAMESET_VBIAS = ("rule", "pair")  # sameset: the video rows' key bias (the arm's own / fovea.pair_bias)
+SAMESET_READS = ("bw20", "bw30", "bw16", "bw8")  # sameset: the body reads whose set S the think step computes
 LATE_READ_MID = ("plus10", "core")  # jump-tune: what the landing step computes
 QM_KEYS = QM_KEYS | {"grip_eps", "only_c"}  # jump-tune: the gripper channel's retention c_grip(s); c(s) / c_grip(s) only
 FOVEA_METHODS = ("sink", "rep", "fov_grid", "fov_cluster", "interlace", "interlace_w", "interlace_wfar",
@@ -295,6 +298,12 @@ class PruneConfig:
     late_read_seed: int = 0
     #: anchor-neff: the last step's 49 near-frame tokens (u49 / n49 / flip49, ``fovea.late_read_plan``) and the fixed wrist fingertips.
     late_read_tips: tuple = (78, 82)
+    #: sameset (``late: sameset``, late_read jump with a body read): the think step (late_step 1, or 0 without the action-only step)
+    #: computes exactly the last step's read set S, so no other future token is ever computed or seen. ``sameset_vbias``: the video
+    #: rows' key bias on the two computing steps: rule (the arm's own: log(Kf / |S|) when thinking, the read's bias when reading) or
+    #: pair (``fovea.pair_bias``: every absent token's stand-in key + log(1 + its absentees), frame-0 keys included); the action rows
+    #: keep the arm's own bias.
+    sameset_vbias: str = "rule"
 
 
 @dataclass(frozen=True)
@@ -411,6 +420,13 @@ class CaseStudyConfig:
     explore_track: bool = False
     #: late-anchor-c4: log the drafts (every future token's target clean estimate) of the late anchor (step 1) and of draft_mod.
     record_drafts: bool = False
+    #: sameset diagnostics (beside the pass): ``record_read_drafts`` (late anchor arms) the last step's read rows and their drafts
+    #: (f16); ``record_final_video`` the final future latents and the current frame (f16, Diff layout); ``record_nbr`` per computed
+    #: video row the attention share (head and layer mean) on its same-frame 3 x 3 neighbours among the visible future keys, on every
+    #: computing step (dense: steps 0 and 1).
+    record_read_drafts: bool = False
+    record_final_video: bool = False
+    record_nbr: bool = False
     #: shrinkage-mechanism: the action rows' o - c_bar per step and even layer as a 64-dim random sketch (kappa_val), and m.
     record_kval: bool = False
     #: shrinkage-mechanism (dense only): diagnostic video forwards beside the pass on ``steps`` of the first ``calls`` calls
@@ -539,6 +555,7 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
             late_read_mid=None if block.get("late_read_mid") is None else str(block["late_read_mid"]),
             late_read_seed=int(block.get("late_read_seed", 0)),
             late_read_tips=tuple(int(x) for x in block.get("late_read_tips", (78, 82))),
+            sameset_vbias=str(block.get("sameset_vbias", "rule")),
         )
         if prune.fovea is not None or prune.fovea_off:
             _require(prune.fovea in FOVEA_METHODS, f"prune.fovea must be one of {FOVEA_METHODS} (fovea_off needs a method)")
@@ -594,9 +611,16 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
                  and prune.late_oracle is None and not prune.step_delta and prune.late_plan_far_av is None and prune.late_plan_far_diff is None
                  and (prune.role_select == "notip" or len(prune.role_tips) == 2)), f"prune.role_select ({ROLE_VARIANTS}, 2 role_tips but for notip) "
                  "replaces the late anchor's plan of steps 2-9 (late_step 1, no oracle, no step_delta, no far scaling)")
-        _require(prune.late_read is None or (prune.late_read in LATE_READS and prune.late is not None and prune.late_step == 1
+        same = prune.late == "sameset"
+        _require(prune.late_read is None or (prune.late_read in LATE_READS and prune.late is not None
+                 and (prune.late_step == 1 or (same and prune.late_read == "jump"))
                  and prune.late_oracle is None and not prune.step_delta and prune.role_select is None and steps >= 4),
-                 f"prune.late_read ({LATE_READS}) empties the late anchor's steps 2 .. steps-2 (late_step 1, no oracle / step_delta / role_select)")
+                 f"prune.late_read ({LATE_READS}) empties the late anchor's steps 2 .. steps-2 (late_step 1, no oracle / step_delta / role_select; "
+                 "late_step 0 only for the sameset jump)")
+        _require(not same or (prune.late_read == "jump" and prune.late_read_last in SAMESET_READS and prune.late_read_land is None),
+                 f"prune.late sameset thinks on the last step's read set: late_read jump with a body read {SAMESET_READS}, no landing step")
+        _require(prune.sameset_vbias in SAMESET_VBIAS and (prune.sameset_vbias == "rule" or same),
+                 f"prune.sameset_vbias ({SAMESET_VBIAS}): pair needs prune.late sameset")
         _require(prune.late_read_last in LATE_READ_LAST and (prune.late_read is not None or prune.late_read_last == "plan"),
                  f"prune.late_read_last ({LATE_READ_LAST}) needs late_read")
         _require(not prune.late_record_z or (prune.late is not None and prune.late_step == 1), "prune.late_record_z needs the late anchor")
@@ -782,10 +806,16 @@ def parse_config(raw: Optional[dict]) -> CaseStudyConfig:
                       for e in raw.get("explore") or ()),
         explore_track=bool(raw.get("explore_track", False)),
         record_drafts=bool(raw.get("record_drafts", False)),
+        record_read_drafts=bool(raw.get("record_read_drafts", False)),
+        record_final_video=bool(raw.get("record_final_video", False)),
+        record_nbr=bool(raw.get("record_nbr", False)),
         record_kval=bool(raw.get("record_kval", False)),
         mech=None if raw.get("mech") is None else dict(raw["mech"]),
         qm=None if raw.get("qm") is None else dict(raw["qm"]),
     )
+    _require(not cfg.record_read_drafts or (cfg.prune is not None and cfg.prune.late is not None and cfg.prune.late_read is not None),
+             "record_read_drafts needs a late anchor with late_read")
+    _require(not (cfg.record_final_video or cfg.record_nbr) or cfg.frame0_cache, "record_final_video / record_nbr need the frame-0 cache")
     _require(cfg.qm is None or (cfg.method == "dense" and cfg.prune is None and cfg.frame0_cache and set(cfg.qm) <= QM_KEYS
                                 and steps >= 3), f"casestudy.qm is a dense diagnostic (frame-0 cache, >= 3 steps) with keys {sorted(QM_KEYS)}")
     _require(cfg.mech is None or (cfg.method == "dense" and cfg.frame0_cache and set(cfg.mech) <= MECH_KEYS
