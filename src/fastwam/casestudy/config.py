@@ -97,7 +97,11 @@ QM_KEYS = {"k", "layer", "executed", "eps", "tips", "check", "late"}
 LATE_READS, LATE_READ_LAST = ("lr", "jump"), ("plan", "near", "all", "u49", "n49", "flip49",  # late-read (fovea.late_read_plan)
                                                "bw20", "bw30", "br30", "bwseg30", "bwc30", "bwmid30",  # body-select (fovea.read_body)
                                                "bwm_s16", "bwm_s8", "bwm_all", "bwm_b16", "bwm_g24", "bwm_t24",  # wrist-cover
-                                               "bw16", "bw8")  # sameset: bw30 with 16 / 8 sampled wrist tokens
+                                               "bw16", "bw8",  # sameset: bw30 with 16 / 8 sampled wrist tokens
+                                               # chain2-curves (fovea.CURVE_A / CURVE_W)
+                                               "c2a_full", "c2a_bg25", "c2a_bg50", "c2a_bg75", "c2a_bg100", "c2a_bd25", "c2a_bd50",
+                                               "c2a_bd75", "c2a_bd100", "c2a_bd100nb", "c2w_s4", "c2w_s8", "c2w_s16", "c2w_s30", "c2w_s47",
+                                               "c2w_c4", "c2w_c8", "c2w_c16", "c2w_c30")
 SAMESET_VBIAS = ("rule", "pair")  # sameset: the video rows' key bias (the arm's own / fovea.pair_bias)
 SAMESET_READS = ("bw20", "bw30", "bw16", "bw8")  # sameset: the body reads whose set S the think step computes
 LATE_READ_MID = ("plus10", "core")  # jump-tune: what the landing step computes

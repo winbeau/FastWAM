@@ -1048,8 +1048,8 @@ class JointCaseStudyRunner:
         if cfg.prune is not None and cfg.prune.late_read_last in fv.BODY_READS and body_rows is None:
             # body-select: the last step reads the agentview body mask of this call (the adapter's body_masks option)
             raise ValueError(f"prune.late_read_last {cfg.prune.late_read_last} needs body_rows")
-        if cfg.prune is not None and cfg.prune.late_read_last == "bwm_b16" and body_rows is not None:
-            # wrist-cover: block16 draws its centre from the call's noise seed
+        if cfg.prune is not None and cfg.prune.late_read_last in fv.CALL_SEED_READS and body_rows is not None:
+            # wrist-cover: block16 draws its centre from the call's noise seed; chain2-curves: the drop order / the clump centre too
             body_rows = {**body_rows, "draw_seed": int(seed)}
         self._body_rows = body_rows  # body-select: the anchor set f1body49 (_explore_rows) reads this call's body mask
         if cfg.prune is not None and (cfg.prune.side0_use is not None or cfg.prune.mem_route):

@@ -594,6 +594,16 @@ def read49(last: str, grid: sel.Grid, d_meas: torch.Tensor, tips, seed: int) -> 
 BWM = ("bwm_s16", "bwm_s8", "bwm_all", "bwm_b16", "bwm_g24", "bwm_t24")  # wrist-cover: bwmid30 with another choice of the other 41
 BODY_READS = ("bw20", "bw30", "br30", "bwseg30", "bwc30", "bwmid30") + BWM  # body-select: the last step's reads from the body mask
 BODY_READS = BODY_READS + ("bw16", "bw8")  # sameset (2026-11-10): bw30 with 16 / 8 sampled wrist tokens (S44 / S36)
+# chain2-curves (2026-11-10, task 014): Bw-W30 with one camera changed. Agentview (wrist as bw30): c2a_bg<x> reads the body and drops x %
+# of the background, c2a_bd<x> reads the background and drops x % of the body (nb: no agentview bias), c2a_full both whole. Wrist
+# (agentview body as bw30): c2w_s<n> n spread (quad_pick), c2w_c<n> the n nearest to a centre drawn with the call's seed.
+CURVE_A = {"c2a_full": ("bg", 0.0), "c2a_bg25": ("bg", 0.25), "c2a_bg50": ("bg", 0.5), "c2a_bg75": ("bg", 0.75), "c2a_bg100": ("bg", 1.0),
+           "c2a_bd25": ("bd", 0.25), "c2a_bd50": ("bd", 0.5), "c2a_bd75": ("bd", 0.75), "c2a_bd100": ("bd", 1.0), "c2a_bd100nb": ("bd", 1.0)}
+CURVE_W = {"c2w_s4": ("s", 4), "c2w_s8": ("s", 8), "c2w_s16": ("s", 16), "c2w_s30": ("s", 30), "c2w_s47": ("s", 47),
+           "c2w_c4": ("c", 4), "c2w_c8": ("c", 8), "c2w_c16": ("c", 16), "c2w_c30": ("c", 30)}
+BODY_READS = BODY_READS + tuple(CURVE_A) + tuple(CURVE_W)
+# reads that draw from the call's noise seed (body["draw_seed"], set by the runner)
+CALL_SEED_READS = ("bwm_b16",) + tuple(k for k, (_, x) in CURVE_A.items() if x > 0) + tuple(k for k, (m, _) in CURVE_W.items() if m == "c")
 BW_WRIST_N = {"bw20": 20, "bwmid30": 24, "bw16": 16, "bw8": 8}  # sampled wrist tokens of a body read (else 30)
 WRIST_MID = (65, 66, 67, 79, 80, 81)  # body-select bwmid30: wrist rows 4-5, columns 2-4 (between and above the fingertips 78 / 82)
 BODY_SOURCE = {"bwseg30": "seg", "bwc30": "fk_cover"}  # the mask each read uses (else "fk": the FK body set, dilated)
@@ -623,6 +633,8 @@ def read_body(last: str, grid: sel.Grid, body: dict, tips, seed: int, sinks=SINK
         tip = torch.cat([tip, torch.tensor(WRIST_MID, dtype=torch.long)])
     sink = torch.tensor([int(x) for x in sinks if int(x) not in set(b.tolist())], dtype=torch.long)
     w_rest = wr[~torch.isin(wr, tip)]
+    if last in CURVE_A or last in CURVE_W:
+        return curve_read(last, grid, body, b, ag, tip, sink, w_rest, lg2, seed)
     n_w = BW_WRIST_N.get(last, 30)
     if last == "br30":
         pool = ag[~torch.isin(ag, b) & ~torch.isin(ag, sink)]
@@ -642,6 +654,64 @@ def read_body(last: str, grid: sel.Grid, body: dict, tips, seed: int, sinks=SINK
     rows = torch.sort(torch.cat(rows)).values
     if torch.unique(rows).numel() != rows.numel() or not bool((rows < pf).all()):
         raise RuntimeError(f"read_body {last}: overlapping groups or a far-frame token in {rows.tolist()}")
+    return rows, bias, sizes
+
+
+def curve_read(last: str, grid: sel.Grid, body: dict, b: torch.Tensor, ag: torch.Tensor, tip: torch.Tensor, sink: torch.Tensor,
+               w_rest: torch.Tensor, lg2: float, seed: int) -> tuple[torch.Tensor, dict, dict]:
+    """chain2-curves: the last step's reads of Bw-W30 with one camera changed (``CURVE_A`` / ``CURVE_W``); called by ``read_body``
+    with its sets (b the body, sink the sinks off the body, tip the fingertips, w_rest the other 47 wrist tokens).
+    Agentview: the background G = agentview - body - sinks off the body. c2a_bg<x> reads the body and G without its first round(x |G|)
+    (half up) in a random order from the generator 3 + ``body["draw_seed"]`` (the call's noise seed; nested over x); c2a_bd<x> reads
+    G, the sinks inside the body and the body without its first round(x |B'|) (B' = body - sinks, same generator); every agentview read
+    except the sinks off the body gets key + log(49 / its count) (c2a_bd100nb: no agentview bias); the wrist as bw30. Wrist: the body
+    as bw30 (key + log(49 / |body|)); c2w_s<n>: ``quad_pick`` (seed + 1, as bw30); c2w_c<n>: the n nearest (squared Euclidean on the
+    wrist grid, ties by token) to a centre drawn from w_rest with the generator 1 + draw_seed (as bwm_b16); key + log(47 / n). The sinks
+    off the body and the fingertips: no bias. Every key + log(Kf / pf). -> (rows, bias, group sizes)."""
+    half = grid.width // 2
+    sink_set = {int(x) for x in sink.tolist()}
+    if last in CURVE_A:
+        kind, x = CURVE_A[last]
+        g_bg = ag[~torch.isin(ag, b) & ~torch.isin(ag, sink)]
+        b_sink = b[torch.isin(b, torch.tensor(SINKS_NEAR, dtype=torch.long))]  # a sink inside the body: read, never dropped
+        b_del = b[~torch.isin(b, b_sink)]
+        pool = g_bg if kind == "bg" else b_del
+        m = int(math.floor(x * int(pool.numel()) + 0.5))
+        drop = pool[:0]
+        if m > 0:
+            if "draw_seed" not in body:
+                raise ValueError(f"{last} needs body['draw_seed'] (the call's noise seed)")
+            g = torch.Generator().manual_seed(3 + int(body["draw_seed"]))
+            drop = pool[torch.randperm(int(pool.numel()), generator=g)[:m]]
+        kept = pool[~torch.isin(pool, drop)]
+        a_read = torch.sort(torch.cat([b, kept] if kind == "bg" else [g_bg, b_sink, kept])).values
+        lg_a = 0.0 if last.endswith("nb") else math.log(int(ag.numel()) / int(a_read.numel()))
+        wp = quad_pick(w_rest, 30, grid, seed + 1)
+        sizes = {"agent_pool": [int(pool.numel()), int(m)], "agent_read": int(a_read.numel())}
+    else:
+        kind, n = CURVE_W[last]
+        a_read, lg_a = b, math.log(int(ag.numel()) / int(b.numel()))
+        if kind == "s":
+            wp = quad_pick(w_rest, n, grid, seed + 1)
+        else:
+            if "draw_seed" not in body:
+                raise ValueError(f"{last} needs body['draw_seed'] (the call's noise seed)")
+            pool = w_rest.cpu()
+            g = torch.Generator().manual_seed(1 + int(body["draw_seed"]))
+            centre = int(pool[int(torch.randint(int(pool.numel()), (1,), generator=g))])
+            rc, cc = centre // grid.width, centre % grid.width - half
+            d = sorted(((int(j) // grid.width - rc) ** 2 + (int(j) % grid.width - half - cc) ** 2, int(j)) for j in pool.tolist())
+            wp = torch.sort(torch.tensor([j for _, j in d[:n]], dtype=torch.long)).values
+        sizes = {"wrist_pool": int(w_rest.numel()), "wrist_read": int(wp.numel())}
+    lg_w = math.log(int(w_rest.numel()) / int(wp.numel()))
+    groups = [(a_read, lg_a), (sink, 0.0), (tip, 0.0), (wp, lg_w)]
+    rows, bias = [], {}
+    for chosen, lg in groups:
+        rows.append(chosen)
+        bias.update({int(j): lg2 + lg for j in chosen.tolist()})
+    rows = torch.sort(torch.cat(rows)).values
+    if torch.unique(rows).numel() != rows.numel() or not bool((rows < grid.per_frame).all()) or sink_set & set(a_read.tolist()):
+        raise RuntimeError(f"curve_read {last}: overlapping groups or a far-frame token in {rows.tolist()}")
     return rows, bias, sizes
 
 
