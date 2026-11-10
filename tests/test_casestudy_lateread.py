@@ -215,8 +215,6 @@ def test_wrist_cover_reads(last):
             d = sorted((((j // 14) - (c // 14)) ** 2 + ((j % 14) - (c % 14)) ** 2, j) for j in pool)
             return sorted(j for _, j in d[:16])
         assert any(near16(c) == chosen for c in pool)
-        assert fv.late_read_plan(plan, last, GRID, body={**body, "draw_seed": 124}, tips=(78, 82), seed=0).real(9).tolist() != p.real(9).tolist() \
-            or True  # another call seed may (but need not) draw another centre
     if last == "bwm_g24":
         gm = dict(zip(body["g9"]["rows"], body["g9"]["g"]))
         assert chosen == sorted(sorted(pool, key=lambda j: (-gm[j], j))[:24])
