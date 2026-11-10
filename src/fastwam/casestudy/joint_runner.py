@@ -1042,6 +1042,9 @@ class JointCaseStudyRunner:
         if cfg.prune is not None and cfg.prune.late_read_last in fv.BODY_READS and body_rows is None:
             # body-select: the last step reads the agentview body mask of this call (the adapter's body_masks option)
             raise ValueError(f"prune.late_read_last {cfg.prune.late_read_last} needs body_rows")
+        if cfg.prune is not None and cfg.prune.late_read_last == "bwm_b16" and body_rows is not None:
+            # wrist-cover: block16 draws its centre from the call's noise seed
+            body_rows = {**body_rows, "draw_seed": int(seed)}
         self._body_rows = body_rows  # body-select: the anchor set f1body49 (_explore_rows) reads this call's body mask
         if cfg.prune is not None and (cfg.prune.side0_use is not None or cfg.prune.mem_route):
             # step0-sparse-r2: R1 / R3b / R7 score on casestudy.score_layer (B's layer; R7 has no dense step 0 from call 1 on).
@@ -1098,6 +1101,10 @@ class JointCaseStudyRunner:
         latent_w = width // vae.upsampling_factor
         patch = self.video.patch_size
         grid = sel.Grid(frames=latent_t // int(patch[0]), height=latent_h // int(patch[1]), width=latent_w // int(patch[2]))
+        if cfg.prune is not None and cfg.prune.late_read_last == "bwm_t24" and body_rows is not None:
+            # wrist-cover tex24: the wrist half's 7 x 7 Sobel texture of this call's input image (no model output)
+            body_rows = {**body_rows, "tex": fv.wrist_texture(input_image if input_image.ndim == 4 else input_image[None], grid)}
+            self._body_rows = body_rows
         f0 = grid.per_frame
         num_future = grid.num_future
 
@@ -1380,6 +1387,9 @@ class JointCaseStudyRunner:
         d_future = d_obs = d_act = d_hidden = d_cur = None
         d_latents: list[torch.Tensor] = []
         # shrinkage-mechanism: the action rows' o - c_bar sketches [steps, even layers, 64] and future shares (record_kval)
+        # wrist-cover: quick-metrics' g_j of the last step's visible future keys, per layer (prune.late_record_g9)
+        g9_acc: Optional[list] = [] if prune is not None and prune.late_record_g9 else None
+        g9_rows: Optional[torch.Tensor] = None
         kval_buf = ((torch.zeros(steps, (self.num_layers + 1) // 2, self.KVAL_DIM), torch.zeros(steps, (self.num_layers + 1) // 2))
                     if cfg.record_kval else None)
         pre_v_freeze: Optional[dict] = None
@@ -1726,6 +1736,15 @@ class JointCaseStudyRunner:
                                 # Contiguous, so that with every token kept mFk is summed exactly like mF.
                                 steer_fut[layer] = fut.contiguous()
                                 steer_logits[layer] = logits
+                    if g9_acc is not None and s == steps - 1 and not biased:
+                        # wrist-cover: the action rows' contribution g_j of every visible future key (beside the pass)
+                        lg9 = self._head_logits(io_a[0], k_all)
+                        if amask is not None:
+                            lg9 = lg9 + amask[0].float()
+                        nf9 = int(k_all.shape[1]) - f0 - int(io_a[1].shape[1])
+                        vh9 = rearrange(v_all, "b s (n d) -> b n s d", n=self.num_heads)[0].float()
+                        g9_acc.append(qmm.readout(lg9, vh9, f0, nf9, {}, {})["g"].float())
+                        g9_rows = idx_rel.clone() if nf9 == int(idx_rel.numel()) else all_future
                     if kval_buf is not None and layer % 2 == 0 and not biased:
                         # shrinkage-mechanism: the action rows' o - c_bar sketch and future share (diagnostic, beside the pass)
                         sk_, m_ = self._kval(io_a[0], k_all, v_all, amask, f0, int(io_a[1].shape[1]))
@@ -2292,6 +2311,9 @@ class JointCaseStudyRunner:
                     if prune.late_read_last in fv.BODY_READS:  # body-select: the body set the last step read
                         src = fv.BODY_SOURCE.get(prune.late_read_last, "fk")
                         diag["late_read"]["body"] = sorted(int(j) for j in body_rows[src])
+                        for k_ in ("tex", "draw_seed"):  # wrist-cover: what tex24 / block16 chose from
+                            if k_ in body_rows:
+                                diag["late_read"][k_] = body_rows[k_]
             if c2f is not None and s == 1 and "df1" in c2f:
                 # C2F: the plan of steps 2-9 from the scores measured at steps 0 and 1 (the latest for every token).
                 av_m, df_m = c2f["av"].clone(), c2f["diff"].clone()
@@ -2722,6 +2744,9 @@ class JointCaseStudyRunner:
                                    "route": bool(route_plan)}
         # Relative compute (token passes + attention): per step [video queries, video keys, action
         # queries, action keys] at layer 0, the parameter counts and the context length.
+        if g9_acc is not None and g9_acc:
+            diag.setdefault("late_read", {})["g9"] = {"rows": g9_rows.cpu().tolist(), "g": [round(float(v), 7) for v in torch.stack(g9_acc).mean(dim=0).cpu()],
+                                                      "layers": len(g9_acc)}
         if kval_buf is not None:
             diag["kval_f16"], diag["kval_m"] = _f16_b64(kval_buf[0]), [[round(float(v), 6) for v in r] for r in kval_buf[1]]
             diag["kval_shape"] = list(kval_buf[0].shape)

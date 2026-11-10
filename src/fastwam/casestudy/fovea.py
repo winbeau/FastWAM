@@ -591,7 +591,8 @@ def read49(last: str, grid: sel.Grid, d_meas: torch.Tensor, tips, seed: int) -> 
     return rows, bias, sizes
 
 
-BODY_READS = ("bw20", "bw30", "br30", "bwseg30", "bwc30", "bwmid30")  # body-select: the last step's reads from the agentview body mask
+BWM = ("bwm_s16", "bwm_s8", "bwm_all", "bwm_b16", "bwm_g24", "bwm_t24")  # wrist-cover: bwmid30 with another choice of the other 41
+BODY_READS = ("bw20", "bw30", "br30", "bwseg30", "bwc30", "bwmid30") + BWM  # body-select: the last step's reads from the body mask
 WRIST_MID = (65, 66, 67, 79, 80, 81)  # body-select bwmid30: wrist rows 4-5, columns 2-4 (between and above the fingertips 78 / 82)
 BODY_SOURCE = {"bwseg30": "seg", "bwc30": "fk_cover"}  # the mask each read uses (else "fk": the FK body set, dilated)
 SINKS_NEAR = (84,)  # body-select: the near-frame sink of diag.late.sinks in >= 50 % of the quick-metrics samples (58 / 60)
@@ -616,7 +617,7 @@ def read_body(last: str, grid: sel.Grid, body: dict, tips, seed: int, sinks=SINK
     if b.numel() == 0 or not bool(torch.isin(b, ag).all()):
         raise ValueError(f"read_body {last}: the body mask must be a non-empty set of near-frame agentview tokens, got {b.tolist()}")
     tip = torch.tensor([int(x) for x in tips], dtype=torch.long)
-    if last == "bwmid30":  # the six tokens between and above the fingertips are read every call too
+    if last == "bwmid30" or last in BWM:  # the six tokens between and above the fingertips are read every call too
         tip = torch.cat([tip, torch.tensor(WRIST_MID, dtype=torch.long)])
     sink = torch.tensor([int(x) for x in sinks if int(x) not in set(b.tolist())], dtype=torch.long)
     w_rest = wr[~torch.isin(wr, tip)]
@@ -629,7 +630,7 @@ def read_body(last: str, grid: sel.Grid, body: dict, tips, seed: int, sinks=SINK
         groups = [(ag, b, math.log(int(ag.numel()) / int(b.numel())))]
     else:
         raise ValueError(f"read_body: {last!r}")
-    wp = quad_pick(w_rest, n_w, grid, seed + 1)
+    wp = wrist_cover_pick(last, w_rest, grid, body, seed) if last in BWM else quad_pick(w_rest, n_w, grid, seed + 1)
     groups += [(sink, sink, 0.0), (tip, tip, 0.0), (w_rest, wp, math.log(int(w_rest.numel()) / int(wp.numel())))]
     rows, bias, sizes = [], {}, {}
     for i, (pool, chosen, lg) in enumerate(groups):
@@ -640,6 +641,64 @@ def read_body(last: str, grid: sel.Grid, body: dict, tips, seed: int, sinks=SINK
     if torch.unique(rows).numel() != rows.numel() or not bool((rows < pf).all()):
         raise RuntimeError(f"read_body {last}: overlapping groups or a far-frame token in {rows.tolist()}")
     return rows, bias, sizes
+
+
+def wrist_cover_pick(last: str, pool: torch.Tensor, grid: sel.Grid, body: dict, seed: int) -> torch.Tensor:
+    """wrist-cover: which of the wrist pool (the 41 near-frame wrist tokens besides the fixed 8) the last step reads. bwm_s16 / s8:
+    ``quad_pick`` (seed + 1, as bwmid30); bwm_all: every one; bwm_b16: the 16 nearest (Euclidean on the wrist grid, ties by token)
+    to a centre drawn from the pool with the generator 1 + ``body["draw_seed"]`` (the call's noise seed); bwm_g24 / bwm_t24: the 24
+    largest of ``body["g9"]`` ({rows, g}: the last-step contribution of J98-G105 at the same call and seed) / ``body["tex"]`` (the
+    wrist image's 7 x 7 Sobel texture, ``wrist_texture``), ties by token. Sorted."""
+    pool = pool.cpu()
+    half = grid.width // 2
+    if last == "bwm_s16":
+        return quad_pick(pool, 16, grid, seed + 1)
+    if last == "bwm_s8":
+        return quad_pick(pool, 8, grid, seed + 1)
+    if last == "bwm_all":
+        return torch.sort(pool).values
+    if last == "bwm_b16":
+        if "draw_seed" not in body:
+            raise ValueError("bwm_b16 needs body['draw_seed'] (the call's noise seed)")
+        g = torch.Generator().manual_seed(1 + int(body["draw_seed"]))
+        centre = int(pool[int(torch.randint(int(pool.numel()), (1,), generator=g))])
+        rc, cc = centre // grid.width, centre % grid.width - half
+        d = [((int(j) // grid.width - rc) ** 2 + (int(j) % grid.width - half - cc) ** 2, int(j)) for j in pool.tolist()]
+        return torch.sort(torch.tensor([j for _, j in sorted(d)[:16]], dtype=torch.long)).values
+    if last == "bwm_g24":
+        if "g9" not in body:
+            raise ValueError("bwm_g24 needs body['g9'] (J98-G105's last-step g at the same call and seed)")
+        gmap = dict(zip((int(j) for j in body["g9"]["rows"]), (float(v) for v in body["g9"]["g"])))
+        score = {int(j): gmap[int(j)] for j in pool.tolist()}
+    elif last == "bwm_t24":
+        if "tex" not in body:
+            raise ValueError("bwm_t24 needs body['tex'] (the wrist image's 7 x 7 texture)")
+        tex = [float(v) for v in body["tex"]]
+        score = {int(j): tex[(int(j) // grid.width) * half + int(j) % grid.width - half] for j in pool.tolist()}
+    else:
+        raise ValueError(f"wrist_cover_pick: {last!r}")
+    top = sorted(score, key=lambda j: (-score[j], j))[:24]
+    return torch.sort(torch.tensor(top, dtype=torch.long)).values
+
+
+def wrist_texture(image: torch.Tensor, grid: sel.Grid) -> list[float]:
+    """wrist-cover tex24: the model input image [1, 3, H, W] (agentview | wrist side by side, values in [-1, 1]) -> the wrist half's
+    mean Sobel gradient magnitude of the luma (0.299 R + 0.587 G + 0.114 B, replicate padding) over each of its grid cells, row-major
+    (grid.height x grid.width / 2)."""
+    x = image[0].float()
+    h, w = int(x.shape[1]), int(x.shape[2])
+    half = grid.width // 2
+    if h % grid.height or w % grid.width:
+        raise ValueError(f"wrist_texture: image {h} x {w} is not a multiple of the token grid {grid.height} x {grid.width}")
+    wr = x[:, :, w // 2:]
+    y = (0.299 * wr[0] + 0.587 * wr[1] + 0.114 * wr[2])[None, None]
+    kx = torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]], device=y.device)
+    yp = torch.nn.functional.pad(y, (1, 1, 1, 1), mode="replicate")
+    gx = torch.nn.functional.conv2d(yp, kx[None, None])
+    gy = torch.nn.functional.conv2d(yp, kx.t()[None, None])
+    mag = torch.sqrt(gx * gx + gy * gy)
+    cells = torch.nn.functional.avg_pool2d(mag, kernel_size=(h // grid.height, (w // 2) // half))[0, 0]
+    return [float(v) for v in cells.flatten().cpu()]
 
 
 def body_anchor(body: dict | None, grid: sel.Grid, n: int, seed: int) -> torch.Tensor:
@@ -1017,5 +1076,5 @@ __all__ = ["INTERLACE", "METHODS", "PROBE_CORNERS", "PROBE_SINK", "Plan", "STEP0
            "ht_frequencies", "ht_schedule", "interlace_slices", "interp_tokens", "kmeans", "make_plan", "probe_index",
            "roll_blocks", "rope_freqs_at", "step0_slices", "token_latent_mask", "token_norms", "tube_mask", "stratified_pick",
            "lowest_av", "apply_step_delta", "ROLE_VARIANTS", "role_strata", "spread_order", "role_plan", "BODY_READS", "BODY_SOURCE",
-           "SINKS_NEAR", "WRIST_MID", "read_body", "body_anchor", "nearest_sources", "idw_fill", "align_frames", "memory_map",
+           "SINKS_NEAR", "WRIST_MID", "BWM", "read_body", "body_anchor", "wrist_cover_pick", "wrist_texture", "nearest_sources", "idw_fill", "align_frames", "memory_map",
            "select_core", "reselect"]

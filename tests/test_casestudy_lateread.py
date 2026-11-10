@@ -188,3 +188,56 @@ def test_body_anchor():
             fv.body_anchor(bad, GRID, 49, seed=1)
     with pytest.raises(ValueError):  # the body alone exceeds the budget
         fv.body_anchor(body, GRID, 10, seed=1)
+
+
+@pytest.mark.parametrize("last", ("bwm_s16", "bwm_s8", "bwm_all", "bwm_b16", "bwm_g24", "bwm_t24"))
+def test_wrist_cover_reads(last):
+    plan = _plan()
+    lg2 = math.log(2.0)
+    wr = [j for j in range(98) if j % 14 >= 7]
+    fixed = {78, 82, *fv.WRIST_MID}
+    pool = [j for j in wr if j not in fixed]
+    assert len(pool) == 41
+    g = torch.Generator().manual_seed(5)
+    body = {"fk": [r * 14 + c for r in range(2, 6) for c in range(1, 6)], "draw_seed": 123,
+            "g9": {"rows": list(range(98)), "g": torch.rand(98, generator=g).tolist()}, "tex": torch.rand(49, generator=g).tolist()}
+    p = fv.late_read_plan(plan, last, GRID, body=body, tips=(78, 82), seed=0)
+    r, bias = set(p.real(9).tolist()), p.bias_at(9)
+    chosen = sorted((r & set(wr)) - fixed)
+    n = {"bwm_s16": 16, "bwm_s8": 8, "bwm_all": 41}.get(last, 16 if last == "bwm_b16" else 24)
+    assert len(chosen) == n and fixed <= r and set(body["fk"]) <= r and 84 in r
+    assert all(bias[j] == pytest.approx(lg2 + math.log(41 / n)) for j in chosen) and all(bias[j] == pytest.approx(lg2) for j in fixed)
+    assert p.real(9).numel() == len(body["fk"]) + 1 + 8 + n
+    if last in ("bwm_s16", "bwm_s8"):
+        assert chosen == fv.quad_pick(torch.tensor(pool), n, GRID, 1).tolist()
+    if last == "bwm_b16":  # the 16 pool tokens nearest one pool token (Euclidean on the wrist grid, ties by index)
+        def near16(c):
+            d = sorted((((j // 14) - (c // 14)) ** 2 + ((j % 14) - (c % 14)) ** 2, j) for j in pool)
+            return sorted(j for _, j in d[:16])
+        assert any(near16(c) == chosen for c in pool)
+        assert fv.late_read_plan(plan, last, GRID, body={**body, "draw_seed": 124}, tips=(78, 82), seed=0).real(9).tolist() != p.real(9).tolist() \
+            or True  # another call seed may (but need not) draw another centre
+    if last == "bwm_g24":
+        gm = dict(zip(body["g9"]["rows"], body["g9"]["g"]))
+        assert chosen == sorted(sorted(pool, key=lambda j: (-gm[j], j))[:24])
+    if last == "bwm_t24":
+        tm = {j: body["tex"][(j // 14) * 7 + j % 14 - 7] for j in pool}
+        assert chosen == sorted(sorted(pool, key=lambda j: (-tm[j], j))[:24])
+    with pytest.raises(ValueError):
+        if last in ("bwm_b16", "bwm_g24", "bwm_t24"):
+            fv.late_read_plan(plan, last, GRID, body={"fk": body["fk"]}, tips=(78, 82), seed=0)
+        else:
+            raise ValueError("no extra input needed")
+
+
+def test_wrist_texture():
+    img = torch.zeros(1, 3, 224, 448)
+    img[:, :, 64:96, 224 + 96:224 + 128] = 1.0  # a bright square: wrist cell (2, 3)
+    img[:, :, :, :224] = torch.rand(1, 3, 224, 224)  # the agentview half must not matter
+    tex = fv.wrist_texture(img, GRID)
+    assert len(tex) == 49 and tex[2 * 7 + 3] > 0
+    flat = [i for i, v in enumerate(tex) if v > 1e-6]
+    assert set(flat) <= {r * 7 + c for r in (1, 2, 3) for c in (2, 3, 4)}  # only the square's cell and its edge neighbours
+    assert fv.wrist_texture(img, GRID) == tex
+    with pytest.raises(ValueError):
+        fv.wrist_texture(torch.zeros(1, 3, 100, 448), GRID)

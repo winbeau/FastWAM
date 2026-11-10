@@ -385,6 +385,15 @@ class FastWAMJointPolicy:
             self.body_masks = {"dir": Path(str(f["dir"])), "online": bool(f.get("online", False))}
         self._body_calib = None
         self._body_now = None
+        self.wrist_g9 = None
+        self._g9 = None
+        if options.get("wrist_g9") is not None:
+            # wrist-cover g24: per episode <dir>/<episode>.npz with g9 [calls, seeds, 98] (J98-G105's last-step contribution g_j of the
+            # near frame at every call and seed offset), rows [98], seeds [n]
+            f = dict(options["wrist_g9"])
+            if sorted(f) != ["dir"]:
+                raise ValueError("wrist_g9 needs dir only")
+            self.wrist_g9 = {"dir": Path(str(f["dir"]))}
         self._repeat_offset = 0
         self.episode_plans = {}
         self.episode_plans_sha256 = None
@@ -516,6 +525,12 @@ class FastWAMJointPolicy:
                 self._inject_frames = {k: z[k] for k in ("agentview", "wrist", "deltas", "call_ok", "valid")}
             if [float(x) for x in self._inject_frames["deltas"]] != self.inject["deltas"]:
                 raise ValueError(f"inject_future: {path} has deltas {self._inject_frames['deltas']}, not {self.inject['deltas']}")
+        if self.wrist_g9 is not None:
+            path = self.wrist_g9["dir"] / f"{_re.sub(r'-r[0-9]+.*$', '', episode_id)}.npz"
+            if not path.is_file():
+                raise FileNotFoundError(f"wrist_g9: no file {path}")
+            with np.load(path) as z:
+                self._g9 = {"g9": z["g9"].astype(np.float64), "rows": [int(j) for j in z["rows"]], "seeds": [int(x) for x in z["seeds"]]}
         if self.body_masks is not None and self.body_masks["online"]:
             import json as _json
 
@@ -871,7 +886,7 @@ class FastWAMJointPolicy:
                     prompt=prompt, input_image=image, proprio=proprio,
                     action_horizon=self.action_horizon, num_video_frames=self.num_video_frames,
                     seed=seed, sigma_shift=self.sigma_shift, rand_device=self.rand_device, **self._tube_kwargs(runner),
-                    **self._mem_kwargs(runner, offset), **real, **self._qm_kwargs(runner), **self._body_kwargs(runner, call_index),
+                    **self._mem_kwargs(runner, offset), **real, **self._qm_kwargs(runner), **self._body_kwargs(runner, call_index, offset),
                 )
                 cont, _, agc_log = self._agc(runner.cfg, d, self._continuous(action))
                 entry = {"seed": int(seed), **self._chunk_logs(action, cont), **agc_log}
@@ -1084,13 +1099,23 @@ class FastWAMJointPolicy:
 
         return tube
 
-    def _body_kwargs(self, runner, call_index: int) -> dict:
+    def _body_kwargs(self, runner, call_index: int, offset=None) -> dict:
         """body-select: ``body_rows`` {fk, fk_cover, seg} of this call (near-frame agentview token indices r * 14 + c) whenever the
         body_masks option is set (body reads, the f1body49 anchor, mech sets); {} otherwise (a body read then fails in the runner)."""
         if self.body_masks is None:
             return {}
         if self.body_masks["online"]:
             return {"body_rows": dict(self._body_now)}
+        out = self._body_rows_offline(call_index)
+        prune = getattr(runner.cfg, "prune", None)
+        if prune is not None and prune.late_read_last == "bwm_g24":
+            # wrist-cover g24: J98-G105's g at this call and seed offset (the same state up to the last step)
+            if self._g9 is None or offset is None or int(offset) not in self._g9["seeds"]:
+                raise ValueError(f"wrist_g9: no g for call {call_index}, seed offset {offset}")
+            out["body_rows"]["g9"] = {"rows": self._g9["rows"], "g": self._g9["g9"][call_index, self._g9["seeds"].index(int(offset))].tolist()}
+        return out
+
+    def _body_rows_offline(self, call_index: int) -> dict:
         if self._body is None or call_index >= len(self._body["fk_body"]):
             raise ValueError(f"body_masks: no mask for call {call_index} of {self._episode_id}")
         width = 2 * int(self._body["fk_body"].shape[-1])
