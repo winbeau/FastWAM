@@ -601,9 +601,21 @@ CURVE_A = {"c2a_full": ("bg", 0.0), "c2a_bg25": ("bg", 0.25), "c2a_bg50": ("bg",
            "c2a_bd25": ("bd", 0.25), "c2a_bd50": ("bd", 0.5), "c2a_bd75": ("bd", 0.75), "c2a_bd100": ("bd", 1.0), "c2a_bd100nb": ("bd", 1.0)}
 CURVE_W = {"c2w_s4": ("s", 4), "c2w_s8": ("s", 8), "c2w_s16": ("s", 16), "c2w_s30": ("s", 30), "c2w_s47": ("s", 47),
            "c2w_c4": ("c", 4), "c2w_c8": ("c", 8), "c2w_c16": ("c", 16), "c2w_c30": ("c", 30)}
+# chain2-curves-more (2026-11-11, task 015): both agentview lines at 12.5 / 37.5 / 62.5 / 87.5 %; c2a_rd<x> drops x % of the 48 agentview
+# tokens off the sinks (body and background alike); c2a_bg<x>nb the background line without the agentview bias. Wrist: spread / clumped
+# at n = 2 / 6 / 12 / 20 / 24 / 38; c2w_r<n> spread re-drawn every call (quad_pick seeded with the call's noise seed); c2w_s<n>nb the
+# spread line without the wrist bias.
+_C2X = {"12p5": 0.125, "25": 0.25, "37p5": 0.375, "50": 0.5, "62p5": 0.625, "75": 0.75, "87p5": 0.875, "100": 1.0}
+CURVE_A.update({f"c2a_{k}{s}": (k, _C2X[s]) for k in ("bg", "bd") for s in ("12p5", "37p5", "62p5", "87p5")})
+CURVE_A.update({f"c2a_rd{s}": ("rd", x) for s, x in _C2X.items()})
+CURVE_A.update({f"c2a_bg{s}nb": ("bg", _C2X[s]) for s in ("25", "50", "75", "100")})
+CURVE_W.update({f"c2w_{k}{n}": (k, n) for k in ("s", "c") for n in (2, 6, 12, 20, 24, 38)})
+CURVE_W.update({f"c2w_r{n}": ("r", n) for n in (2, 4, 6, 8, 12, 16)})
+CURVE_W.update({f"c2w_s{n}nb": ("s", n) for n in (4, 8, 16, 30)})
 BODY_READS = BODY_READS + tuple(CURVE_A) + tuple(CURVE_W)
 # reads that draw from the call's noise seed (body["draw_seed"], set by the runner)
-CALL_SEED_READS = ("bwm_b16",) + tuple(k for k, (_, x) in CURVE_A.items() if x > 0) + tuple(k for k, (m, _) in CURVE_W.items() if m == "c")
+CALL_SEED_READS = ("bwm_b16",) + tuple(k for k, (_, x) in CURVE_A.items() if x > 0) + tuple(k for k, (m, _) in CURVE_W.items()
+                                                                                          if m in ("c", "r"))
 BW_WRIST_N = {"bw20": 20, "bwmid30": 24, "bw16": 16, "bw8": 8}  # sampled wrist tokens of a body read (else 30)
 WRIST_MID = (65, 66, 67, 79, 80, 81)  # body-select bwmid30: wrist rows 4-5, columns 2-4 (between and above the fingertips 78 / 82)
 BODY_SOURCE = {"bwseg30": "seg", "bwc30": "fk_cover"}  # the mask each read uses (else "fk": the FK body set, dilated)
@@ -667,7 +679,11 @@ def curve_read(last: str, grid: sel.Grid, body: dict, b: torch.Tensor, ag: torch
     except the sinks off the body gets key + log(49 / its count) (c2a_bd100nb: no agentview bias); the wrist as bw30. Wrist: the body
     as bw30 (key + log(49 / |body|)); c2w_s<n>: ``quad_pick`` (seed + 1, as bw30); c2w_c<n>: the n nearest (squared Euclidean on the
     wrist grid, ties by token) to a centre drawn from w_rest with the generator 1 + draw_seed (as bwm_b16); key + log(47 / n). The sinks
-    off the body and the fingertips: no bias. Every key + log(Kf / pf). -> (rows, bias, group sizes)."""
+    off the body and the fingertips: no bias. Every key + log(Kf / pf). -> (rows, bias, group sizes).
+    Task 015: c2a_rd<x> reads the sinks inside the body and the 48 agentview tokens off the sinks without their first round(x 48) in a
+    random order from the generator 3 + draw_seed (biased as above; rd100 with the sink off the body reads no other agentview token);
+    c2a_bg<x>nb: c2a_bg<x>'s set without the agentview bias; c2w_r<n>: ``quad_pick`` seeded with draw_seed (a new set every call);
+    c2w_s<n>nb: c2w_s<n>'s set without the wrist bias."""
     half = grid.width // 2
     sink_set = {int(x) for x in sink.tolist()}
     if last in CURVE_A:
@@ -675,7 +691,10 @@ def curve_read(last: str, grid: sel.Grid, body: dict, b: torch.Tensor, ag: torch
         g_bg = ag[~torch.isin(ag, b) & ~torch.isin(ag, sink)]
         b_sink = b[torch.isin(b, torch.tensor(SINKS_NEAR, dtype=torch.long))]  # a sink inside the body: read, never dropped
         b_del = b[~torch.isin(b, b_sink)]
-        pool = g_bg if kind == "bg" else b_del
+        if kind == "rd":  # body and background alike: every agentview token but the sinks
+            pool = ag[~torch.isin(ag, sink) & ~torch.isin(ag, b_sink)]
+        else:
+            pool = g_bg if kind == "bg" else b_del
         m = int(math.floor(x * int(pool.numel()) + 0.5))
         drop = pool[:0]
         if m > 0:
@@ -684,8 +703,9 @@ def curve_read(last: str, grid: sel.Grid, body: dict, b: torch.Tensor, ag: torch
             g = torch.Generator().manual_seed(3 + int(body["draw_seed"]))
             drop = pool[torch.randperm(int(pool.numel()), generator=g)[:m]]
         kept = pool[~torch.isin(pool, drop)]
-        a_read = torch.sort(torch.cat([b, kept] if kind == "bg" else [g_bg, b_sink, kept])).values
-        lg_a = 0.0 if last.endswith("nb") else math.log(int(ag.numel()) / int(a_read.numel()))
+        parts = {"bg": [b, kept], "bd": [g_bg, b_sink, kept], "rd": [b_sink, kept]}[kind]
+        a_read = torch.sort(torch.cat(parts)).values
+        lg_a = 0.0 if last.endswith("nb") or a_read.numel() == 0 else math.log(int(ag.numel()) / int(a_read.numel()))
         wp = quad_pick(w_rest, 30, grid, seed + 1)
         sizes = {"agent_pool": [int(pool.numel()), int(m)], "agent_read": int(a_read.numel())}
     else:
@@ -693,6 +713,10 @@ def curve_read(last: str, grid: sel.Grid, body: dict, b: torch.Tensor, ag: torch
         a_read, lg_a = b, math.log(int(ag.numel()) / int(b.numel()))
         if kind == "s":
             wp = quad_pick(w_rest, n, grid, seed + 1)
+        elif kind == "r":
+            if "draw_seed" not in body:
+                raise ValueError(f"{last} needs body['draw_seed'] (the call's noise seed)")
+            wp = quad_pick(w_rest, n, grid, int(body["draw_seed"]))
         else:
             if "draw_seed" not in body:
                 raise ValueError(f"{last} needs body['draw_seed'] (the call's noise seed)")
@@ -703,7 +727,7 @@ def curve_read(last: str, grid: sel.Grid, body: dict, b: torch.Tensor, ag: torch
             d = sorted(((int(j) // grid.width - rc) ** 2 + (int(j) % grid.width - half - cc) ** 2, int(j)) for j in pool.tolist())
             wp = torch.sort(torch.tensor([j for _, j in d[:n]], dtype=torch.long)).values
         sizes = {"wrist_pool": int(w_rest.numel()), "wrist_read": int(wp.numel())}
-    lg_w = math.log(int(w_rest.numel()) / int(wp.numel()))
+    lg_w = 0.0 if last in CURVE_W and last.endswith("nb") else math.log(int(w_rest.numel()) / int(wp.numel()))
     groups = [(a_read, lg_a), (sink, 0.0), (tip, 0.0), (wp, lg_w)]
     rows, bias = [], {}
     for chosen, lg in groups:

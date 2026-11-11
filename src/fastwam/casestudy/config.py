@@ -102,6 +102,12 @@ LATE_READS, LATE_READ_LAST = ("lr", "jump"), ("plan", "near", "all", "u49", "n49
                                                "c2a_full", "c2a_bg25", "c2a_bg50", "c2a_bg75", "c2a_bg100", "c2a_bd25", "c2a_bd50",
                                                "c2a_bd75", "c2a_bd100", "c2a_bd100nb", "c2w_s4", "c2w_s8", "c2w_s16", "c2w_s30", "c2w_s47",
                                                "c2w_c4", "c2w_c8", "c2w_c16", "c2w_c30")
+# chain2-curves-more (task 015; fovea.CURVE_A / CURVE_W): the other agentview steps, random drop, no-bias lines; more wrist n, re-drawn spread
+_C2X = ("12p5", "25", "37p5", "50", "62p5", "75", "87p5", "100")
+LATE_READ_LAST = (LATE_READ_LAST + tuple(f"c2a_{k}{s}" for k in ("bg", "bd") for s in ("12p5", "37p5", "62p5", "87p5"))
+                  + tuple(f"c2a_rd{s}" for s in _C2X) + tuple(f"c2a_bg{s}nb" for s in ("25", "50", "75", "100"))
+                  + tuple(f"c2w_{k}{n}" for k in ("s", "c") for n in (2, 6, 12, 20, 24, 38))
+                  + tuple(f"c2w_r{n}" for n in (2, 4, 6, 8, 12, 16)) + tuple(f"c2w_s{n}nb" for n in (4, 8, 16, 30)))
 SAMESET_VBIAS = ("rule", "pair")  # sameset: the video rows' key bias (the arm's own / fovea.pair_bias)
 SAMESET_READS = ("bw20", "bw30", "bw16", "bw8")  # sameset: the body reads whose set S the think step computes
 LATE_READ_MID = ("plus10", "core")  # jump-tune: what the landing step computes

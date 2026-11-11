@@ -100,3 +100,110 @@ def test_curve_config():
         assert last in fv.BODY_READS
     assert "c2a_full" not in fv.CALL_SEED_READS and "c2w_s4" not in fv.CALL_SEED_READS
     assert {"c2a_bg25", "c2a_bd100nb", "c2w_c4", "bwm_b16"} <= set(fv.CALL_SEED_READS)
+
+
+# ---- chain2-curves-more (2026-11-11, task 015)
+X8 = {"12p5": 0.125, "25": 0.25, "37p5": 0.375, "50": 0.5, "62p5": 0.625, "75": 0.75, "87p5": 0.875, "100": 1.0}
+
+
+@pytest.mark.parametrize("kind", ("bg", "bd"))
+def test_nine_steps_nested(kind):
+    """The 014 lines with the four new steps: one drop order per call, so all nine steps nest."""
+    prev = _read("c2a_full")[0] & set(AG)
+    pool = [j for j in AG if j not in FK and j != 84] if kind == "bg" else FK
+    for s, x in X8.items():
+        a = _read(f"c2a_{kind}{s}")[0] & set(AG)
+        assert len(set(pool) - a) == int(math.floor(x * len(pool) + 0.5)) and a <= prev
+        prev = a
+
+
+@pytest.mark.parametrize("fk", (FK, FK + [84]))
+def test_random_drop(fk):
+    """c2a_rd<x>: x % of the 48 agentview tokens off the sink, body and background alike, nested; the sink always read; the agentview
+    bias log(49 / count) (the sink too when inside the body); rd100 reads only the sink."""
+    pool = [j for j in AG if j != 84]
+    prev = set(AG)
+    for s, x in X8.items():
+        r, bias, sizes = _read(f"c2a_rd{s}", fk=fk)
+        a = r & set(AG)
+        m = int(math.floor(x * 48 + 0.5))
+        assert 84 in a and len(set(pool) - a) == m and a <= prev and sizes["agent_pool"] == [48, m]
+        prev = a
+        biased = a if 84 in fk else a - {84}
+        assert all(bias[j] == pytest.approx(LG2 + math.log(49 / len(biased))) for j in biased)
+        if 84 not in fk:
+            assert bias[84] == pytest.approx(LG2)
+        rw, _, _ = fv.read_body("bw30", GRID, {"fk": fk}, (78, 82), 0)
+        assert r & set(WR) == set(rw.tolist()) & set(WR)
+    assert prev == {84}
+    # random over body and background: across call seeds the 50 % drop hits both
+    hit_b = hit_g = False
+    for seed in range(20):
+        a = _read("c2a_rd50", fk=fk, seed=seed)[0] & set(AG)
+        hit_b |= bool(set(FK) - a)
+        hit_g |= bool(set(pool) - set(FK) - a)
+    assert hit_b and hit_g
+
+
+@pytest.mark.parametrize("s", ("25", "50", "75", "100"))
+def test_background_no_bias(s):
+    r0, b0, _ = _read(f"c2a_bg{s}")
+    r1, b1, _ = _read(f"c2a_bg{s}nb")
+    assert r0 == r1
+    a = r1 & set(AG)
+    assert all(b1[j] == pytest.approx(LG2) for j in a)
+    assert all(b1[j] == pytest.approx(b0[j]) for j in r1 - set(AG))
+
+
+@pytest.mark.parametrize("n", (2, 6, 12, 20, 24, 38))
+def test_more_wrist_n(n):
+    pool = [j for j in WR if j not in (78, 82)]
+    for k in ("s", "c"):
+        r, bias, _ = _read(f"c2w_{k}{n}")
+        w = (r & set(WR)) - {78, 82}
+        assert len(w) == n and w <= set(pool) and all(bias[j] == pytest.approx(LG2 + math.log(47 / n)) for j in w)
+    w_s = (_read(f"c2w_s{n}", seed=1)[0] & set(WR)) - {78, 82}
+    assert w_s == (_read(f"c2w_s{n}", seed=2)[0] & set(WR)) - {78, 82}  # fixed pattern
+
+
+def _quads(w):
+    return sorted(((j // 14) >= 4) * 2 + ((j % 14 - 7) >= 4) for j in w)
+
+
+@pytest.mark.parametrize("n", (2, 4, 6, 8, 12, 16))
+def test_redraw(n):
+    """c2w_r<n>: quad_pick seeded with the call's noise seed: a new set each call, the same strata quota as the fixed pattern."""
+    pool = torch.tensor([j for j in WR if j not in (78, 82)], dtype=torch.long)
+    fixed = (_read(f"c2w_s{n}")[0] & set(WR)) - {78, 82}
+    sets = []
+    for seed in (11, 12, 13, 14):
+        r, bias, _ = _read(f"c2w_r{n}", seed=seed)
+        w = (r & set(WR)) - {78, 82}
+        assert w == set(fv.quad_pick(pool, n, GRID, seed).tolist()) and _quads(w) == _quads(fixed)
+        assert all(bias[j] == pytest.approx(LG2 + math.log(47 / n)) for j in w)
+        assert r & set(AG) == _read(f"c2w_s{n}")[0] & set(AG)
+        sets.append(w)
+    assert len({tuple(sorted(w)) for w in sets}) > 1
+    with pytest.raises(ValueError):
+        fv.read_body(f"c2w_r{n}", GRID, {"fk": FK}, (78, 82), 0)
+
+
+@pytest.mark.parametrize("n", (4, 8, 16, 30))
+def test_spread_no_bias(n):
+    r0, b0, _ = _read(f"c2w_s{n}")
+    r1, b1, _ = _read(f"c2w_s{n}nb")
+    assert r0 == r1
+    w = (r1 & set(WR)) - {78, 82}
+    assert all(b1[j] == pytest.approx(LG2) for j in w)
+    assert all(b1[j] == pytest.approx(b0[j]) for j in r1 - w)
+
+
+def test_more_config():
+    new = ([f"c2a_{k}{s}" for k in ("bg", "bd") for s in ("12p5", "37p5", "62p5", "87p5")] + [f"c2a_rd{s}" for s in X8]
+           + [f"c2a_bg{s}nb" for s in ("25", "50", "75", "100")] + [f"c2w_{k}{n}" for k in "sc" for n in (2, 6, 12, 20, 24, 38)]
+           + [f"c2w_r{n}" for n in (2, 4, 6, 8, 12, 16)] + [f"c2w_s{n}nb" for n in (4, 8, 16, 30)])
+    assert len(new) == 42 and set(new) <= set(fv.CURVE_A) | set(fv.CURVE_W)
+    assert len(fv.CURVE_A) + len(fv.CURVE_W) == 19 + 42
+    assert {f"c2w_r{n}" for n in (2, 4, 6, 8, 12, 16)} <= set(fv.CALL_SEED_READS)
+    assert {f"c2a_rd{s}" for s in X8} | {"c2a_bg25nb"} <= set(fv.CALL_SEED_READS)
+    assert not {"c2w_s2", "c2w_s4nb", "c2w_s38"} & set(fv.CALL_SEED_READS)
